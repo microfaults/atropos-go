@@ -1,0 +1,21 @@
+# ── Build stage ────────────────────────────────────────────────
+FROM golang:1.25-alpine AS builder
+
+WORKDIR /app
+COPY go.mod ./
+# If a go.sum exists, copy it too (not yet, but future-proof).
+COPY go.su[m] ./
+
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 go build -o /cpu_spike_poc ./cmd/cpu_spike_poc
+
+# ── Runtime stage ──────────────────────────────────────────────
+FROM alpine:3.21
+
+COPY --from=builder /cpu_spike_poc /cpu_spike_poc
+
+ENTRYPOINT ["/cpu_spike_poc"]
+# Default: 2 cores, 5 seconds.
+CMD ["--cores=2", "--duration=5s"]
