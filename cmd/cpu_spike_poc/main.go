@@ -10,50 +10,79 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/pronei/faults-lab/fault"
+	fault "atropos-go/internal/fault/resource/cpu_throttler"
 )
 
 func main() {
-	cores := flag.Int("cores", 1, "number of CPU cores to saturate")
-	duration := flag.Duration("duration", 5*time.Second, "how long to spike CPU")
+	load := flag.Float64("load", 0.5, "target total CPU load as a fraction (0.0–1.0]")
+	duration := flag.Duration("duration", 5*time.Second, "total fault duration (including ramp-up)")
+	rampUp := flag.Duration("rampup", 1*time.Second, "ramp-up period (0 = instant)")
+	rampDown := flag.Duration("rampdown", 1*time.Second, "ramp-down period (0 = instant)")
 	flag.Parse()
 
+	available := fault.AvailableCPUs()
+
 	fmt.Println("╔══════════════════════════════════════════╗")
-	fmt.Println("║       atropos-go · CPU Spike POC         ║")
+	fmt.Println("║     atropos-go · CPU Throttle POC        ║")
 	fmt.Println("╚══════════════════════════════════════════╝")
 	fmt.Println()
-	fmt.Printf("  System cores (NumCPU):  %d\n", runtime.NumCPU())
+	fmt.Printf("  Host cores (NumCPU):    %d\n", runtime.NumCPU())
+	fmt.Printf("  Available CPUs (cgroup): %.2f\n", available)
 	fmt.Printf("  GOMAXPROCS:             %d\n", runtime.GOMAXPROCS(0))
-	fmt.Printf("  Requested cores:        %d\n", *cores)
-	fmt.Printf("  Requested duration:     %s\n", *duration)
+	fmt.Printf("  Target load (total):    %.0f%% of %.2f CPUs\n", *load*100, available)
+	fmt.Printf("  Duration:               %s\n", *duration)
+	fmt.Printf("  Ramp-up:                %s\n", *rampUp)
 	fmt.Println()
 
 	// Allow Ctrl+C to cancel early.
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	cfg := fault.CPUSpikeConfig{
-		Cores:    *cores,
-		Duration: *duration,
+	cfg := fault.CPUThrottleConfig{
+		TargetLoad: *load,
+		Duration:   *duration,
+		RampUp:     *rampUp,
+		RampDown:   *rampDown,
 	}
 
-	fmt.Println("🔥 Starting CPU spike…")
-	start := time.Now()
-	result := fault.InjectCPUSpike(ctx, cfg)
-	wall := time.Since(start)
-
-	fmt.Println()
-	fmt.Println("── Results ─────────────────────────────────")
-	fmt.Printf("  Actual cores used:      %d\n", result.ActualCores)
-	fmt.Printf("  Actual duration:        %s\n", result.ActualDuration)
-	fmt.Printf("  Wall-clock elapsed:     %s\n", wall)
-	if result.Err != nil {
-		fmt.Printf("  Error:                  %v\n", result.Err)
-	} else {
-		fmt.Println("  Status:                 ✅ completed normally")
+	handle, err := fault.StartCPUThrottle(ctx, cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Config error: %v\n", err)
+		os.Exit(1)
 	}
+
+	fmt.Println("🔥 CPU throttle started (non-blocking) — doing other work…")
 	fmt.Println()
 
-	// Tip for the user.
-	fmt.Println("💡 Tip: run 'docker stats' in another terminal to see CPU usage in real time.")
+	// Simulate the SDK / request handler continuing to do work while
+	// the CPU throttle runs in the background.
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	tick := 1
+
+	for {
+		select {
+		case result := <-handle.Done():
+			// Throttle finished.
+			fmt.Println()
+			fmt.Println("── Throttle Results ─────────────────────────")
+			fmt.Printf("  Available CPUs:         %.2f\n", result.AvailableCPUs)
+			fmt.Printf("  Workers spawned:        %d\n", result.Workers)
+			fmt.Printf("  Per-worker load:        %.0f%%\n", result.PerWorkerLoad*100)
+			fmt.Printf("  Actual duration:        %s\n", result.ActualDuration)
+			if result.Err != nil {
+				fmt.Printf("  Error:                  %v\n", result.Err)
+			} else {
+				fmt.Println("  Status:                 ✅ completed normally")
+			}
+			fmt.Println()
+			fmt.Println("💡 Tip: run 'docker stats' or Task Manager to see CPU usage in real time.")
+			return
+
+		case <-ticker.C:
+			// Proof that the main goroutine is NOT blocked.
+			fmt.Printf("  [main] still running… tick #%d\n", tick)
+			tick++
+		}
+	}
 }
