@@ -10,7 +10,9 @@ import (
 	"syscall"
 	"time"
 
-	fault "atropos-go/internal/fault/resource/cpu_throttler"
+	fault "atropos-go/internal/faults"
+	"atropos-go/internal/faults/resource"
+	"atropos-go/internal/faults/resource/cpu"
 )
 
 func main() {
@@ -20,7 +22,7 @@ func main() {
 	rampDown := flag.Duration("rampdown", 1*time.Second, "ramp-down period (0 = instant)")
 	flag.Parse()
 
-	available := fault.AvailableCPUs()
+	available := cpu.AvailableCPUs()
 
 	fmt.Println("╔══════════════════════════════════════════╗")
 	fmt.Println("║     atropos-go · CPU Throttle POC        ║")
@@ -34,28 +36,29 @@ func main() {
 	fmt.Printf("  Ramp-up:                %s\n", *rampUp)
 	fmt.Println()
 
-	// Allow Ctrl+C to cancel early.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	cfg := fault.CPUThrottleConfig{
-		TargetLoad: *load,
-		Duration:   *duration,
-		RampUp:     *rampUp,
-		RampDown:   *rampDown,
+	s := &cpu.Stress{
+		Config: resource.Config{
+			FaultConfig: fault.FaultConfig{
+				Duration: *duration,
+				RampUp:   *rampUp,
+				RampDown: *rampDown,
+			},
+			TargetLoad: *load,
+		},
 	}
 
-	handle, err := fault.StartCPUThrottle(ctx, cfg)
+	handle, err := s.Start(ctx)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "❌ Config error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Config error: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Println("🔥 CPU throttle started (non-blocking) — doing other work…")
+	fmt.Println("CPU throttle started (non-blocking) — doing other work…")
 	fmt.Println()
 
-	// Simulate the SDK / request handler continuing to do work while
-	// the CPU throttle runs in the background.
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	tick := 1
@@ -63,24 +66,24 @@ func main() {
 	for {
 		select {
 		case result := <-handle.Done():
-			// Throttle finished.
 			fmt.Println()
 			fmt.Println("── Throttle Results ─────────────────────────")
-			fmt.Printf("  Available CPUs:         %.2f\n", result.AvailableCPUs)
-			fmt.Printf("  Workers spawned:        %d\n", result.Workers)
-			fmt.Printf("  Per-worker load:        %.0f%%\n", result.PerWorkerLoad*100)
+			if d, ok := result.Detail.(cpu.Detail); ok {
+				fmt.Printf("  Available CPUs:         %.2f\n", d.AvailableCPUs)
+				fmt.Printf("  Workers spawned:        %d\n", d.Workers)
+				fmt.Printf("  Per-worker load:        %.0f%%\n", d.PerWorkerLoad*100)
+			}
 			fmt.Printf("  Actual duration:        %s\n", result.ActualDuration)
 			if result.Err != nil {
 				fmt.Printf("  Error:                  %v\n", result.Err)
 			} else {
-				fmt.Println("  Status:                 ✅ completed normally")
+				fmt.Println("  Status:                 completed normally")
 			}
 			fmt.Println()
-			fmt.Println("💡 Tip: run 'docker stats' or Task Manager to see CPU usage in real time.")
+			fmt.Println("Tip: run 'docker stats' or Task Manager to see CPU usage in real time.")
 			return
 
 		case <-ticker.C:
-			// Proof that the main goroutine is NOT blocked.
 			fmt.Printf("  [main] still running… tick #%d\n", tick)
 			tick++
 		}
