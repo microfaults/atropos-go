@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	fault "atropos-go/internal/faults"
-	"atropos-go/internal/faults/resource"
+	"atropos-go/internal/fault"
+	"atropos-go/internal/fault/resource"
 )
 
 // Stress is a CPU-pressure fault that consumes a configurable fraction
