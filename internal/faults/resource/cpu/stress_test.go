@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"atropos-go/internal/fault"
-	"atropos-go/internal/fault/resource"
+	fault "atropos-go/internal/faults"
+	"atropos-go/internal/faults/resource"
 )
 
 func newStress(load float64, duration, rampUp, rampDown time.Duration) *Stress {

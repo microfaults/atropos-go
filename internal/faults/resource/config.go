@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"atropos-go/internal/fault"
+	fault "atropos-go/internal/faults"
 )
 
 // Config holds parameters shared by all resource-pressure faults
