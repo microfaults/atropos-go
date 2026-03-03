@@ -1,3 +1,3 @@
-module github.com/pronei/faults-lab
+module atropos-go
 
 go 1.25.5
