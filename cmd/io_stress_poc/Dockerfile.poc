@@ -1,0 +1,21 @@
+# ── Build stage ────────────────────────────────────────────────
+FROM golang:1.25-alpine AS builder
+
+WORKDIR /app
+COPY go.mod ./
+# If a go.sum exists, copy it too (not yet, but future-proof).
+COPY go.sum* ./
+
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 go build -o /io_stress_poc ./cmd/io_stress_poc
+
+# ── Runtime stage ──────────────────────────────────────────────
+FROM alpine:3.21
+
+COPY --from=builder /io_stress_poc /io_stress_poc
+
+ENTRYPOINT ["/io_stress_poc"]
+# Default: 100 KB/s read rate, 100 × 4KB files, 5 seconds.
+CMD ["--readrate=102400", "--filecount=100", "--filesize=4096", "--duration=5s"]
