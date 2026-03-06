@@ -1,0 +1,15 @@
+FROM grafana/k6:latest
+
+# Generic runner entry point
+COPY runner.js /scripts/runner.js
+
+# JS modules (engine, template, archer, tracing, legacy personas)
+COPY scripts/ /scripts/scripts/
+
+# Declarative config layers
+COPY flows/ /scripts/flows/
+COPY personas/ /scripts/personas/
+
+WORKDIR /scripts
+
+ENTRYPOINT ["k6"]
