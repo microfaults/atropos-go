@@ -61,8 +61,9 @@ type Fault interface {
 // It is returned by Fault.Start and lets the caller wait for completion
 // or request early cancellation without blocking.
 type Handle struct {
-	done   chan Result
-	cancel context.CancelFunc
+	done     chan Result
+	cancel   context.CancelFunc
+	onResult func(Result)
 }
 
 // NewHandle creates a Handle wired to the given cancel func.
@@ -72,6 +73,13 @@ func NewHandle(cancel context.CancelFunc) *Handle {
 		done:   make(chan Result, 1),
 		cancel: cancel,
 	}
+}
+
+// SetOnResult registers a callback that fires synchronously when Send
+// is called, before the result enters the Done channel. Used by the
+// interceptor to end OTel spans on fault completion.
+func (h *Handle) SetOnResult(fn func(Result)) {
+	h.onResult = fn
 }
 
 // Done returns a channel that receives exactly one Result when the fault
@@ -86,7 +94,12 @@ func (h *Handle) Stop() {
 }
 
 // Send delivers the result to the Done channel. Called once by fault implementations.
+// If an OnResult callback is set, it fires synchronously before the result
+// is pushed to the channel.
 func (h *Handle) Send(r Result) {
+	if h.onResult != nil {
+		h.onResult(r)
+	}
 	h.done <- r
 }
 
