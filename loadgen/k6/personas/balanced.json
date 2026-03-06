@@ -1,0 +1,11 @@
+{
+  "name": "balanced",
+  "description": "Browses everything, buys selectively. Maps to bargain-hunter archetype.",
+  "probabilities": {
+    "explore": 0.95,
+    "engage": 0.4,
+    "commit": 0.3,
+    "repeat": 0.5
+  },
+  "thinkTime": { "min": 3000, "max": 8000 }
+}
