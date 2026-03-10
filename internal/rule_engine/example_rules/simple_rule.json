@@ -1,7 +1,44 @@
 {
-  "id": "simple_rule",
-  "name": "Simple Rule",
-  "conditions": [],
-  "faults": [],
-  "edges": []
+  "id":          "checkout_high_value",
+  "name":        "High-value checkout orders",
+  "description": "Inject CPU faults on orders over $100",
+  "conditions": [
+    {
+      "id":        "checkout_svc",
+      "name":      "Checkout Service",
+      "match": [
+        { "field": "service", "operator": "==", "value": "checkout" }
+      ]
+    },
+    {
+      "id":   "high_value",
+      "name": "High-Value Order",
+      "match": [
+        { "field": "total_amount.units", "operator": ">", "value": 100 }
+      ]
+    }
+  ],
+  "faults": [
+    {
+      "id":   "cpu_fault",
+      "name": "CPU Spike",
+      "spec": {
+        "fault_type":      "cpu",
+        "injection_point": "inbound",
+        "duration_ms":     10000,
+        "cpu": {
+          "target_load": 0.8,
+          "window_ms":   100
+        },
+        "metrics": {
+          "target_load": 0.8,
+          "window_ms":   100
+        }
+      }
+    }
+  ],
+  "edges": [
+    ["checkout_svc", "high_value"],
+    ["high_value",   "cpu_fault"]
+  ]
 }

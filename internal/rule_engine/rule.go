@@ -2,6 +2,8 @@ package rule_engine
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -17,38 +19,181 @@ const (
 	NodeFault
 )
 
+// ─── Enum types ─────────────────────────────────────────────────────
+
+// FaultKind selects which type of fault to inject.
+type FaultKind string
+
+const (
+	FaultCPU        FaultKind = "cpu"
+	FaultIO         FaultKind = "io"
+	FaultLatency    FaultKind = "latency"
+	FaultPacketDrop FaultKind = "packet_drop"
+)
+
+// InjectionPoint is where in the request lifecycle the fault is injected.
+type InjectionPoint string
+
+const (
+	InjectInbound   InjectionPoint = "inbound"
+	InjectOutbound  InjectionPoint = "outbound"
+	InjectTransient InjectionPoint = "transient"
+	InjectCustom    InjectionPoint = "custom"
+)
+
+// IOMode selects the direction of I/O stress.
+type IOMode string
+
+const (
+	IOModeRead      IOMode = "read"
+	IOModeWrite     IOMode = "write"
+	IOModeReadWrite IOMode = "readwrite"
+)
+
 // ─── FaultSpec ──────────────────────────────────────────────────────
 
 // FaultSpec is the complete fault configuration.
 // Condition nodes can embed this in their Rego policy as "fault_spec",
 // and fault (leaf) nodes carry it directly.
 //
-// The fields map onto existing types:
-//   - DurationMs/RampUpMs/RampDownMs → fault.FaultConfig
-//   - TargetLoad/WindowMs            → resource.Config
-//   - ReadRate/FileSize/FileCount/Workers/IOMode → io.Config
+// Base timing (duration, ramp) is common to every fault. Type-specific
+// parameters live in the matching sub-struct (CPU, IO, Latency, Network).
+// Only the sub-struct corresponding to FaultType should be populated.
+//
+// Metrics is a free-form map whose keys become span attribute names on
+// the fault's trace span (e.g. {"target_load": 0.8, "window_ms": 100}).
 type FaultSpec struct {
-	// What kind of fault to inject.
-	FaultType string `json:"fault_type"` // "cpu", "io", "latency", "packet_drop"
+	// ── Discriminators ──
 
-	// Where in the request lifecycle to inject.
-	InjectionPoint string `json:"injection_point"` // "inbound", "outbound", "transient", "custom"
+	// FaultType selects which sub-struct carries the type-specific config.
+	FaultType FaultKind `json:"fault_type"`
 
-	// For outbound faults: which downstream service to target.
+	// InjectionPoint is where in the request lifecycle to inject.
+	InjectionPoint InjectionPoint `json:"injection_point"`
+
+	// TargetService is the downstream service to target (outbound faults).
 	TargetService string `json:"target_service,omitempty"`
 
-	// ── Base fault config (fault.FaultConfig) ──
+	// ── Base timing (common to all faults) ──
 
 	DurationMs int64 `json:"duration_ms"`
 	RampUpMs   int64 `json:"ramp_up_ms,omitempty"`
 	RampDownMs int64 `json:"ramp_down_ms,omitempty"`
 
-	// ── Resource fault config (resource.Config) ──
+	// ── Type-specific params ──
 
-	// TargetLoad is the fraction of the resource to consume (0.0, 1.0].
-	TargetLoad float64 `json:"target_load,omitempty"`
+	CPU     *CPUParams     `json:"cpu,omitempty"`
+	IO      *IOParams      `json:"io,omitempty"`
+	Latency *LatencyParams `json:"latency,omitempty"`
+	Network *NetworkParams `json:"network,omitempty"`
+
+	// ── Observability ──
+
+	// Metrics to attach to the fault's trace span.
+	// Keys become OTel span attribute names; values are recorded as-is.
+	Metrics map[string]any `json:"metrics,omitempty"`
+}
+
+// Validate checks that the FaultSpec is well-formed.
+func (s *FaultSpec) Validate() error {
+	if s.FaultType == "" {
+		return fmt.Errorf("fault_spec: fault_type is required")
+	}
+	if s.InjectionPoint == "" {
+		return fmt.Errorf("fault_spec: injection_point is required")
+	}
+	if s.DurationMs <= 0 {
+		return fmt.Errorf("fault_spec: duration_ms must be > 0")
+	}
+
+	switch s.FaultType {
+	case FaultCPU:
+		if s.CPU == nil {
+			return fmt.Errorf("fault_spec: cpu params required for fault_type=cpu")
+		}
+		return s.CPU.Validate()
+	case FaultIO:
+		if s.IO == nil {
+			return fmt.Errorf("fault_spec: io params required for fault_type=io")
+		}
+		return s.IO.Validate()
+	case FaultLatency:
+		if s.Latency == nil {
+			return fmt.Errorf("fault_spec: latency params required for fault_type=latency")
+		}
+		return s.Latency.Validate()
+	case FaultPacketDrop:
+		if s.Network == nil {
+			return fmt.Errorf("fault_spec: network params required for fault_type=packet_drop")
+		}
+		return s.Network.Validate()
+	default:
+		return fmt.Errorf("fault_spec: unknown fault_type %q", s.FaultType)
+	}
+}
+
+// CPUParams holds CPU-pressure fault parameters.
+type CPUParams struct {
+	// TargetLoad is the fraction of available CPU to consume (0.0, 1.0].
+	TargetLoad float64 `json:"target_load"`
 	// WindowMs is the duty-cycle period in milliseconds.
 	WindowMs int64 `json:"window_ms,omitempty"`
+}
+
+// Validate checks CPUParams constraints.
+func (p *CPUParams) Validate() error {
+	if p.TargetLoad <= 0 || p.TargetLoad > 1.0 {
+		return fmt.Errorf("cpu: target_load must be in (0.0, 1.0], got %.2f", p.TargetLoad)
+	}
+	return nil
+}
+
+// IOParams holds I/O stress fault parameters.
+type IOParams struct {
+	ReadRate  int64  `json:"read_rate,omitempty"`
+	FileSize  int    `json:"file_size,omitempty"`
+	FileCount int    `json:"file_count,omitempty"`
+	Workers   int    `json:"workers,omitempty"`
+	IOMode    IOMode `json:"io_mode,omitempty"`
+}
+
+// Validate checks IOParams constraints.
+func (p *IOParams) Validate() error {
+	// All fields have sensible defaults, so nothing is strictly required.
+	return nil
+}
+
+// LatencyParams holds latency-injection parameters.
+type LatencyParams struct {
+	// DelayMs is the fixed delay to inject in milliseconds.
+	DelayMs int64 `json:"delay_ms"`
+	// Jitter is a 0.0–1.0 factor applied as ±(Jitter×DelayMs) randomness.
+	Jitter float64 `json:"jitter,omitempty"`
+}
+
+// Validate checks LatencyParams constraints.
+func (p *LatencyParams) Validate() error {
+	if p.DelayMs <= 0 {
+		return fmt.Errorf("latency: delay_ms must be > 0, got %d", p.DelayMs)
+	}
+	if p.Jitter < 0 || p.Jitter > 1.0 {
+		return fmt.Errorf("latency: jitter must be in [0.0, 1.0], got %.2f", p.Jitter)
+	}
+	return nil
+}
+
+// NetworkParams holds network-fault parameters.
+type NetworkParams struct {
+	// DropRate is the fraction of packets to drop (0.0, 1.0].
+	DropRate float64 `json:"drop_rate"`
+}
+
+// Validate checks NetworkParams constraints.
+func (p *NetworkParams) Validate() error {
+	if p.DropRate <= 0 || p.DropRate > 1.0 {
+		return fmt.Errorf("network: drop_rate must be in (0.0, 1.0], got %.2f", p.DropRate)
+	}
+	return nil
 }
 
 // ─── Rule definition (developer-facing format) ──────────────────────
@@ -125,11 +270,13 @@ type ConditionDef struct {
 	// Option A: structured — for dashboards / non-technical users
 	Match []MatchRule `json:"match,omitempty"`
 
-	// Option B: Rego — for power users
-	// Rego is the Rego policy source code.
+	// Option B: Rego inline — for power users
 	// Must define "package <name>" and a "match" rule.
-	// May optionally define a "fault_spec" rule.
 	Rego string `json:"rego,omitempty"`
+
+	// Option C: Rego file — path to a .rego file (relative to the rule JSON).
+	// Loaded at graph-build time. Same requirements as inline Rego.
+	RegoFile string `json:"rego_file,omitempty"`
 }
 
 type MatchRule struct {
@@ -258,16 +405,22 @@ type FaultDef struct {
 // of RuleDefs.  It feeds every definition through a Builder and returns
 // the validated, ready-to-evaluate graph.
 //
-// For each ConditionDef, if Rego is provided it is used directly.
-// Otherwise, the Match rules are auto-compiled into Rego via GenerateRego.
+// baseDir is the directory against which relative rego_file paths are
+// resolved (typically the directory containing the rule JSON file).
+// Pass "" if no file-based Rego references are used.
+//
+// For each ConditionDef the Rego source is resolved with this priority:
+//   1. Inline Rego string
+//   2. rego_file path (read at build time)
+//   3. Match rules (auto-compiled)
 //
 //	rules := []RuleDef{ ... }
-//	graph, policies, err := BuildGraph(rules, &OPACompiler{})
-func BuildGraph(rules []RuleDef, compiler PolicyCompiler) (*Graph, map[string]CompiledPolicy, error) {
+//	graph, policies, err := BuildGraph(rules, &OPACompiler{}, "/path/to/rules")
+func BuildGraph(rules []RuleDef, compiler PolicyCompiler, baseDir string) (*Graph, map[string]CompiledPolicy, error) {
 	b := NewBuilder(compiler)
 	for _, r := range rules {
 		for _, c := range r.Conditions {
-			regoSrc, err := resolveRego(c)
+			regoSrc, err := resolveRego(c, baseDir)
 			if err != nil {
 				return nil, nil, fmt.Errorf("rule %q, condition %q: %w", r.ID, c.ID, err)
 			}
@@ -288,14 +441,34 @@ func BuildGraph(rules []RuleDef, compiler PolicyCompiler) (*Graph, map[string]Co
 }
 
 // resolveRego returns the Rego source for a ConditionDef.
-// If Rego is set, it is returned as-is.
-// Otherwise, GenerateRego compiles the Match rules into Rego.
-func resolveRego(c ConditionDef) (string, error) {
+//
+// Priority: inline Rego > rego_file > match rules.
+func resolveRego(c ConditionDef, baseDir string) (string, error) {
+	// 1. Inline Rego string.
 	if c.Rego != "" {
 		return c.Rego, nil
 	}
+
+	// 2. Rego file reference.
+	if c.RegoFile != "" {
+		path := c.RegoFile
+		if !filepath.IsAbs(path) && baseDir != "" {
+			path = filepath.Join(baseDir, path)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("failed to read rego_file %q: %w", c.RegoFile, err)
+		}
+		src := strings.TrimSpace(string(data))
+		if src == "" {
+			return "", fmt.Errorf("rego_file %q is empty", c.RegoFile)
+		}
+		return src, nil
+	}
+
+	// 3. Structured match rules → auto-compile to Rego.
 	if len(c.Match) == 0 {
-		return "", fmt.Errorf("condition must have either 'rego' or 'match' rules")
+		return "", fmt.Errorf("condition must have 'rego', 'rego_file', or 'match' rules")
 	}
 	return GenerateRego(c.ID, c.Match)
 }

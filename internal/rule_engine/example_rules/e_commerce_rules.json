@@ -1,0 +1,198 @@
+[
+  {
+    "id": "blacklisted_checkout",
+    "name": "Blacklisted user on checkout",
+    "description": "CPU spike for known malicious users hitting the checkout service",
+    "conditions": [
+      {
+        "id":        "checkout_svc",
+        "name":      "Checkout Service",
+        "rego_file": "checkout_svc.rego"
+      },
+      {
+        "id":   "blacklisted_user",
+        "name": "Blacklisted User",
+        "match": [
+          { "field": "user_id", "operator": "in", "value": ["hacker1", "hacker2", "bot_9000"] }
+        ]
+      }
+    ],
+    "faults": [
+      {
+        "id":   "cpu_spike_checkout",
+        "name": "CPU Spike (checkout blacklist)",
+        "spec": {
+          "fault_type":      "cpu",
+          "injection_point": "inbound",
+          "duration_ms":     8000,
+          "cpu":             { "target_load": 0.9, "window_ms": 50 },
+          "metrics":         { "reason": "blacklisted_user", "target_load": 0.9 }
+        }
+      }
+    ],
+    "edges": [
+      ["checkout_svc",     "blacklisted_user"],
+      ["blacklisted_user", "cpu_spike_checkout"]
+    ]
+  },
+
+  {
+    "id": "high_value_international_payment",
+    "name": "International high-value payment latency",
+    "description": "Inject latency on international payments over $500 through the payment service",
+    "conditions": [
+      {
+        "id":        "payment_svc",
+        "name":      "Payment Service",
+        "rego_file": "payment_svc.rego"
+      },
+      {
+        "id":   "high_value_order",
+        "name": "High-Value Order (>$500)",
+        "match": [
+          { "field": "total_amount.units", "operator": ">", "value": 500 }
+        ]
+      },
+      {
+        "id":        "international_origin",
+        "name":      "International Origin",
+        "rego_file": "international_origin.rego"
+      }
+    ],
+    "faults": [
+      {
+        "id":   "latency_intl_payment",
+        "name": "Payment Gateway Latency",
+        "spec": {
+          "fault_type":      "latency",
+          "injection_point": "outbound",
+          "target_service":  "payment-gateway",
+          "duration_ms":     5000,
+          "latency":         { "delay_ms": 2000, "jitter": 0.3 },
+          "metrics":         { "scenario": "international_payment", "delay_ms": 2000 }
+        }
+      }
+    ],
+    "edges": [
+      ["payment_svc",          "high_value_order"],
+      ["high_value_order",     "international_origin"],
+      ["international_origin", "latency_intl_payment"]
+    ]
+  },
+
+  {
+    "id": "low_stock_inventory",
+    "name": "Low stock inventory I/O stress",
+    "description": "Stress disk I/O when inventory service sees low-stock items",
+    "conditions": [
+      {
+        "id":   "inventory_svc",
+        "name": "Inventory Service",
+        "match": [
+          { "field": "service", "operator": "==", "value": "inventory" }
+        ]
+      },
+      {
+        "id":        "low_stock",
+        "name":      "Low Stock Item",
+        "rego_file": "low_stock.rego"
+      }
+    ],
+    "faults": [
+      {
+        "id":   "io_stress_inventory",
+        "name": "Disk I/O Stress",
+        "spec": {
+          "fault_type":      "io",
+          "injection_point": "transient",
+          "duration_ms":     15000,
+          "io":              { "workers": 4, "file_size": 1048576, "file_count": 10, "io_mode": "readwrite" },
+          "metrics":         { "scenario": "low_stock_io" }
+        }
+      }
+    ],
+    "edges": [
+      ["inventory_svc", "low_stock"],
+      ["low_stock",     "io_stress_inventory"]
+    ]
+  },
+
+  {
+    "id": "guest_cart_drops",
+    "name": "Guest user cart packet drops",
+    "description": "Drop packets for unauthenticated users on the cart service",
+    "conditions": [
+      {
+        "id":   "cart_svc",
+        "name": "Cart Service",
+        "match": [
+          { "field": "service", "operator": "==", "value": "cart" }
+        ]
+      },
+      {
+        "id":   "guest_user",
+        "name": "Guest / Unauthenticated User",
+        "match": [
+          { "field": "user_id", "operator": "==", "value": "" }
+        ]
+      }
+    ],
+    "faults": [
+      {
+        "id":   "packet_drop_cart",
+        "name": "Cart Packet Drop",
+        "spec": {
+          "fault_type":      "packet_drop",
+          "injection_point": "inbound",
+          "duration_ms":     10000,
+          "network":         { "drop_rate": 0.5 },
+          "metrics":         { "scenario": "guest_cart_drop", "drop_rate": 0.5 }
+        }
+      }
+    ],
+    "edges": [
+      ["cart_svc",    "guest_user"],
+      ["guest_user",  "packet_drop_cart"]
+    ]
+  },
+
+  {
+    "id": "regional_shipping_latency",
+    "name": "Regional shipping latency burst",
+    "description": "Inject latency on the shipping service for specific regions",
+    "conditions": [
+      {
+        "id":   "shipping_svc",
+        "name": "Shipping Service",
+        "match": [
+          { "field": "service", "operator": "==", "value": "shipping" }
+        ]
+      },
+      {
+        "id":        "target_region",
+        "name":      "Target Region (EU/APAC)",
+        "rego_file": "target_region.rego"
+      }
+    ],
+    "faults": [
+      {
+        "id":   "latency_shipping",
+        "name": "Shipping Latency Burst",
+        "spec": {
+          "fault_type":      "latency",
+          "injection_point": "outbound",
+          "target_service":  "shipping-provider-api",
+          "duration_ms":     12000,
+          "ramp_up_ms":      2000,
+          "ramp_down_ms":    2000,
+          "latency":         { "delay_ms": 3000, "jitter": 0.5 },
+          "metrics":         { "scenario": "regional_shipping", "delay_ms": 3000 }
+        }
+      }
+    ],
+    "edges": [
+      ["shipping_svc",   "target_region"],
+      ["target_region",  "latency_shipping"]
+    ]
+  }
+]
