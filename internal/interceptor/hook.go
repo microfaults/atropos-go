@@ -2,34 +2,58 @@ package interceptor
 
 import (
 	"context"
+	"fmt"
 
 	"atropos-go/internal/evaluator"
 	fault "atropos-go/internal/fault"
+	"atropos-go/internal/trace"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
-// Hook checks for faults at a developer-annotated code point.
-//
-// Usage:
-//
-//	cr, _ := interceptor.Hook(ctx, "process-payment", map[string]string{"amount": "100"})
-//	if cr.Handle != nil {
-//	    <-cr.Handle.Done()
-//	}
-func (i *Interceptor) Hook(ctx context.Context, name string, labels map[string]string) (CheckResult, error) {
+// Hook always creates a span and checks for faults. Caller must End() the span.
+func (i *Interceptor) Hook(ctx context.Context, name string, labels map[string]string) (context.Context, trace.Span, CheckResult, error) {
 	if labels == nil {
 		labels = make(map[string]string)
 	}
-	labels["hook.name"] = name
+	labels[trace.AttrHookName] = name
 
-	return i.Check(ctx, evaluator.Request{
+	// Always create a hook span for the annotated code block.
+	ctx, hookSpan := i.tracer.Start(ctx, trace.SpanHookPrefix+name,
+		attribute.String(trace.AttrHookName, name),
+	)
+
+	// Thread developer labels onto the hook span.
+	for k, v := range labels {
+		hookSpan.SetAttributes(attribute.String(k, v))
+	}
+
+	// Check for faults — the fault span nests under the hook span
+	// because ctx already carries the hook span.
+	cr, err := i.Check(ctx, evaluator.Request{
 		Point:  evaluator.Custom,
 		Labels: labels,
 	})
+	if err != nil {
+		hookSpan.AddEvent(trace.EventFaultCheckErr,
+			attribute.String("error", err.Error()),
+		)
+		return ctx, hookSpan, cr, err
+	}
+
+	if cr.Handle != nil {
+		hookSpan.AddEvent(trace.EventFaultInjected,
+			attribute.String(trace.AttrFaultType, fmt.Sprintf("%T", cr.Decision.Fault)),
+			attribute.String(trace.AttrFaultReason, cr.Decision.Reason),
+		)
+	} else {
+		hookSpan.AddEvent(trace.EventFaultSkipped)
+	}
+
+	return ctx, hookSpan, cr, nil
 }
 
-// MustFault is a convenience for injection points where a specific fault
-// is always injected (useful for testing without an evaluator).
-// It starts the fault with OTel tracing and returns the handle.
+// MustFault bypasses the evaluator and injects the fault directly.
 func (i *Interceptor) MustFault(ctx context.Context, point evaluator.InjectionPoint, name string, f fault.Fault) (*fault.Handle, error) {
 	// Bypass evaluator — inject directly.
 	return i.startTraced(ctx, point, name, f)
@@ -38,7 +62,7 @@ func (i *Interceptor) MustFault(ctx context.Context, point evaluator.InjectionPo
 func (i *Interceptor) startTraced(ctx context.Context, point evaluator.InjectionPoint, name string, f fault.Fault) (*fault.Handle, error) {
 	cr, err := i.Check(ctx, evaluator.Request{
 		Point:  point,
-		Labels: map[string]string{"hook.name": name},
+		Labels: map[string]string{trace.AttrHookName: name},
 	})
 	if err != nil {
 		return nil, err
@@ -57,8 +81,18 @@ func (i *Interceptor) directStart(ctx context.Context, point evaluator.Injection
 		return nil, err
 	}
 
-	faultType := ""
-	ctx, span := i.tracer.Start(ctx, faultType, point.String(), "direct: "+name)
+	ctx, span := i.tracer.Start(ctx, trace.SpanFaultInject,
+		attribute.String(trace.AttrFaultType, fmt.Sprintf("%T", f)),
+		attribute.String(trace.AttrFaultInjectionPoint, point.String()),
+		attribute.String(trace.AttrFaultReason, "direct: "+name),
+	)
+
+	// If the fault can emit events, wire it up to the span.
+	if ea, ok := f.(fault.EventAware); ok {
+		ea.SetEventEmitter(func(evName string, attrs ...attribute.KeyValue) {
+			span.AddEvent(evName, attrs...)
+		})
+	}
 
 	handle, err := f.Start(ctx)
 	if err != nil {

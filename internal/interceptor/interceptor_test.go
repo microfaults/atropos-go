@@ -11,6 +11,8 @@ import (
 	fault "atropos-go/internal/fault"
 	"atropos-go/internal/fault/inline"
 	"atropos-go/internal/trace"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // mockEvaluator returns a fixed decision for all requests.
@@ -36,6 +38,21 @@ func TestCheck_NoFault(t *testing.T) {
 	}
 	if cr.Decision != nil {
 		t.Fatal("expected nil decision")
+	}
+}
+
+func TestCheck_NilEvaluator(t *testing.T) {
+	// A nil evaluator should use the noop fallback and not panic.
+	i := New(nil, trace.Noop())
+
+	cr, err := i.Check(context.Background(), evaluator.Request{
+		Point: evaluator.Ingress,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cr.Handle != nil {
+		t.Fatal("expected nil handle with nil evaluator")
 	}
 }
 
@@ -125,6 +142,72 @@ func TestCheck_OnResultCallback(t *testing.T) {
 		recorder.started, recorder.span.resultRecorded)
 }
 
+func TestCheck_LabelsThreadedToSpan(t *testing.T) {
+	eval := &mockEvaluator{
+		decision: &evaluator.Decision{
+			Fault:  &inline.Latency{Delay: 10 * time.Millisecond},
+			Reason: "test",
+			Mode:   evaluator.Inline,
+		},
+	}
+
+	recorder := &recordingTracer{}
+	i := New(eval, recorder)
+
+	labels := map[string]string{
+		"tenant":      "acme",
+		"queue_depth": "42",
+	}
+
+	cr, err := i.Check(context.Background(), evaluator.Request{
+		Point:  evaluator.Ingress,
+		Labels: labels,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-cr.Handle.Done()
+
+	// Verify labels were set on the span as attributes.
+	found := make(map[string]string)
+	for _, a := range recorder.span.attrs {
+		found[string(a.Key)] = a.Value.AsString()
+	}
+
+	for k, v := range labels {
+		got, ok := found[k]
+		if !ok {
+			t.Errorf("label %q not found in span attributes", k)
+		} else if got != v {
+			t.Errorf("label %q: got %q, want %q", k, got, v)
+		}
+	}
+	t.Logf("labels threaded to span: %v", found)
+}
+
+func TestCheck_SpanName(t *testing.T) {
+	eval := &mockEvaluator{
+		decision: &evaluator.Decision{
+			Fault:  &inline.Latency{Delay: 10 * time.Millisecond},
+			Reason: "test",
+			Mode:   evaluator.Inline,
+		},
+	}
+
+	recorder := &recordingTracer{}
+	i := New(eval, recorder)
+
+	cr, err := i.Check(context.Background(), evaluator.Request{Point: evaluator.Ingress})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-cr.Handle.Done()
+
+	if recorder.spanName != trace.SpanFaultInject {
+		t.Fatalf("expected span name %q, got %q", trace.SpanFaultInject, recorder.spanName)
+	}
+}
+
 func TestIngressMiddleware(t *testing.T) {
 	eval := &mockEvaluator{
 		decision: &evaluator.Decision{
@@ -163,40 +246,192 @@ func TestHook(t *testing.T) {
 			Mode:   evaluator.Inline,
 		},
 	}
-	i := New(eval, trace.Noop())
+	recorder := &recordingTracer{}
+	i := New(eval, recorder)
 
-	cr, err := i.Hook(context.Background(), "process-payment", map[string]string{"amount": "100"})
+	ctx, hookSpan, cr, err := i.Hook(context.Background(), "process-payment", map[string]string{"amount": "100"})
 	if err != nil {
 		t.Fatal(err)
 	}
+	_ = ctx
 	if cr.Handle == nil {
 		t.Fatal("expected handle from hook")
 	}
 
 	result := <-cr.Handle.Done()
+	hookSpan.End()
+
 	if result.Err != nil {
 		t.Fatalf("unexpected error: %v", result.Err)
 	}
+
+	// Verify the hook span was created (the first Start call is the hook span).
+	if !recorder.started {
+		t.Fatal("hook span was not created")
+	}
+
+	// Verify injected event was recorded on the hook span.
+	foundInjected := false
+	for _, ev := range recorder.span.events {
+		if ev == trace.EventFaultInjected {
+			foundInjected = true
+		}
+	}
+	if !foundInjected {
+		t.Fatal("expected fault.injected event on hook span")
+	}
+
 	t.Logf("hook: %s", result.ActualDuration)
 }
 
-// recordingTracer tracks whether Start was called and span was ended.
+func TestHook_AlwaysCreatesSpan(t *testing.T) {
+	// Even with nil evaluator (no faults), Hook must create a span.
+	recorder := &recordingTracer{}
+	i := New(nil, recorder)
+
+	ctx, hookSpan, cr, err := i.Hook(context.Background(), "drain-queue", map[string]string{
+		"queue_depth": "7",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = ctx
+
+	// No fault should fire.
+	if cr.Handle != nil {
+		t.Fatal("expected nil handle when no evaluator")
+	}
+
+	hookSpan.End()
+
+	if !recorder.started {
+		t.Fatal("hook span was not created")
+	}
+
+	// Verify span name includes hook name.
+	expectedName := trace.SpanHookPrefix + "drain-queue"
+	if recorder.spanName != expectedName {
+		t.Fatalf("expected span name %q, got %q", expectedName, recorder.spanName)
+	}
+
+	// Verify labels were set on the hook span.
+	found := make(map[string]string)
+	for _, a := range recorder.span.attrs {
+		found[string(a.Key)] = a.Value.AsString()
+	}
+	if found["queue_depth"] != "7" {
+		t.Errorf("expected queue_depth=7, got %q", found["queue_depth"])
+	}
+
+	// Verify fault.skipped event.
+	foundSkipped := false
+	for _, ev := range recorder.span.events {
+		if ev == trace.EventFaultSkipped {
+			foundSkipped = true
+		}
+	}
+	if !foundSkipped {
+		t.Fatal("expected fault.skipped event on hook span")
+	}
+
+	if !recorder.span.ended {
+		t.Fatal("hook span was not ended")
+	}
+}
+
+// recordingTracer tracks Start calls and span lifecycle for test assertions.
 type recordingTracer struct {
-	started bool
-	span    recordingSpan
+	started  bool
+	spanName string
+	span     recordingSpan
+	// spanCount tracks how many times Start was called (hook + fault = 2).
+	spanCount int
 }
 
 type recordingSpan struct {
 	resultRecorded bool
 	errorRecorded  bool
 	ended          bool
+	attrs          []attribute.KeyValue
+	events         []string
 }
 
-func (t *recordingTracer) Start(ctx context.Context, _, _, _ string) (context.Context, trace.Span) {
+func (t *recordingTracer) Start(ctx context.Context, name string, _ ...attribute.KeyValue) (context.Context, trace.Span) {
 	t.started = true
+	t.spanCount++
+	// Record the first span name (hook or fault depending on call order).
+	if t.spanCount == 1 {
+		t.spanName = name
+	}
 	return ctx, &t.span
 }
 
+func (s *recordingSpan) SetAttributes(attrs ...attribute.KeyValue) {
+	s.attrs = append(s.attrs, attrs...)
+}
+func (s *recordingSpan) AddEvent(name string, _ ...attribute.KeyValue) {
+	s.events = append(s.events, name)
+}
 func (s *recordingSpan) RecordResult(_ fault.Result) { s.resultRecorded = true }
 func (s *recordingSpan) EndWithError(_ error)        { s.errorRecorded = true; s.ended = true }
 func (s *recordingSpan) End()                        { s.ended = true }
+
+// eventFault is a test fault implementing EventAware.
+// It calls the injected EventEmitter during Start to verify the interceptor
+// wires up span events correctly.
+type eventFault struct {
+	emit      fault.EventEmitter
+	emitName  string
+	emitAttrs []attribute.KeyValue
+}
+
+func (f *eventFault) Validate() error { return nil }
+func (f *eventFault) Start(ctx context.Context) (*fault.Handle, error) {
+	_, cancel := context.WithCancel(ctx)
+	h := fault.NewHandle(cancel)
+	go func() {
+		defer cancel()
+		if f.emit != nil {
+			f.emit(f.emitName, f.emitAttrs...)
+		}
+		h.Send(fault.Result{ActualDuration: time.Millisecond})
+	}()
+	return h, nil
+}
+func (f *eventFault) SetEventEmitter(fn fault.EventEmitter) { f.emit = fn }
+
+func TestCheck_EventAwareFault_EmitsSpanEvents(t *testing.T) {
+	ef := &eventFault{
+		emitName:  "test.event",
+		emitAttrs: []attribute.KeyValue{attribute.String("key", "value")},
+	}
+	eval := &mockEvaluator{decision: &evaluator.Decision{
+		Fault:  ef,
+		Reason: "test: event aware",
+		Mode:   evaluator.Inline,
+	}}
+	recorder := &recordingTracer{}
+	i := New(eval, recorder)
+
+	cr, err := i.Check(context.Background(), evaluator.Request{
+		Point:  evaluator.Custom,
+		Labels: map[string]string{"test": "true"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-cr.Handle.Done()
+
+	if len(recorder.span.events) == 0 {
+		t.Fatal("expected EventAware fault to emit span events")
+	}
+	found := false
+	for _, e := range recorder.span.events {
+		if e == "test.event" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected event 'test.event', got events: %v", recorder.span.events)
+	}
+}

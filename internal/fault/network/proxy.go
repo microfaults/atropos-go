@@ -11,14 +11,18 @@ import (
 	"time"
 
 	fault "atropos-go/internal/fault"
+	"atropos-go/internal/trace"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Proxy is a TCP fault that sits between client and upstream,
 // applying toxic effects to connections passing through it.
 //
-// Implements fault.Fault.
+// Implements fault.Fault and fault.EventAware.
 type Proxy struct {
 	Config
+	emit fault.EventEmitter
 }
 
 // Detail carries diagnostics from a completed proxy fault.
@@ -28,6 +32,19 @@ type Detail struct {
 	TotalConnections int64
 	AffectedConns    int64
 	PassthroughConns int64
+}
+
+// SetEventEmitter implements fault.EventAware. The interceptor injects
+// an emitter that records span events on the enclosing fault.inject span.
+func (p *Proxy) SetEventEmitter(fn fault.EventEmitter) {
+	p.emit = fn
+}
+
+// emitEvent is a nil-safe helper for emitting span events.
+func (p *Proxy) emitEvent(name string, attrs ...attribute.KeyValue) {
+	if p.emit != nil {
+		p.emit(name, attrs...)
+	}
 }
 
 // Validate checks that the proxy config is valid.
@@ -116,16 +133,22 @@ func (p *Proxy) run(ctx context.Context, cancel context.CancelFunc, listener *ne
 			continue
 		}
 
-		totalConns.Add(1)
+		connID := totalConns.Add(1)
 		applyToxics := rng.Float64() < scope
+
+		p.emitEvent(trace.EventNetConnAccepted,
+			attribute.Int64(trace.AttrNetConnID, connID),
+			attribute.String(trace.AttrNetConnRemoteAddr, conn.RemoteAddr().String()),
+			attribute.Bool(trace.AttrNetConnAffected, applyToxics),
+		)
 
 		wg.Add(1)
 		if applyToxics {
 			affected.Add(1)
-			go func(c *net.TCPConn) {
+			go func(c *net.TCPConn, id int64) {
 				defer wg.Done()
-				p.handleAffected(ctx, c)
-			}(conn)
+				p.handleAffected(ctx, c, id)
+			}(conn, connID)
 		} else {
 			passthrough.Add(1)
 			go func(c *net.TCPConn) {
@@ -149,5 +172,8 @@ func (p *Proxy) run(ctx context.Context, cancel context.CancelFunc, listener *ne
 	})
 }
 
-// Compile-time interface check.
-var _ fault.Fault = (*Proxy)(nil)
+// Compile-time interface checks.
+var (
+	_ fault.Fault      = (*Proxy)(nil)
+	_ fault.EventAware = (*Proxy)(nil)
+)

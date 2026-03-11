@@ -14,40 +14,33 @@ import (
 
 const tracerName = "atropos-go/fault"
 
-// Tracer creates and manages spans for fault injection.
-// Abstracted so the interceptor doesn't import OTel directly.
+// Tracer creates and manages spans.
 type Tracer interface {
-	// Start creates a span for a fault injection event.
-	// The returned context carries the span; the returned Span
-	// is used to record the result and end the span.
-	Start(ctx context.Context, faultType, injectionPoint, reason string) (context.Context, Span)
+	Start(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, Span)
 }
 
-// Span records fault-specific attributes and ends the trace span.
+// Span records attributes, events, and lifecycle signals on a trace span.
 type Span interface {
+	SetAttributes(attrs ...attribute.KeyValue)
+	AddEvent(name string, attrs ...attribute.KeyValue)
 	RecordResult(r fault.Result)
 	EndWithError(err error)
 	End()
 }
 
-// OTelTracer is the production tracer backed by go.opentelemetry.io/otel.
-// It uses the globally registered TracerProvider.
+// OTelTracer delegates to the global OTel TracerProvider.
 type OTelTracer struct {
 	tracer oteltrace.Tracer
 }
 
-// NewOTelTracer creates a tracer using the global OTel TracerProvider.
+// NewOTelTracer creates a tracer from the global TracerProvider.
 func NewOTelTracer() *OTelTracer {
 	return &OTelTracer{tracer: otel.Tracer(tracerName)}
 }
 
-func (t *OTelTracer) Start(ctx context.Context, faultType, injectionPoint, reason string) (context.Context, Span) {
-	ctx, span := t.tracer.Start(ctx, "fault.inject",
-		oteltrace.WithAttributes(
-			attribute.String("fault.type", faultType),
-			attribute.String("fault.injection_point", injectionPoint),
-			attribute.String("fault.reason", reason),
-		),
+func (t *OTelTracer) Start(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, Span) {
+	ctx, span := t.tracer.Start(ctx, name,
+		oteltrace.WithAttributes(attrs...),
 	)
 	return ctx, &otelSpan{span: span}
 }
@@ -56,10 +49,18 @@ type otelSpan struct {
 	span oteltrace.Span
 }
 
+func (s *otelSpan) SetAttributes(attrs ...attribute.KeyValue) {
+	s.span.SetAttributes(attrs...)
+}
+
+func (s *otelSpan) AddEvent(name string, attrs ...attribute.KeyValue) {
+	s.span.AddEvent(name, oteltrace.WithAttributes(attrs...))
+}
+
 func (s *otelSpan) RecordResult(r fault.Result) {
 	s.span.SetAttributes(
-		attribute.Int64("fault.duration_ms", r.ActualDuration.Milliseconds()),
-		attribute.String("fault.actual_duration", r.ActualDuration.String()),
+		attribute.Int64(AttrFaultDurationMs, r.ActualDuration.Milliseconds()),
+		attribute.String(AttrFaultActualDuration, r.ActualDuration.String()),
 	)
 	if r.Err != nil {
 		s.span.SetStatus(codes.Error, r.Err.Error())
@@ -68,7 +69,7 @@ func (s *otelSpan) RecordResult(r fault.Result) {
 		s.span.SetStatus(codes.Ok, "completed")
 	}
 	if r.Detail != nil {
-		s.span.SetAttributes(attribute.String("fault.detail", fmt.Sprintf("%+v", r.Detail)))
+		s.span.SetAttributes(attribute.String(AttrFaultDetail, fmt.Sprintf("%+v", r.Detail)))
 	}
 	s.span.End()
 }
