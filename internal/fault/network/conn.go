@@ -3,10 +3,15 @@ package network
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
 	"time"
+
+	"atropos-go/internal/trace"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 const dialTimeout = 5 * time.Second
@@ -25,8 +30,9 @@ func handlePassthrough(ctx context.Context, client *net.TCPConn, upstream string
 }
 
 // handleAffected dials upstream and applies configured toxics.
-func (p *Proxy) handleAffected(ctx context.Context, client *net.TCPConn) {
+func (p *Proxy) handleAffected(ctx context.Context, client *net.TCPConn, connID int64) {
 	defer client.Close()
+	connStart := time.Now()
 
 	// Check for ConnToxic hijackers before dialing upstream.
 	for _, tl := range p.Toxics {
@@ -34,15 +40,39 @@ func (p *Proxy) handleAffected(ctx context.Context, client *net.TCPConn) {
 		if !ok {
 			continue
 		}
+		p.emitEvent(trace.EventNetToxicHijack,
+			attribute.Int64(trace.AttrNetConnID, connID),
+			attribute.String(trace.AttrNetToxicPhase, "pre_dial"),
+			attribute.String(trace.AttrNetToxicType, fmt.Sprintf("%T", ct)),
+		)
 		// Blackhole-style: hijack before we even have an upstream conn.
 		hijacked, err := ct.Hijack(ctx, client, nil)
 		if hijacked || err != nil {
+			p.emitEvent(trace.EventNetConnClosed,
+				attribute.Int64(trace.AttrNetConnID, connID),
+				attribute.Int64(trace.AttrNetConnDurationMs, time.Since(connStart).Milliseconds()),
+				attribute.String("atropos.net.close_reason", "hijack_pre_dial"),
+			)
 			return
 		}
 	}
 
+	dialStart := time.Now()
 	server, err := net.DialTimeout("tcp", p.Upstream, dialTimeout)
+	dialDuration := time.Since(dialStart)
+
+	p.emitEvent(trace.EventNetUpstreamDial,
+		attribute.Int64(trace.AttrNetConnID, connID),
+		attribute.String(trace.AttrNetUpstreamAddr, p.Upstream),
+		attribute.Int64(trace.AttrNetDialDurationMs, dialDuration.Milliseconds()),
+		attribute.Bool("atropos.net.upstream.error", err != nil),
+	)
+
 	if err != nil {
+		p.emitEvent(trace.EventNetConnError,
+			attribute.Int64(trace.AttrNetConnID, connID),
+			attribute.String("error", err.Error()),
+		)
 		return
 	}
 	serverTCP := server.(*net.TCPConn)
@@ -54,9 +84,19 @@ func (p *Proxy) handleAffected(ctx context.Context, client *net.TCPConn) {
 		if !ok {
 			continue
 		}
+		p.emitEvent(trace.EventNetToxicHijack,
+			attribute.Int64(trace.AttrNetConnID, connID),
+			attribute.String(trace.AttrNetToxicPhase, "post_dial"),
+			attribute.String(trace.AttrNetToxicType, fmt.Sprintf("%T", ct)),
+		)
 		hijacked, err := ct.Hijack(ctx, client, serverTCP)
 		if hijacked || err != nil {
 			applyRST(client, serverTCP, err)
+			p.emitEvent(trace.EventNetConnClosed,
+				attribute.Int64(trace.AttrNetConnID, connID),
+				attribute.Int64(trace.AttrNetConnDurationMs, time.Since(connStart).Milliseconds()),
+				attribute.String("atropos.net.close_reason", "hijack_post_dial"),
+			)
 			return
 		}
 	}
@@ -84,6 +124,13 @@ func (p *Proxy) handleAffected(ctx context.Context, client *net.TCPConn) {
 		} else {
 			err = passthrough(ctx, client, serverTCP)
 		}
+		if err != nil {
+			p.emitEvent(trace.EventNetConnError,
+				attribute.Int64(trace.AttrNetConnID, connID),
+				attribute.String("error", err.Error()),
+				attribute.String("atropos.net.direction", "upstream"),
+			)
+		}
 		applyRST(client, serverTCP, err)
 		serverTCP.CloseWrite()
 	}()
@@ -97,11 +144,23 @@ func (p *Proxy) handleAffected(ctx context.Context, client *net.TCPConn) {
 		} else {
 			err = passthrough(ctx, serverTCP, client)
 		}
+		if err != nil {
+			p.emitEvent(trace.EventNetConnError,
+				attribute.Int64(trace.AttrNetConnID, connID),
+				attribute.String("error", err.Error()),
+				attribute.String("atropos.net.direction", "downstream"),
+			)
+		}
 		applyRST(client, serverTCP, err)
 		client.CloseWrite()
 	}()
 
 	wg.Wait()
+
+	p.emitEvent(trace.EventNetConnClosed,
+		attribute.Int64(trace.AttrNetConnID, connID),
+		attribute.Int64(trace.AttrNetConnDurationMs, time.Since(connStart).Milliseconds()),
+	)
 }
 
 // bidirectionalCopy copies data between two TCP connections until one side

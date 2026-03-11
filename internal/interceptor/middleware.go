@@ -5,12 +5,10 @@ import (
 	"net/http"
 
 	"atropos-go/internal/evaluator"
+	"atropos-go/internal/trace"
 )
 
-// IngressMiddleware returns HTTP middleware that checks for faults on
-// inbound requests. If the evaluator returns an Inline fault, the
-// middleware blocks until the fault completes before calling next.
-// Background faults run independently.
+// IngressMiddleware checks for faults on inbound HTTP requests.
 func (i *Interceptor) IngressMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		req := evaluator.Request{
@@ -31,9 +29,7 @@ func (i *Interceptor) IngressMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// EgressTransport wraps an http.RoundTripper to check for faults on
-// outbound requests. If the evaluator returns an Inline fault, the
-// transport blocks before making the real request.
+// EgressTransport checks for faults on outbound HTTP requests.
 func (i *Interceptor) EgressTransport(base http.RoundTripper) http.RoundTripper {
 	if base == nil {
 		base = http.DefaultTransport
@@ -65,12 +61,12 @@ func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 
 func extractHTTPLabels(r *http.Request) map[string]string {
 	labels := map[string]string{
-		"http.method": r.Method,
-		"http.path":   r.URL.Path,
-		"http.host":   r.Host,
+		trace.AttrHTTPMethod: r.Method,
+		trace.AttrHTTPPath:   r.URL.Path,
+		trace.AttrHTTPHost:   r.Host,
 	}
 	if ua := r.UserAgent(); ua != "" {
-		labels["http.user_agent"] = ua
+		labels[trace.AttrHTTPUserAgent] = ua
 	}
 	return labels
 }

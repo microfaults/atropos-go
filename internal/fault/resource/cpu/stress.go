@@ -9,6 +9,9 @@ import (
 
 	"atropos-go/internal/fault"
 	"atropos-go/internal/fault/resource"
+	"atropos-go/internal/trace"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Stress is a CPU-pressure fault that consumes a configurable fraction
@@ -16,8 +19,11 @@ import (
 //
 // Maps to iBench SoI11/12/15 (integer, FP, vector processing pressure)
 // but at the system level rather than microarchitectural.
+//
+// Implements fault.Fault and fault.EventAware.
 type Stress struct {
 	resource.Config
+	emit fault.EventEmitter
 }
 
 // Detail carries CPU-specific diagnostics from a completed fault.
@@ -25,6 +31,18 @@ type Detail struct {
 	AvailableCPUs float64
 	Workers       int
 	PerWorkerLoad float64
+}
+
+// SetEventEmitter implements fault.EventAware.
+func (s *Stress) SetEventEmitter(fn fault.EventEmitter) {
+	s.emit = fn
+}
+
+// emitEvent is a nil-safe helper.
+func (s *Stress) emitEvent(name string, attrs ...attribute.KeyValue) {
+	if s.emit != nil {
+		s.emit(name, attrs...)
+	}
 }
 
 // Validate checks that the CPU stress config is valid.
@@ -74,6 +92,15 @@ func (s *Stress) Start(ctx context.Context) (*fault.Handle, error) {
 		var wg sync.WaitGroup
 		start := time.Now()
 
+		// Phase-tracking goroutine: emits ramp events at transitions.
+		if s.emit != nil && (s.RampUp > 0 || s.RampDown > 0) {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				s.emitPhaseEvents(throttleCtx, start)
+			}()
+		}
+
 		for i := 0; i < workers; i++ {
 			wg.Add(1)
 			go func() {
@@ -103,6 +130,49 @@ func (s *Stress) Start(ctx context.Context) (*fault.Handle, error) {
 	}()
 
 	return handle, nil
+}
+
+// emitPhaseEvents emits timestamped events at ramp phase boundaries.
+func (s *Stress) emitPhaseEvents(ctx context.Context, globalStart time.Time) {
+	rampDownStart := s.Duration - s.RampDown
+
+	if s.RampUp > 0 {
+		s.emitEvent(trace.EventResourceRampUpStart,
+			attribute.Float64(trace.AttrResourceTargetLoad, s.TargetLoad),
+			attribute.Int64(trace.AttrResourceRampUpMs, s.RampUp.Milliseconds()),
+		)
+		select {
+		case <-time.After(s.RampUp):
+			s.emitEvent(trace.EventResourceRampUpComplete)
+		case <-ctx.Done():
+			return
+		}
+	}
+
+	s.emitEvent(trace.EventResourceSustainStart,
+		attribute.Float64(trace.AttrResourceTargetLoad, s.TargetLoad),
+	)
+
+	if s.RampDown > 0 {
+		sustainDuration := rampDownStart - s.RampUp
+		if sustainDuration > 0 {
+			select {
+			case <-time.After(sustainDuration):
+			case <-ctx.Done():
+				return
+			}
+		}
+
+		s.emitEvent(trace.EventResourceRampDownStart,
+			attribute.Int64(trace.AttrResourceRampDownMs, s.RampDown.Milliseconds()),
+		)
+		select {
+		case <-time.After(s.RampDown):
+			s.emitEvent(trace.EventResourceRampDownComplete)
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // dutyCycle runs a single worker's burn/sleep loop on one OS thread.
@@ -155,3 +225,9 @@ func dutyCycle(ctx context.Context, targetLoad float64, totalDuration, rampUp, r
 		}
 	}
 }
+
+// Compile-time interface checks.
+var (
+	_ fault.Fault      = (*Stress)(nil)
+	_ fault.EventAware = (*Stress)(nil)
+)

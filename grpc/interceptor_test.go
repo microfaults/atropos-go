@@ -1,0 +1,194 @@
+package atroposgrpc
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"atropos-go/internal/evaluator"
+	"atropos-go/internal/fault/inline"
+	"atropos-go/internal/interceptor"
+	"atropos-go/internal/trace"
+
+	"google.golang.org/grpc"
+)
+
+type testEvaluator struct {
+	decision *evaluator.Decision
+}
+
+func (e *testEvaluator) Evaluate(_ context.Context, _ evaluator.Request) *evaluator.Decision {
+	return e.decision
+}
+
+func TestUnaryServerInterceptor_NoFault(t *testing.T) {
+	i := interceptor.New(nil, trace.Noop())
+	interceptorFn := UnaryServerInterceptor(i)
+
+	handler := func(ctx context.Context, req any) (any, error) {
+		return "ok", nil
+	}
+
+	info := &grpc.UnaryServerInfo{FullMethod: "/test.Service/DoStuff"}
+
+	resp, err := interceptorFn(context.Background(), "test-request", info, handler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp != "ok" {
+		t.Fatalf("expected 'ok', got %v", resp)
+	}
+}
+
+func TestUnaryServerInterceptor_WithFault(t *testing.T) {
+	eval := &testEvaluator{
+		decision: &evaluator.Decision{
+			Fault:  &inline.Latency{Delay: 30 * time.Millisecond},
+			Reason: "test: grpc fault",
+			Mode:   evaluator.Inline,
+		},
+	}
+	i := interceptor.New(eval, trace.Noop())
+	interceptorFn := UnaryServerInterceptor(i)
+
+	handler := func(ctx context.Context, req any) (any, error) {
+		return "ok", nil
+	}
+
+	info := &grpc.UnaryServerInfo{FullMethod: "/test.Service/DoStuff"}
+
+	start := time.Now()
+	resp, err := interceptorFn(context.Background(), "test-request", info, handler)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp != "ok" {
+		t.Fatalf("expected 'ok', got %v", resp)
+	}
+	if elapsed < 20*time.Millisecond {
+		t.Fatalf("expected >= 20ms from fault, got %s", elapsed)
+	}
+	t.Logf("grpc unary server interceptor with fault: %s", elapsed)
+}
+
+func TestExtractGRPCLabels(t *testing.T) {
+	labels := extractGRPCLabels(context.Background(), "/test.Service/DoStuff")
+	if labels[trace.AttrGRPCMethod] != "/test.Service/DoStuff" {
+		t.Fatalf("expected method label, got %v", labels)
+	}
+}
+
+func TestStreamServerInterceptor_NoFault(t *testing.T) {
+	i := interceptor.New(nil, trace.Noop())
+	interceptorFn := StreamServerInterceptor(i)
+
+	handler := func(srv any, ss grpc.ServerStream) error {
+		return nil
+	}
+
+	info := &grpc.StreamServerInfo{FullMethod: "/test.Service/StreamStuff"}
+	err := interceptorFn(nil, &fakeServerStream{ctx: context.Background()}, info, handler)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStreamServerInterceptor_WithFault(t *testing.T) {
+	eval := &testEvaluator{
+		decision: &evaluator.Decision{
+			Fault:  &inline.Latency{Delay: 30 * time.Millisecond},
+			Reason: "test: stream fault",
+			Mode:   evaluator.Inline,
+		},
+	}
+	i := interceptor.New(eval, trace.Noop())
+	interceptorFn := StreamServerInterceptor(i)
+
+	handler := func(srv any, ss grpc.ServerStream) error {
+		return nil
+	}
+
+	info := &grpc.StreamServerInfo{FullMethod: "/test.Service/StreamStuff"}
+	start := time.Now()
+	err := interceptorFn(nil, &fakeServerStream{ctx: context.Background()}, info, handler)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed < 20*time.Millisecond {
+		t.Fatalf("expected >= 20ms from fault, got %s", elapsed)
+	}
+}
+
+func TestUnaryClientInterceptor_NoFault(t *testing.T) {
+	i := interceptor.New(nil, trace.Noop())
+	interceptorFn := UnaryClientInterceptor(i)
+
+	invoker := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
+		return nil
+	}
+
+	err := interceptorFn(context.Background(), "/test.Service/Call", "req", "reply", nil, invoker)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUnaryClientInterceptor_WithFault(t *testing.T) {
+	eval := &testEvaluator{
+		decision: &evaluator.Decision{
+			Fault:  &inline.Latency{Delay: 30 * time.Millisecond},
+			Reason: "test: client fault",
+			Mode:   evaluator.Inline,
+		},
+	}
+	i := interceptor.New(eval, trace.Noop())
+	interceptorFn := UnaryClientInterceptor(i)
+
+	invoker := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
+		return nil
+	}
+
+	start := time.Now()
+	err := interceptorFn(context.Background(), "/test.Service/Call", "req", "reply", nil, invoker)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed < 20*time.Millisecond {
+		t.Fatalf("expected >= 20ms from fault, got %s", elapsed)
+	}
+}
+
+func TestStreamClientInterceptor_NoFault(t *testing.T) {
+	i := interceptor.New(nil, trace.Noop())
+	interceptorFn := StreamClientInterceptor(i)
+
+	streamer := func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		return &fakeClientStream{}, nil
+	}
+
+	desc := &grpc.StreamDesc{StreamName: "StreamStuff"}
+	cs, err := interceptorFn(context.Background(), desc, nil, "/test.Service/StreamStuff", streamer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cs == nil {
+		t.Fatal("expected non-nil client stream")
+	}
+}
+
+type fakeServerStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (f *fakeServerStream) Context() context.Context { return f.ctx }
+
+type fakeClientStream struct {
+	grpc.ClientStream
+}

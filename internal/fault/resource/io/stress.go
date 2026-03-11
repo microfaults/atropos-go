@@ -11,6 +11,9 @@ import (
 	"time"
 
 	"atropos-go/internal/fault"
+	"atropos-go/internal/trace"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Stress is an I/O-pressure fault that creates many small random-hex files
@@ -22,8 +25,11 @@ import (
 // Phase 2 (read): spawns Workers goroutines that each pick files round-robin
 // and read them at a combined rate of ReadRate bytes/sec, throttled by a
 // shared token bucket.
+//
+// Implements fault.Fault and fault.EventAware.
 type Stress struct {
 	Config
+	emit fault.EventEmitter
 }
 
 // Detail carries I/O-specific diagnostics from a completed fault.
@@ -35,6 +41,18 @@ type Detail struct {
 	FileCount         int
 	FileSize          int
 	TempDir           string
+}
+
+// SetEventEmitter implements fault.EventAware.
+func (s *Stress) SetEventEmitter(fn fault.EventEmitter) {
+	s.emit = fn
+}
+
+// emitEvent is a nil-safe helper.
+func (s *Stress) emitEvent(name string, attrs ...attribute.KeyValue) {
+	if s.emit != nil {
+		s.emit(name, attrs...)
+	}
 }
 
 // Validate checks that the I/O stress config is valid.
@@ -102,6 +120,15 @@ func (s *Stress) Start(ctx context.Context) (*fault.Handle, error) {
 			rampLoop(throttleCtx, bucket, readRate, s.Duration, s.RampUp, s.RampDown, start)
 		}()
 
+		// Phase-tracking goroutine: emits ramp events at transitions.
+		if s.emit != nil && (s.RampUp > 0 || s.RampDown > 0) {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				s.emitPhaseEvents(throttleCtx, start, readRate)
+			}()
+		}
+
 		for i := 0; i < workers; i++ {
 			wg.Add(1)
 			go func(workerID int) {
@@ -134,6 +161,49 @@ func (s *Stress) Start(ctx context.Context) (*fault.Handle, error) {
 	}()
 
 	return handle, nil
+}
+
+// emitPhaseEvents emits timestamped events at ramp phase boundaries.
+func (s *Stress) emitPhaseEvents(ctx context.Context, globalStart time.Time, targetRate int64) {
+	rampDownStart := s.Duration - s.RampDown
+
+	if s.RampUp > 0 {
+		s.emitEvent(trace.EventResourceRampUpStart,
+			attribute.Int64(trace.AttrResourceTargetRate, targetRate),
+			attribute.Int64(trace.AttrResourceRampUpMs, s.RampUp.Milliseconds()),
+		)
+		select {
+		case <-time.After(s.RampUp):
+			s.emitEvent(trace.EventResourceRampUpComplete)
+		case <-ctx.Done():
+			return
+		}
+	}
+
+	s.emitEvent(trace.EventResourceSustainStart,
+		attribute.Int64(trace.AttrResourceTargetRate, targetRate),
+	)
+
+	if s.RampDown > 0 {
+		sustainDuration := rampDownStart - s.RampUp
+		if sustainDuration > 0 {
+			select {
+			case <-time.After(sustainDuration):
+			case <-ctx.Done():
+				return
+			}
+		}
+
+		s.emitEvent(trace.EventResourceRampDownStart,
+			attribute.Int64(trace.AttrResourceRampDownMs, s.RampDown.Milliseconds()),
+		)
+		select {
+		case <-time.After(s.RampDown):
+			s.emitEvent(trace.EventResourceRampDownComplete)
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // writeRandomFile creates a file with n bytes of crypto/rand data.
@@ -188,12 +258,12 @@ func readWorker(ctx context.Context, bucket *tokenBucket, files []string, fileSi
 // ── Token bucket ────────────────────────────────────────────────────
 
 type tokenBucket struct {
-	mu         sync.Mutex
-	tokens     int64
-	rate       int64 // bytes/sec (current, may be updated by ramp)
-	capacity   int64
-	minCap     int64 // minimum capacity (must be >= max single acquire)
-	lastTick   time.Time
+	mu       sync.Mutex
+	tokens   int64
+	rate     int64 // bytes/sec (current, may be updated by ramp)
+	capacity int64
+	minCap   int64 // minimum capacity (must be >= max single acquire)
+	lastTick time.Time
 }
 
 func newTokenBucket(rate int64, minCapacity int64) *tokenBucket {
@@ -320,3 +390,9 @@ func rampLoop(ctx context.Context, bucket *tokenBucket, targetRate int64, totalD
 		bucket.setRate(effectiveRate)
 	}
 }
+
+// Compile-time interface checks.
+var (
+	_ fault.Fault      = (*Stress)(nil)
+	_ fault.EventAware = (*Stress)(nil)
+)
