@@ -1,0 +1,22 @@
+# ── Build stage ────────────────────────────────────────────────
+FROM golang:1.25-alpine AS builder
+
+WORKDIR /app
+COPY go.mod ./
+# If a go.sum exists, copy it too (not yet, but future-proof).
+COPY go.sum* ./
+
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 go build -o /mem_hogger_poc ./cmd/mem_hogger_poc
+
+# ── Runtime stage ──────────────────────────────────────────────
+FROM alpine:3.21
+
+COPY --from=builder /mem_hogger_poc /mem_hogger_poc
+
+ENTRYPOINT ["/mem_hogger_poc"]
+# Default: 50% of available memory, 5 seconds.
+# Use `docker run --memory=256m` to set a cgroup limit.
+CMD ["--load=0.5", "--duration=5s"]
