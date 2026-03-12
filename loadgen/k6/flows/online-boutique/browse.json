@@ -1,0 +1,50 @@
+{
+  "name": "online-boutique-browse",
+  "description": "Browse products and optionally add to cart",
+  "targets": ["frontend", "productcatalogservice", "currencyservice", "cartservice"],
+  "estimatedRpsPerVu": 2,
+  "thresholds": {
+    "http_req_failed": ["rate<0.1"],
+    "http_req_duration": ["p(95)<2000"]
+  },
+  "steps": [
+    {
+      "name": "homepage",
+      "method": "GET",
+      "path": "/",
+      "expect": [200]
+    },
+    {
+      "name": "view_product",
+      "method": "GET",
+      "path": "/product/{{pool.products.id}}",
+      "requires": "homepage",
+      "probability": "explore",
+      "expect": [200],
+      "extract": {
+        "product_id": "{{pool.products.id}}"
+      }
+    },
+    {
+      "name": "add_to_cart",
+      "method": "POST",
+      "path": "/cart",
+      "requires": "view_product",
+      "probability": "engage",
+      "headers": { "Content-Type": "application/json" },
+      "body": {
+        "product_id": "{{steps.view_product.product_id}}",
+        "quantity": "{{random_int(1,3)}}"
+      },
+      "expect": [200, 302]
+    },
+    {
+      "name": "view_cart",
+      "method": "GET",
+      "path": "/cart",
+      "requires": "add_to_cart",
+      "probability": 0.5,
+      "expect": [200]
+    }
+  ]
+}

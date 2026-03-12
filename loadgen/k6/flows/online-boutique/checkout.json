@@ -1,0 +1,79 @@
+{
+  "name": "online-boutique-checkout",
+  "description": "Full purchase flow: browse, cart, checkout",
+  "targets": [
+    "frontend",
+    "productcatalogservice",
+    "cartservice",
+    "checkoutservice",
+    "paymentservice",
+    "shippingservice",
+    "emailservice",
+    "currencyservice"
+  ],
+  "estimatedRpsPerVu": 3,
+  "thresholds": {
+    "http_req_failed": ["rate<0.1"],
+    "http_req_duration": ["p(95)<3000"]
+  },
+  "steps": [
+    {
+      "name": "homepage",
+      "method": "GET",
+      "path": "/",
+      "expect": [200]
+    },
+    {
+      "name": "view_product",
+      "method": "GET",
+      "path": "/product/{{pool.products.id}}",
+      "requires": "homepage",
+      "probability": "explore",
+      "expect": [200],
+      "extract": {
+        "product_id": "{{pool.products.id}}"
+      }
+    },
+    {
+      "name": "add_to_cart",
+      "method": "POST",
+      "path": "/cart",
+      "requires": "view_product",
+      "probability": "engage",
+      "headers": { "Content-Type": "application/json" },
+      "body": {
+        "product_id": "{{steps.view_product.product_id}}",
+        "quantity": "{{random_int(1,2)}}"
+      },
+      "expect": [200, 302]
+    },
+    {
+      "name": "view_cart",
+      "method": "GET",
+      "path": "/cart",
+      "requires": "add_to_cart",
+      "expect": [200]
+    },
+    {
+      "name": "checkout",
+      "method": "POST",
+      "path": "/cart/checkout",
+      "requires": "view_cart",
+      "probability": "commit",
+      "headers": { "Content-Type": "application/json" },
+      "body": {
+        "email": "{{pool.users.email}}",
+        "street_address": "{{pool.users.street_address}}",
+        "zip_code": "{{pool.users.zip_code}}",
+        "city": "{{pool.users.city}}",
+        "state": "{{pool.users.state}}",
+        "country": "{{pool.users.country}}",
+        "credit_card_number": "{{pool.users.credit_card_number}}",
+        "credit_card_expiration_month": "{{pool.users.credit_card_expiration_month}}",
+        "credit_card_expiration_year": "{{pool.users.credit_card_expiration_year}}",
+        "credit_card_cvv": "{{pool.users.credit_card_cvv}}"
+      },
+      "expect": [200, 302]
+    }
+  ]
+}

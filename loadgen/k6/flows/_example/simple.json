@@ -1,0 +1,14 @@
+{
+  "name": "example-health-check",
+  "description": "Minimal example: hit a single endpoint. Use as template for new flows.",
+  "targets": ["myservice"],
+  "estimatedRpsPerVu": 1,
+  "steps": [
+    {
+      "name": "health",
+      "method": "GET",
+      "path": "/healthz",
+      "expect": [200]
+    }
+  ]
+}
