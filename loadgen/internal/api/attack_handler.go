@@ -3,7 +3,7 @@ package api
 import (
 	"net/http"
 
-	"atropos-go/loadgen/internal/attacker"
+	"github.com/microfaults/atropos-go/loadgen/internal/attacker"
 )
 
 func (s *Server) handleCreateAttack(w http.ResponseWriter, r *http.Request) {

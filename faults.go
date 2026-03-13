@@ -4,8 +4,8 @@ package atropos
 import (
 	"time"
 
-	"atropos-go/internal/fault"
-	"atropos-go/internal/fault/inline"
+	"github.com/microfaults/atropos-go/internal/fault"
+	"github.com/microfaults/atropos-go/internal/fault/inline"
 )
 
 // NewLatencyFault creates a fault that delays by base + rand(jitter).

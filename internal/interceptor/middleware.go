@@ -4,8 +4,8 @@ import (
 	"log"
 	"net/http"
 
-	"atropos-go/internal/evaluator"
-	"atropos-go/internal/trace"
+	"github.com/microfaults/atropos-go/internal/evaluator"
+	"github.com/microfaults/atropos-go/internal/trace"
 )
 
 // IngressMiddleware checks for faults on inbound HTTP requests.

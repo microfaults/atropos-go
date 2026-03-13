@@ -6,7 +6,7 @@ import (
 	"math/rand"
 	"time"
 
-	fault "atropos-go/internal/fault"
+	fault "github.com/microfaults/atropos-go/internal/fault"
 )
 
 // Latency is an inline fault that introduces a delay in the current

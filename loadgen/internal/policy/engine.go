@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"atropos-go/loadgen/internal/attacker"
+	"github.com/microfaults/atropos-go/loadgen/internal/attacker"
 )
 
 // MetricSource provides values for condition evaluation.

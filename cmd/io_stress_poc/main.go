@@ -9,8 +9,8 @@ import (
 	"syscall"
 	"time"
 
-	"atropos-go/internal/fault"
-	iostress "atropos-go/internal/fault/resource/io"
+	"github.com/microfaults/atropos-go/internal/fault"
+	iostress "github.com/microfaults/atropos-go/internal/fault/resource/io"
 )
 
 func main() {

@@ -11,8 +11,8 @@ import (
 
 	vegeta "github.com/tsenart/vegeta/v12/lib"
 
-	"atropos-go/loadgen/internal/dedup"
-	"atropos-go/loadgen/internal/trace"
+	"github.com/microfaults/atropos-go/loadgen/internal/dedup"
+	"github.com/microfaults/atropos-go/loadgen/internal/trace"
 )
 
 // TargetSpec defines the HTTP target for an attack.

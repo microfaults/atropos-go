@@ -3,7 +3,7 @@ package network
 import (
 	"fmt"
 
-	fault "atropos-go/internal/fault"
+	fault "github.com/microfaults/atropos-go/internal/fault"
 )
 
 // Config holds parameters for TCP proxy-based network faults.

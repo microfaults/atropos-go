@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	"atropos-go/loadgen/internal/workload"
+	"github.com/microfaults/atropos-go/loadgen/internal/workload"
 )
 
 func (s *Server) handleCreateWorkload(w http.ResponseWriter, r *http.Request) {

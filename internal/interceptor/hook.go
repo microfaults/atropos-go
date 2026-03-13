@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	"atropos-go/internal/evaluator"
-	fault "atropos-go/internal/fault"
-	"atropos-go/internal/trace"
+	"github.com/microfaults/atropos-go/internal/evaluator"
+	fault "github.com/microfaults/atropos-go/internal/fault"
+	"github.com/microfaults/atropos-go/internal/trace"
 
 	"go.opentelemetry.io/otel/attribute"
 )

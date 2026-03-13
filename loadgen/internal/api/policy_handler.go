@@ -3,7 +3,7 @@ package api
 import (
 	"net/http"
 
-	"atropos-go/loadgen/internal/policy"
+	"github.com/microfaults/atropos-go/loadgen/internal/policy"
 )
 
 func (s *Server) handleCreatePolicy(w http.ResponseWriter, r *http.Request) {

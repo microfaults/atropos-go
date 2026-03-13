@@ -3,7 +3,7 @@ package trace
 import (
 	"context"
 
-	fault "atropos-go/internal/fault"
+	fault "github.com/microfaults/atropos-go/internal/fault"
 	"go.opentelemetry.io/otel/attribute"
 )
 

@@ -9,11 +9,11 @@ import (
 	"syscall"
 	"time"
 
-	"atropos-go/loadgen/internal/api"
-	"atropos-go/loadgen/internal/attacker"
-	"atropos-go/loadgen/internal/dedup"
-	"atropos-go/loadgen/internal/policy"
-	"atropos-go/loadgen/internal/workload"
+	"github.com/microfaults/atropos-go/loadgen/internal/api"
+	"github.com/microfaults/atropos-go/loadgen/internal/attacker"
+	"github.com/microfaults/atropos-go/loadgen/internal/dedup"
+	"github.com/microfaults/atropos-go/loadgen/internal/policy"
+	"github.com/microfaults/atropos-go/loadgen/internal/workload"
 )
 
 func main() {

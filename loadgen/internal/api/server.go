@@ -5,9 +5,9 @@ import (
 	"io"
 	"net/http"
 
-	"atropos-go/loadgen/internal/attacker"
-	"atropos-go/loadgen/internal/policy"
-	"atropos-go/loadgen/internal/workload"
+	"github.com/microfaults/atropos-go/loadgen/internal/attacker"
+	"github.com/microfaults/atropos-go/loadgen/internal/policy"
+	"github.com/microfaults/atropos-go/loadgen/internal/workload"
 )
 
 const maxBodySize = 1 << 20 // 1 MiB

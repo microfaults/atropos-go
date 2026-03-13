@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"atropos-go/loadgen/internal/attacker"
+	"github.com/microfaults/atropos-go/loadgen/internal/attacker"
 )
 
 // Rule defines a hypothesis test: "when Condition is true, execute Action."

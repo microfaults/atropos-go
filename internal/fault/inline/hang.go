@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	fault "atropos-go/internal/fault"
+	fault "github.com/microfaults/atropos-go/internal/fault"
 )
 
 // Hang is an inline fault that blocks the current goroutine until
