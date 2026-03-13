@@ -1,0 +1,157 @@
+package atropos
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+)
+
+func resetDemoEval() {
+	demoEval = nil
+	demoEvalOnce = sync.Once{}
+}
+
+func TestFaultAdmin_PostLatency(t *testing.T) {
+	resetDemoEval()
+	handler := FaultAdminHandler()
+
+	// POST latency fault
+	body := `{"type":"latency","delay":"200ms","jitter":"50ms"}`
+	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var status faultStatus
+	json.NewDecoder(rec.Body).Decode(&status)
+	if !status.Active {
+		t.Fatal("expected active=true")
+	}
+	if status.Fault.Type != "latency" {
+		t.Fatalf("expected type=latency, got %s", status.Fault.Type)
+	}
+
+	// GET should show active
+	req = httptest.NewRequest(http.MethodGet, "/admin/fault", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	json.NewDecoder(rec.Body).Decode(&status)
+	if !status.Active {
+		t.Fatal("expected GET to show active=true")
+	}
+
+	// DELETE should clear
+	req = httptest.NewRequest(http.MethodDelete, "/admin/fault", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	json.NewDecoder(rec.Body).Decode(&status)
+	if status.Active {
+		t.Fatal("expected active=false after DELETE")
+	}
+
+	// GET should now show inactive
+	req = httptest.NewRequest(http.MethodGet, "/admin/fault", nil)
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	json.NewDecoder(rec.Body).Decode(&status)
+	if status.Active {
+		t.Fatal("expected GET to show active=false after DELETE")
+	}
+}
+
+func TestFaultAdmin_PostError(t *testing.T) {
+	resetDemoEval()
+	handler := FaultAdminHandler()
+
+	body := `{"type":"error","status_code":503,"message":"service down"}`
+	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var status faultStatus
+	json.NewDecoder(rec.Body).Decode(&status)
+	if status.Fault.StatusCode != 503 {
+		t.Fatalf("expected status_code=503, got %d", status.Fault.StatusCode)
+	}
+}
+
+func TestFaultAdmin_PostHang(t *testing.T) {
+	resetDemoEval()
+	handler := FaultAdminHandler()
+
+	body := `{"type":"hang","duration":"2s"}`
+	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestFaultAdmin_InvalidType(t *testing.T) {
+	resetDemoEval()
+	handler := FaultAdminHandler()
+
+	body := `{"type":"explode"}`
+	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+}
+
+func TestFaultAdmin_MissingDelay(t *testing.T) {
+	resetDemoEval()
+	handler := FaultAdminHandler()
+
+	body := `{"type":"latency"}`
+	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing delay, got %d", rec.Code)
+	}
+}
+
+func TestFaultAdmin_InvalidJSON(t *testing.T) {
+	resetDemoEval()
+	handler := FaultAdminHandler()
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader("{bad"))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for bad json, got %d", rec.Code)
+	}
+}
+
+func TestFaultAdmin_MethodNotAllowed(t *testing.T) {
+	resetDemoEval()
+	handler := FaultAdminHandler()
+
+	req := httptest.NewRequest(http.MethodPut, "/admin/fault", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405, got %d", rec.Code)
+	}
+}
