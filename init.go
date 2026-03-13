@@ -64,9 +64,10 @@ func Init(ctx context.Context, opts ...Option) (func(context.Context) error, err
 	}
 
 	// Build resource with service metadata.
+	// Use NewSchemaless to avoid schema URL conflicts with resource.Default().
 	res, err := resource.Merge(
 		resource.Default(),
-		resource.NewWithAttributes(semconv.SchemaURL,
+		resource.NewSchemaless(
 			semconv.ServiceName(cfg.serviceName),
 			semconv.ServiceVersion(cfg.serviceVersion),
 			semconv.DeploymentEnvironment(cfg.environment),
