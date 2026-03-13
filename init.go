@@ -11,8 +11,6 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 // Init bootstraps OpenTelemetry for the calling service.
@@ -48,17 +46,16 @@ func Init(ctx context.Context, opts ...Option) (func(context.Context) error, err
 		endpoint = "localhost:4317"
 	}
 
-	// Build gRPC dial options.
-	dialOpts := []grpc.DialOption{}
+	// Build OTLP exporter options.
+	exporterOpts := []otlptracegrpc.Option{
+		otlptracegrpc.WithEndpoint(endpoint),
+	}
 	if cfg.insecure {
-		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		exporterOpts = append(exporterOpts, otlptracegrpc.WithInsecure())
 	}
 
 	// Build OTLP exporter.
-	exporter, err := otlptracegrpc.New(ctx,
-		otlptracegrpc.WithEndpoint(endpoint),
-		otlptracegrpc.WithDialOption(dialOpts...),
-	)
+	exporter, err := otlptracegrpc.New(ctx, exporterOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("atropos: init otlp exporter: %w", err)
 	}
