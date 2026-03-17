@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"atropos-go/internal/fault"
-	"atropos-go/internal/fault/inline"
+	"atropos-go/internal/fault/resource/disk" 
 )
 
 // NewLatencyFault creates a fault that delays by base + rand(jitter).
@@ -31,4 +31,16 @@ func NewErrorFault(statusCode int, message string) Fault {
 		StatusCode:  statusCode,
 		Message:     message,
 	}
+}
+
+func NewDiskStressFault(duration time.Duration, writeRate, maxDiskUsage, chunkSize int64, path string) Fault {
+    return &disk.Stress{
+        Config: disk.Config{
+            FaultConfig:  fault.FaultConfig{Duration: duration},
+            WriteRate:    writeRate,
+            MaxDiskUsage: maxDiskUsage,
+            ChunkSize:    chunkSize,
+            Path:         path,
+        },
+    }
 }
