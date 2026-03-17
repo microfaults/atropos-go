@@ -1,0 +1,18 @@
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 go build -o /disk_stress_poc ./cmd/disk_stress_poc
+
+# ── Runtime stage ──────────────────────────────────────────────
+FROM alpine:3.21
+
+COPY --from=builder /disk_stress_poc /disk_stress_poc
+
+ENTRYPOINT ["/disk_stress_poc"]
+# Default: 10 MB/s, 512 MB max disk, 1 MB chunks, 5s duration
+CMD ["--writerate=10485760", "--maxdisk=536870912", "--chunksize=1048576", "--duration=5s"]
