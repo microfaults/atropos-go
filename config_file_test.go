@@ -121,27 +121,19 @@ func TestFileConfigToOptions(t *testing.T) {
 	}
 }
 
-func TestFileConfigToOptions_AlwaysOnSampler(t *testing.T) {
-	fc := &FileConfig{Sampler: SamplerConfig{Strategy: "always_on"}}
-	opts := fc.ToOptions()
-	cfg := defaultConfig()
-	for _, o := range opts {
-		o.apply(&cfg)
-	}
-	if cfg.sampler == nil {
-		t.Fatal("expected always_on sampler")
-	}
-}
-
-func TestFileConfigToOptions_NeverSampler(t *testing.T) {
-	fc := &FileConfig{Sampler: SamplerConfig{Strategy: "never"}}
-	opts := fc.ToOptions()
-	cfg := defaultConfig()
-	for _, o := range opts {
-		o.apply(&cfg)
-	}
-	if cfg.sampler == nil {
-		t.Fatal("expected never sampler")
+func TestFileConfigToOptions_SamplerStrategies(t *testing.T) {
+	for _, strategy := range []string{"always_on", "never"} {
+		t.Run(strategy, func(t *testing.T) {
+			fc := &FileConfig{Sampler: SamplerConfig{Strategy: strategy}}
+			opts := fc.ToOptions()
+			cfg := defaultConfig()
+			for _, o := range opts {
+				o.apply(&cfg)
+			}
+			if cfg.sampler == nil {
+				t.Fatalf("expected sampler for strategy %q", strategy)
+			}
+		})
 	}
 }
 

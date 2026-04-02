@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -52,102 +53,79 @@ func matchLabels(pairs []*dto.LabelPair, want map[string]string) bool {
 	return true
 }
 
-func TestIngressMetrics_200(t *testing.T) {
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-
-	labels := map[string]string{"method": "GET", "status_code": "200", "service": "test-ingress"}
-	beforeCount := gatherCounter("http_server_requests_total", labels)
-	beforeHist := gatherHistogramCount("http_server_request_duration_seconds", labels)
-
-	mw := IngressMiddleware(handler, "test-ingress")
-	req := httptest.NewRequest("GET", "/test", nil)
-	rec := httptest.NewRecorder()
-	mw.ServeHTTP(rec, req)
-
-	afterCount := gatherCounter("http_server_requests_total", labels)
-	afterHist := gatherHistogramCount("http_server_request_duration_seconds", labels)
-
-	if delta := afterCount - beforeCount; delta != 1 {
-		t.Fatalf("expected counter delta 1, got %v", delta)
+func TestIngressMetrics(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		statusCode int
+		service    string
+		checkHist  bool
+	}{
+		{"200", "GET", 200, "test-ingress", true},
+		{"500", "POST", 500, "test-500", false},
 	}
-	if delta := afterHist - beforeHist; delta != 1 {
-		t.Fatalf("expected histogram observation delta 1, got %v", delta)
-	}
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tt.statusCode)
+			})
+			labels := map[string]string{"method": tt.method, "status_code": strconv.Itoa(tt.statusCode), "service": tt.service}
+			beforeCount := gatherCounter("http_server_requests_total", labels)
+			beforeHist := gatherHistogramCount("http_server_request_duration_seconds", labels)
 
-func TestIngressMetrics_500(t *testing.T) {
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	})
+			mw := IngressMiddleware(handler, tt.service)
+			mw.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(tt.method, "/test", nil))
 
-	labels := map[string]string{"method": "POST", "status_code": "500", "service": "test-500"}
-	beforeCount := gatherCounter("http_server_requests_total", labels)
-
-	mw := IngressMiddleware(handler, "test-500")
-	req := httptest.NewRequest("POST", "/fail", nil)
-	rec := httptest.NewRecorder()
-	mw.ServeHTTP(rec, req)
-
-	afterCount := gatherCounter("http_server_requests_total", labels)
-	if delta := afterCount - beforeCount; delta != 1 {
-		t.Fatalf("expected counter delta 1, got %v", delta)
+			if delta := gatherCounter("http_server_requests_total", labels) - beforeCount; delta != 1 {
+				t.Fatalf("expected counter delta 1, got %v", delta)
+			}
+			if tt.checkHist {
+				if delta := gatherHistogramCount("http_server_request_duration_seconds", labels) - beforeHist; delta != 1 {
+					t.Fatalf("expected histogram delta 1, got %v", delta)
+				}
+			}
+		})
 	}
 }
 
-func TestEgressMetrics_200(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer ts.Close()
-
-	// Extract host from test server URL for label matching.
-	host := strings.TrimPrefix(ts.URL, "http://")
-	labels := map[string]string{"method": "GET", "status_code": "200", "target": host}
-	beforeCount := gatherCounter("http_client_requests_total", labels)
-	beforeHist := gatherHistogramCount("http_client_request_duration_seconds", labels)
-
-	transport := EgressTransport(http.DefaultTransport)
-	client := &http.Client{Transport: transport}
-	resp, err := client.Get(ts.URL + "/ok")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+func TestEgressMetrics(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		checkHist  bool
+	}{
+		{"200", 200, true},
+		{"503", 503, false},
 	}
-	resp.Body.Close()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tt.statusCode)
+			}))
+			defer ts.Close()
 
-	afterCount := gatherCounter("http_client_requests_total", labels)
-	afterHist := gatherHistogramCount("http_client_request_duration_seconds", labels)
+			host := strings.TrimPrefix(ts.URL, "http://")
+			labels := map[string]string{"method": "GET", "status_code": strconv.Itoa(tt.statusCode), "target": host}
+			beforeCount := gatherCounter("http_client_requests_total", labels)
+			beforeHist := gatherHistogramCount("http_client_request_duration_seconds", labels)
 
-	if delta := afterCount - beforeCount; delta != 1 {
-		t.Fatalf("expected counter delta 1, got %v", delta)
-	}
-	if delta := afterHist - beforeHist; delta != 1 {
-		t.Fatalf("expected histogram observation delta 1, got %v", delta)
-	}
-}
+			transport := EgressTransport(http.DefaultTransport)
+			client := &http.Client{Transport: transport}
+			resp, err := client.Get(ts.URL + "/test")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			resp.Body.Close()
 
-func TestEgressMetrics_503(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer ts.Close()
-
-	host := strings.TrimPrefix(ts.URL, "http://")
-	labels := map[string]string{"method": "GET", "status_code": "503", "target": host}
-	beforeCount := gatherCounter("http_client_requests_total", labels)
-
-	transport := EgressTransport(http.DefaultTransport)
-	client := &http.Client{Transport: transport}
-	resp, err := client.Get(ts.URL + "/unavail")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	resp.Body.Close()
-
-	afterCount := gatherCounter("http_client_requests_total", labels)
-	if delta := afterCount - beforeCount; delta != 1 {
-		t.Fatalf("expected counter delta 1, got %v", delta)
+			if delta := gatherCounter("http_client_requests_total", labels) - beforeCount; delta != 1 {
+				t.Fatalf("expected counter delta 1, got %v", delta)
+			}
+			if tt.checkHist {
+				if delta := gatherHistogramCount("http_client_request_duration_seconds", labels) - beforeHist; delta != 1 {
+					t.Fatalf("expected histogram delta 1, got %v", delta)
+				}
+			}
+		})
 	}
 }
 
@@ -157,38 +135,31 @@ func TestEgressMetrics_TransportError(t *testing.T) {
 
 	transport := EgressTransport(http.DefaultTransport)
 	client := &http.Client{Transport: transport}
-	// Port 1 is almost certainly not listening — expect a dial error.
 	resp, _ := client.Get("http://127.0.0.1:1/nope")
 	if resp != nil {
 		resp.Body.Close()
 	}
 
-	afterCount := gatherCounter("http_client_requests_total", labels)
-	if delta := afterCount - beforeCount; delta != 1 {
+	if delta := gatherCounter("http_client_requests_total", labels) - beforeCount; delta != 1 {
 		t.Fatalf("expected counter delta 1 for error status, got %v", delta)
 	}
 }
 
 func TestMetricsHandler_ServesMetrics(t *testing.T) {
-	// Trigger at least one ingress metric so there's something to scrape.
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 	mw := IngressMiddleware(handler, "handler-test")
 	mw.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil))
 
-	// Scrape via MetricsHandler.
-	req := httptest.NewRequest("GET", "/metrics", nil)
 	rec := httptest.NewRecorder()
-	MetricsHandler().ServeHTTP(rec, req)
+	MetricsHandler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
 
 	body, _ := io.ReadAll(rec.Body)
 	text := string(body)
-
-	if !strings.Contains(text, "http_server_requests_total") {
-		t.Fatal("expected http_server_requests_total in metrics output")
-	}
-	if !strings.Contains(text, "http_server_request_duration_seconds") {
-		t.Fatal("expected http_server_request_duration_seconds in metrics output")
+	for _, metric := range []string{"http_server_requests_total", "http_server_request_duration_seconds"} {
+		if !strings.Contains(text, metric) {
+			t.Fatalf("expected %s in metrics output", metric)
+		}
 	}
 }
