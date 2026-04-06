@@ -21,23 +21,47 @@ func (e *testEvaluator) Evaluate(_ context.Context, _ evaluator.Request) *evalua
 	return e.decision
 }
 
-func TestUnaryServerInterceptor_NoFault(t *testing.T) {
+func TestInterceptors_NoFault(t *testing.T) {
 	i := interceptor.New(nil, trace.Noop())
-	interceptorFn := UnaryServerInterceptor(i)
+	ctx := context.Background()
 
-	handler := func(ctx context.Context, req any) (any, error) {
-		return "ok", nil
-	}
+	t.Run("UnaryServer", func(t *testing.T) {
+		fn := UnaryServerInterceptor(i)
+		resp, err := fn(ctx, "req", &grpc.UnaryServerInfo{FullMethod: "/test.Service/Do"}, func(ctx context.Context, req any) (any, error) { return "ok", nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp != "ok" {
+			t.Fatalf("expected 'ok', got %v", resp)
+		}
+	})
 
-	info := &grpc.UnaryServerInfo{FullMethod: "/test.Service/DoStuff"}
+	t.Run("StreamServer", func(t *testing.T) {
+		fn := StreamServerInterceptor(i)
+		err := fn(nil, &fakeServerStream{ctx: ctx}, &grpc.StreamServerInfo{FullMethod: "/test.Service/Stream"}, func(srv any, ss grpc.ServerStream) error { return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
 
-	resp, err := interceptorFn(context.Background(), "test-request", info, handler)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp != "ok" {
-		t.Fatalf("expected 'ok', got %v", resp)
-	}
+	t.Run("UnaryClient", func(t *testing.T) {
+		fn := UnaryClientInterceptor(i)
+		err := fn(ctx, "/test.Service/Call", "req", "reply", nil, func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, opts ...grpc.CallOption) error { return nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("StreamClient", func(t *testing.T) {
+		fn := StreamClientInterceptor(i)
+		cs, err := fn(ctx, &grpc.StreamDesc{StreamName: "Stream"}, nil, "/test.Service/Stream", func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) { return &fakeClientStream{}, nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cs == nil {
+			t.Fatal("expected non-nil client stream")
+		}
+	})
 }
 
 func TestUnaryServerInterceptor_WithFault(t *testing.T) {
@@ -80,20 +104,6 @@ func TestExtractGRPCLabels(t *testing.T) {
 	}
 }
 
-func TestStreamServerInterceptor_NoFault(t *testing.T) {
-	i := interceptor.New(nil, trace.Noop())
-	interceptorFn := StreamServerInterceptor(i)
-
-	handler := func(srv any, ss grpc.ServerStream) error {
-		return nil
-	}
-
-	info := &grpc.StreamServerInfo{FullMethod: "/test.Service/StreamStuff"}
-	err := interceptorFn(nil, &fakeServerStream{ctx: context.Background()}, info, handler)
-	if err != nil {
-		t.Fatal(err)
-	}
-}
 
 func TestStreamServerInterceptor_WithFault(t *testing.T) {
 	eval := &testEvaluator{
@@ -123,19 +133,6 @@ func TestStreamServerInterceptor_WithFault(t *testing.T) {
 	}
 }
 
-func TestUnaryClientInterceptor_NoFault(t *testing.T) {
-	i := interceptor.New(nil, trace.Noop())
-	interceptorFn := UnaryClientInterceptor(i)
-
-	invoker := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
-		return nil
-	}
-
-	err := interceptorFn(context.Background(), "/test.Service/Call", "req", "reply", nil, invoker)
-	if err != nil {
-		t.Fatal(err)
-	}
-}
 
 func TestUnaryClientInterceptor_WithFault(t *testing.T) {
 	eval := &testEvaluator{
@@ -164,23 +161,6 @@ func TestUnaryClientInterceptor_WithFault(t *testing.T) {
 	}
 }
 
-func TestStreamClientInterceptor_NoFault(t *testing.T) {
-	i := interceptor.New(nil, trace.Noop())
-	interceptorFn := StreamClientInterceptor(i)
-
-	streamer := func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-		return &fakeClientStream{}, nil
-	}
-
-	desc := &grpc.StreamDesc{StreamName: "StreamStuff"}
-	cs, err := interceptorFn(context.Background(), desc, nil, "/test.Service/StreamStuff", streamer)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cs == nil {
-		t.Fatal("expected non-nil client stream")
-	}
-}
 
 type fakeServerStream struct {
 	grpc.ServerStream
