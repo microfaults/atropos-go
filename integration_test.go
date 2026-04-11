@@ -27,14 +27,14 @@ func TestIntegration_IngressMiddleware_WithFault(t *testing.T) {
 	}
 	defer shutdown(context.Background())
 
-	Configure(&integrationEval{
+	Configure(WithEvaluator(&integrationEval{
 		decision: &evaluator.Decision{
 			Fault:  &inline.Latency{Delay: 50 * time.Millisecond},
 			Reason: "integration test",
 			Mode:   evaluator.Inline,
 		},
-	})
-	defer Configure(nil)
+	}))
+	defer Configure()
 
 	handler := IngressMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -87,14 +87,14 @@ func TestIntegration_SpanWithFault_ProducesSpans(t *testing.T) {
 	}
 	defer shutdown(context.Background())
 
-	Configure(&integrationEval{
+	Configure(WithEvaluator(&integrationEval{
 		decision: &evaluator.Decision{
 			Fault:  &inline.Latency{Delay: 20 * time.Millisecond},
 			Reason: "span-with-fault test",
 			Mode:   evaluator.Inline,
 		},
-	})
-	defer Configure(nil)
+	}))
+	defer Configure()
 
 	ctx, span, cr, err := SpanWithFault(context.Background(), "checkout", map[string]string{"user": "test"})
 	if err != nil {
@@ -126,7 +126,7 @@ func TestIntegration_NoFault_StillCreatesSpan(t *testing.T) {
 	}
 	defer shutdown(context.Background())
 
-	Configure(nil)
+	Configure()
 
 	ctx, span := Span(context.Background(), "my-operation")
 	_ = ctx

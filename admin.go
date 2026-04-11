@@ -72,7 +72,7 @@ var (
 func ensureDemoEval() *DemoEvaluator {
 	demoEvalOnce.Do(func() {
 		demoEval = &DemoEvaluator{}
-		Configure(demoEval)
+		Configure(WithEvaluator(demoEval))
 	})
 	return demoEval
 }

@@ -2,6 +2,7 @@
 package atropos
 
 import (
+	"atropos-go/internal/cachebox"
 	"atropos-go/internal/evaluator"
 	"atropos-go/internal/fault"
 	"atropos-go/internal/interceptor"
@@ -58,6 +59,72 @@ const (
 	Background = evaluator.Background
 	Inline     = evaluator.Inline
 )
+
+// CacheBoxAction identifies a cache-box operation the evaluator has chosen.
+type CacheBoxAction = evaluator.CacheBoxAction
+
+// Re-export CacheBoxAction constants.
+const (
+	CacheBoxNone        = evaluator.CacheBoxNone
+	CacheBoxPassthrough = evaluator.CacheBoxPassthrough
+	CacheBoxReplay      = evaluator.CacheBoxReplay
+	CacheBoxReplayDelay = evaluator.CacheBoxReplayDelay
+)
+
+// --- Static evaluator (small helper for tests and simple setups) ---
+
+// StaticRule is a single match rule for StaticEvaluator.
+type StaticRule = evaluator.StaticRule
+
+// StaticEvaluator holds a fixed list of rules and returns the first match.
+type StaticEvaluator = evaluator.StaticEvaluator
+
+// NewStaticEvaluator builds a StaticEvaluator from a rule list.
+func NewStaticEvaluator(rules ...StaticRule) *StaticEvaluator {
+	return evaluator.NewStaticEvaluator(rules...)
+}
+
+// --- Cache-box types ---
+
+// CacheBox is the runtime cache-box coordinator.
+type CacheBox = cachebox.CacheBox
+
+// CacheBoxConfig is the cache-box constructor config.
+type CacheBoxConfig = cachebox.Config
+
+// CacheBoxEntry is a single cached HTTP response.
+type CacheBoxEntry = cachebox.Entry
+
+// CacheBoxStore is the cache-box persistence contract.
+type CacheBoxStore = cachebox.Store
+
+// CacheBoxMemStoreConfig configures the in-memory cache-box store.
+type CacheBoxMemStoreConfig = cachebox.MemStoreConfig
+
+// CacheBoxDelaySource produces delays for replay_with_delay mode.
+type CacheBoxDelaySource = cachebox.DelaySource
+
+// KeyStrategy names a built-in cache-box key derivation strategy.
+type KeyStrategy = cachebox.KeyStrategy
+
+// Re-export cache-box key strategy constants.
+const (
+	KeyStrategyExact         = cachebox.KeyStrategyExact
+	KeyStrategyExactWithHost = cachebox.KeyStrategyExactWithHost
+	KeyStrategyExactWithBody = cachebox.KeyStrategyExactWithBody
+)
+
+// NewCacheBox builds a CacheBox coordinator from a config. Safe defaults
+// are applied for unset fields. See cachebox.Config for details.
+func NewCacheBox(cfg CacheBoxConfig) *CacheBox {
+	return cachebox.New(cfg)
+}
+
+// NewCacheBoxMemStore builds the default in-memory LRU store. A zero
+// maxEntries means unbounded -- use with caution in production.
+func NewCacheBoxMemStore(maxEntries int) CacheBoxStore {
+	return cachebox.NewMemStore(cachebox.MemStoreConfig{MaxEntries: maxEntries})
+}
 
 // --- Trace types ---
 

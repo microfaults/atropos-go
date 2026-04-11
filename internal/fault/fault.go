@@ -3,6 +3,7 @@ package fault
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 )
 
@@ -44,10 +45,17 @@ type Fault interface {
 }
 
 // Handle provides non-blocking control over a running fault.
+//
+// onResult is stored as an atomic.Pointer so that SetOnResult (called on
+// the caller goroutine after Start returns) does not race with Send
+// (called on the fault's internal goroutine). Without this guard the race
+// detector flagged any fault whose goroutine finishes before Start's caller
+// can register its callback, which is common for short-lived latency and
+// error faults.
 type Handle struct {
 	done     chan Result
 	cancel   context.CancelFunc
-	onResult func(Result)
+	onResult atomic.Pointer[func(Result)]
 }
 
 // NewHandle creates a Handle wired to the given cancel func.
@@ -59,8 +67,11 @@ func NewHandle(cancel context.CancelFunc) *Handle {
 }
 
 // SetOnResult registers a callback that fires synchronously on Send.
+// If Send has already fired (e.g. for a near-instantaneous fault), the
+// callback will not be invoked -- callers should register it before they
+// expect the fault to complete.
 func (h *Handle) SetOnResult(fn func(Result)) {
-	h.onResult = fn
+	h.onResult.Store(&fn)
 }
 
 // Done returns a channel that receives one Result on completion.
@@ -75,8 +86,8 @@ func (h *Handle) Stop() {
 
 // Send delivers the result. Fires OnResult callback synchronously first.
 func (h *Handle) Send(r Result) {
-	if h.onResult != nil {
-		h.onResult(r)
+	if fn := h.onResult.Load(); fn != nil {
+		(*fn)(r)
 	}
 	h.done <- r
 }

@@ -5,7 +5,8 @@ import (
 	"time"
 
 	"atropos-go/internal/fault"
-	"atropos-go/internal/fault/resource/disk" 
+	"atropos-go/internal/fault/inline"
+	"atropos-go/internal/fault/resource/disk"
 )
 
 // NewLatencyFault creates a fault that delays by base + rand(jitter).
