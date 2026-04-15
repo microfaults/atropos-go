@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"atropos-go/internal/cachebox"
 	"atropos-go/internal/evaluator"
 	fault "atropos-go/internal/fault"
 	"atropos-go/internal/trace"
@@ -11,10 +12,22 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 )
 
-// Interceptor ties the evaluator, fault execution, and OTel together.
+// Option configures an Interceptor at construction time.
+type Option func(*Interceptor)
+
+// WithCacheBox attaches a cache-box coordinator. A nil coordinator disables
+// cache-box dispatch (the middleware falls through to the fault path).
+func WithCacheBox(cb *cachebox.CacheBox) Option {
+	return func(i *Interceptor) { i.cacheBox = cb }
+}
+
+// Interceptor ties the evaluator, fault execution, OTel, and cache-box
+// together. It is the per-service policy dispatcher -- middleware layers
+// call into it at each injection point.
 type Interceptor struct {
-	eval   evaluator.Evaluator
-	tracer trace.Tracer
+	eval     evaluator.Evaluator
+	tracer   trace.Tracer
+	cacheBox *cachebox.CacheBox
 }
 
 // noopEval never matches (tracing only, no faults).
@@ -25,26 +38,54 @@ func (noopEval) Evaluate(_ context.Context, _ evaluator.Request) *evaluator.Deci
 }
 
 // New creates an Interceptor. Nil eval/tracer use no-op defaults.
-func New(eval evaluator.Evaluator, tracer trace.Tracer) *Interceptor {
+func New(eval evaluator.Evaluator, tracer trace.Tracer, opts ...Option) *Interceptor {
 	if eval == nil {
 		eval = noopEval{}
 	}
 	if tracer == nil {
 		tracer = trace.Noop()
 	}
-	return &Interceptor{eval: eval, tracer: tracer}
+	i := &Interceptor{eval: eval, tracer: tracer}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(i)
+		}
+	}
+	return i
 }
 
-// CheckResult holds the outcome of an injection point check.
+// CacheBox returns the configured cache-box coordinator, or nil if disabled.
+// Middleware uses this to decide whether to dispatch on cache-box decisions.
+func (i *Interceptor) CacheBox() *cachebox.CacheBox {
+	return i.cacheBox
+}
+
+// Tracer returns the interceptor's tracer. Used by cache-box dispatch.
+func (i *Interceptor) Tracer() trace.Tracer {
+	return i.tracer
+}
+
+// CheckResult holds the outcome of a fault-injection check.
 type CheckResult struct {
-	Handle   *fault.Handle       // non-nil if a fault was started
-	Decision *evaluator.Decision // non-nil if a rule matched
+	Handle   *fault.Handle
+	Decision *evaluator.Decision
 }
 
-// Check evaluates rules and starts a fault if one matches.
-func (i *Interceptor) Check(ctx context.Context, req evaluator.Request) (CheckResult, error) {
-	decision := i.eval.Evaluate(ctx, req)
-	if decision == nil {
+// Evaluate runs the rule engine and returns the matching decision, if any.
+// This is a side-effect-free read of the current rule set; callers must
+// dispatch (StartFault or cache-box handleCacheBox) based on the result.
+func (i *Interceptor) Evaluate(ctx context.Context, req evaluator.Request) *evaluator.Decision {
+	return i.eval.Evaluate(ctx, req)
+}
+
+// StartFault validates the fault on a decision, creates a fault-injection
+// span, and starts the fault. Returns an empty CheckResult if the decision
+// is nil or has no fault (i.e. a cache-box-only decision).
+//
+// The decision is assumed to be the output of a prior Evaluate call; this
+// method does not re-run the evaluator.
+func (i *Interceptor) StartFault(ctx context.Context, req evaluator.Request, decision *evaluator.Decision) (CheckResult, error) {
+	if decision == nil || decision.Fault == nil {
 		return CheckResult{}, nil
 	}
 
@@ -52,7 +93,6 @@ func (i *Interceptor) Check(ctx context.Context, req evaluator.Request) (CheckRe
 		return CheckResult{}, fmt.Errorf("interceptor: invalid fault from evaluator: %w", err)
 	}
 
-	// Start OTel span as child of current trace.
 	faultType := fmt.Sprintf("%T", decision.Fault)
 	ctx, span := i.tracer.Start(ctx, trace.SpanFaultInject,
 		attribute.String(trace.AttrFaultType, faultType),
@@ -79,10 +119,30 @@ func (i *Interceptor) Check(ctx context.Context, req evaluator.Request) (CheckRe
 		return CheckResult{}, fmt.Errorf("interceptor: fault start failed: %w", err)
 	}
 
-	// Hook into the handle: when Send is called, end the span with result data.
+	// Hook into the handle: when the fault ends, record the result on the span.
 	handle.SetOnResult(func(r fault.Result) {
 		span.RecordResult(r)
 	})
 
 	return CheckResult{Handle: handle, Decision: decision}, nil
+}
+
+// Check is a convenience that evaluates and (if appropriate) starts a fault.
+// It is the fault-only path: cache-box decisions are explicitly skipped so
+// that callers who don't handle cache-box won't accidentally treat a
+// cache-box decision as a "no-op" fault match.
+//
+// HTTP middleware layers that want to dispatch cache-box should call
+// Evaluate directly and branch on the Decision.
+func (i *Interceptor) Check(ctx context.Context, req evaluator.Request) (CheckResult, error) {
+	decision := i.Evaluate(ctx, req)
+	if decision == nil {
+		return CheckResult{}, nil
+	}
+	if decision.CacheBox != evaluator.CacheBoxNone {
+		// Cache-box decision -- Check() is the fault-only path; middleware
+		// that handles cache-box uses Evaluate directly.
+		return CheckResult{}, nil
+	}
+	return i.StartFault(ctx, req, decision)
 }

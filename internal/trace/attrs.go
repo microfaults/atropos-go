@@ -16,6 +16,7 @@ const (
 	// HTTP label attributes (set by middleware).
 	AttrHTTPMethod    = "atropos.http.method"
 	AttrHTTPPath      = "atropos.http.path"
+	AttrHTTPQuery     = "atropos.http.query"
 	AttrHTTPHost      = "atropos.http.host"
 	AttrHTTPUserAgent = "atropos.http.user_agent"
 
@@ -41,9 +42,21 @@ const (
 	AttrResourceRampUpMs   = "atropos.resource.ramp_up_ms"
 	AttrResourceRampDownMs = "atropos.resource.ramp_down_ms"
 
+	// Cache-box span attributes.
+	AttrCacheBoxMode         = "atropos.cachebox.mode"
+	AttrCacheBoxKey          = "atropos.cachebox.key"
+	AttrCacheBoxHit          = "atropos.cachebox.hit"
+	AttrCacheBoxLatencyUs    = "atropos.cachebox.latency_us"
+	AttrCacheBoxResponseSize = "atropos.cachebox.response_size"
+	AttrCacheBoxResponseBody = "atropos.cachebox.response_body"
+	AttrCacheBoxWorkflow     = "atropos.cachebox.workflow"
+	AttrCacheBoxReason       = "atropos.cachebox.reason"
+	AttrCacheBoxInjection    = "atropos.cachebox.injection_point"
+
 	// Span names.
-	SpanFaultInject = "atropos.fault.inject"
-	SpanHookPrefix  = "atropos.hook."
+	SpanFaultInject   = "atropos.fault.inject"
+	SpanCacheBoxCheck = "atropos.cachebox.check"
+	SpanHookPrefix    = "atropos.hook."
 
 	// Event names.
 	EventFaultInjected = "atropos.fault.injected"
@@ -63,4 +76,11 @@ const (
 	EventResourceSustainStart     = "atropos.resource.sustain.start"
 	EventResourceRampDownStart    = "atropos.resource.ramp_down.start"
 	EventResourceRampDownComplete = "atropos.resource.ramp_down.complete"
+
+	// Cache-box event names.
+	EventCacheBoxRecord   = "atropos.cachebox.record"
+	EventCacheBoxReplay   = "atropos.cachebox.replay"
+	EventCacheBoxMiss     = "atropos.cachebox.miss"
+	EventCacheBoxOversize = "atropos.cachebox.oversize"
+	EventCacheBoxError    = "atropos.cachebox.error"
 )
