@@ -31,3 +31,45 @@ We want to eventually allow this system to be observed on Grafana alongside the 
 
 ## Request correlation
 Another important tool that is in not Gremlin is the ability to correlate requests. This means that when a fault is triggered, it should be possible to see the few requests that led to up to the fault or sort of caused it to trigger. There might be multiple causes or rather a failure cannot be traced to a single request.
+
+## Admin Handlers
+
+The SDK ships three `http.Handler` factories for runtime control. Mount them on an internal/admin mux that is not exposed to external traffic.
+
+### FaultAdminHandler
+
+`FaultAdminHandler` (not yet documented — placeholder for future addition).
+
+### CacheBoxAdminHandler
+
+`CacheBoxAdminHandler(cb *CacheBox) http.Handler` exposes runtime cache-box control.
+
+| Method | Path                    | Body                                             | Response |
+|--------|-------------------------|--------------------------------------------------|----------|
+| GET    | `/admin/cachebox`       | —                                                | 200 `Stats` JSON |
+| POST   | `/admin/cachebox/delay` | `{"mu": float, "sigma": float, "seed"?: uint64}` | 204 (replaces delay source with lognormal distribution) |
+| DELETE | `/admin/cachebox`       | —                                                | 204 (clears store; preserves lifetime counters) |
+
+Example mount:
+
+```go
+mux.Handle("/admin/cachebox", atropos.CacheBoxAdminHandler(cb))
+mux.Handle("/admin/cachebox/", atropos.CacheBoxAdminHandler(cb))
+```
+
+### RulesAdminHandler
+
+`RulesAdminHandler(eval *StaticEvaluator) http.Handler` exposes runtime rule-set management.
+
+| Method | Path           | Body                | Response |
+|--------|----------------|---------------------|----------|
+| GET    | `/admin/rules` | —                   | 200 `[]StaticRule` JSON |
+| POST   | `/admin/rules` | `[]StaticRule` JSON | 204 (atomic replace) |
+
+Example mount:
+
+```go
+eval := atropos.NewStaticEvaluator()
+atropos.Configure(atropos.WithEvaluator(eval))
+mux.Handle("/admin/rules", atropos.RulesAdminHandler(eval))
+```
