@@ -38,7 +38,27 @@ The SDK ships three `http.Handler` factories for runtime control. Mount them on 
 
 ### FaultAdminHandler
 
-`FaultAdminHandler` (not yet documented — placeholder for future addition).
+`FaultAdminHandler() http.Handler` exposes runtime fault injection control via a built-in `DemoEvaluator`.
+
+| Method | Path           | Body             | Response |
+|--------|----------------|------------------|----------|
+| GET    | `/admin/fault` | —                | 200 `{"active": bool, "fault": {...}}` JSON |
+| POST   | `/admin/fault` | fault request JSON (see below) | 201 `{"active": true, "fault": {...}}` JSON |
+| DELETE | `/admin/fault` | —                | 200 `{"active": false}` JSON |
+
+POST body fields by fault type:
+
+| `"type"` | Required fields | Optional fields | Defaults |
+|----------|-----------------|-----------------|----------|
+| `"latency"` | `delay` (duration string, e.g. `"500ms"`) | `jitter` (duration string) | — |
+| `"error"` | — | `status_code` (int), `message` (string) | 500, `"injected fault"` |
+| `"hang"` | `duration` (duration string) | — | — |
+
+Example mount:
+
+```go
+mux.Handle("/admin/fault", atropos.FaultAdminHandler())
+```
 
 ### CacheBoxAdminHandler
 
