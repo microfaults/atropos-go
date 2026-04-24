@@ -18,44 +18,79 @@ defer span.End()
 if cr.Handle != nil { <-cr.Handle.Done() }
 ```
 
+## Current State
+
+A snapshot of what's shipped on `main`. For the research vision (cache-box primitive, interventional performance attribution, policy-driven experiments), see `VISION.md`.
+
+| Area | Status |
+|---|---|
+| OTel bootstrap + HTTP/gRPC middleware | Shipped |
+| Inline faults (latency, error, hang) | Shipped |
+| Network faults (TCP proxy: RST, blackhole, loss, latency, throttle, drip) | Shipped |
+| Resource faults (CPU, I/O, disk, memory) | Shipped |
+| Cache-box (egress HTTP) — passthrough / replay / replay-with-delay | Shipped (Stage 1) |
+| `FaultAdminHandler` — `/admin/fault` runtime fault control | Shipped |
+| `CacheBoxAdminHandler` — `/admin/cachebox` stats, delay source, clear | Shipped |
+| `RulesAdminHandler` — `/admin/rules` atomic rule swap | Shipped |
+| `StaticEvaluator` with versioned atomic rule swap (`SetRules`) | Shipped |
+| Prometheus metrics for HTTP ingress/egress | Shipped |
+| SDK → manteion `Register` / `Apply` wire types | On `feat/admin-endpoints`, not yet merged |
+| `CompiledRule` decoder for manteion wire format | On `feat/admin-endpoints`, not yet merged |
+| Cache-box on ingress + gRPC | Not yet implemented |
+| OPA-backed evaluator | Not yet implemented |
+| Polyglot bindings (DeathStarBench target) | Design only (branch `chore/polyglot-bindings`) |
+
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  Service code                                           │
-│                                                         │
-│   atropos.Init()          -- OTel bootstrap             │
-│   atropos.Span()          -- always-on spans            │
-│   atropos.SpanWithFault() -- spans + fault check        │
-│   atropos.IngressMiddleware()  -- HTTP server            │
-│   atropos.EgressTransport()    -- HTTP client            │
-│   atroposgrpc.UnaryServerInterceptor() -- gRPC          │
-│                                                         │
-├─────────────────────────────────────────────────────────┤
-│  Interceptor layer          (internal/interceptor)      │
-│                                                         │
-│   Evaluator ─► Decision ─► Fault.Start() ─► Handle     │
-│       │            │             │                      │
-│       │       OTel span     EventAware                  │
-│       │       + labels      emitter                     │
-│       ▼                                                 │
-│   No match? ──► hook span with fault.skipped event      │
-│                                                         │
-├─────────────────────────────────────────────────────────┤
-│  Fault taxonomy             (internal/fault)            │
-│                                                         │
-│   inline/     Latency, Error, Hang                      │
-│   network/    TCP proxy with toxics (RST, loss,         │
-│               blackhole, drip, throttle, latency)       │
-│   resource/   CPU stress, I/O stress                    │
-│                                                         │
-├─────────────────────────────────────────────────────────┤
-│  Trace layer                (internal/trace)            │
-│                                                         │
-│   OTelTracer → global TracerProvider                    │
-│   noopTracer → zero-cost when OTel is off               │
-│   atropos.* attribute namespace                         │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  Service code                                                │
+│                                                              │
+│   atropos.Init()          -- OTel bootstrap                  │
+│   atropos.Span()          -- always-on spans                 │
+│   atropos.SpanWithFault() -- spans + fault check             │
+│   atropos.IngressMiddleware()  -- HTTP server                │
+│   atropos.EgressTransport()    -- HTTP client (+ cache-box)  │
+│   atroposgrpc.UnaryServerInterceptor() -- gRPC               │
+│   atropos.FaultAdminHandler()     -- /admin/fault            │
+│   atropos.CacheBoxAdminHandler()  -- /admin/cachebox         │
+│   atropos.RulesAdminHandler()     -- /admin/rules            │
+│   atropos.MetricsHandler()        -- /metrics (Prometheus)   │
+│                                                              │
+├──────────────────────────────────────────────────────────────┤
+│  Interceptor layer          (internal/interceptor)           │
+│                                                              │
+│   Evaluator ─► Decision ─► Fault.Start() ─► Handle           │
+│       │            │             │                           │
+│       │       OTel span     EventAware                       │
+│       │       + labels      emitter                          │
+│       ▼                                                      │
+│   No match? ──► hook span with fault.skipped event           │
+│                                                              │
+├──────────────────────────────────────────────────────────────┤
+│  Cache-box                   (internal/cachebox)             │
+│                                                              │
+│   passthrough  ──► forward to real upstream, record          │
+│   replay       ──► serve cached response, zero upstream load │
+│   replay_delay ──► serve cached response + synthetic latency │
+│                                                              │
+│   MemStore (LRU + TTL) · Recorder (async) · DelaySource      │
+│                                                              │
+├──────────────────────────────────────────────────────────────┤
+│  Fault taxonomy             (internal/fault)                 │
+│                                                              │
+│   inline/     Latency, Error, Hang                           │
+│   network/    TCP proxy with toxics (RST, loss,              │
+│               blackhole, drip, throttle, latency)            │
+│   resource/   CPU stress, I/O stress, Disk, Memory stress    │
+│                                                              │
+├──────────────────────────────────────────────────────────────┤
+│  Trace layer                (internal/trace)                 │
+│                                                              │
+│   OTelTracer → global TracerProvider                         │
+│   noopTracer → zero-cost when OTel is off                    │
+│   atropos.* attribute namespace                              │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ## Installation
@@ -141,7 +176,6 @@ ctx, span := atropos.Span(ctx, "drain-queue",
 )
 defer span.End()
 
-// Add attributes as you learn more.
 span.SetAttributes(attribute.Int("drained", count))
 ```
 
@@ -160,10 +194,10 @@ if cr.Handle != nil {
 
 ### 5. Enable Fault Injection
 
-The SDK instruments spans by default. To activate faults, provide an evaluator:
+The SDK instruments spans by default. To activate faults, configure an evaluator:
 
 ```go
-atropos.Configure(myEvaluator)
+atropos.Configure(atropos.WithEvaluator(myEvaluator))
 ```
 
 The `Evaluator` interface has a single method:
@@ -175,6 +209,116 @@ type Evaluator interface {
 ```
 
 If `Evaluate` returns nil, no fault fires. If it returns a `Decision`, the interceptor validates the fault, starts it, and records the result on the span.
+
+For testing, demos, and manteion integration, use the built-in `StaticEvaluator` with atomic rule swap:
+
+```go
+eval := atropos.NewStaticEvaluator()
+eval.SetRules([]atropos.StaticRule{{
+    Name: "slow-checkout",
+    Point: atropos.Ingress,
+    Labels: map[string]string{"http.method": "POST"},
+    Decision: atropos.Decision{ /* ... */ },
+}})
+atropos.Configure(atropos.WithEvaluator(eval))
+```
+
+### 6. Cache-Box (Egress)
+
+Cache-box is a testing primitive that "freezes" a downstream dependency by replaying recorded responses instead of forwarding to the real service. Three modes, selectable per-request via `Decision.CacheBox`:
+
+- **`CacheBoxPassthrough`** (default): forward to real upstream, record request/response pair asynchronously
+- **`CacheBoxReplay`**: serve cached response immediately; zero upstream load
+- **`CacheBoxReplayDelay`**: serve cached response after a synthetic delay (observed p50, or a fitted lognormal distribution)
+
+```go
+import "atropos-go/internal/cachebox"
+
+cb := cachebox.New(
+    cachebox.NewMemStore(cachebox.MemStoreConfig{MaxBytes: 64 << 20}),
+    cachebox.WithKeyStrategy(cachebox.KeyStrategyExact),
+    cachebox.WithDelaySource(cachebox.NewObservedDelaySource()),
+)
+atropos.Configure(atropos.WithCacheBoxCoordinator(cb))
+
+client := &http.Client{
+    Transport: atropos.EgressTransport(http.DefaultTransport),
+}
+```
+
+Response headers on replay: `X-Atropos-Cache-Key`, `X-Atropos-Cache-Mode`, `X-Atropos-Cache-Latency-Us`. Cache misses fall through to passthrough. Responses larger than `DefaultMaxBodyBytes` (1 MiB) stream through unchanged without caching.
+
+Stage 1 covers **egress HTTP only**. Ingress and gRPC are tracked in Ongoing Development.
+
+### 7. Admin Handlers
+
+Three `http.Handler` factories for runtime control. Mount on an internal admin mux, never on externally-exposed traffic.
+
+#### `FaultAdminHandler()` — `/admin/fault`
+
+Single-fault runtime control via a built-in `DemoEvaluator`. Suitable for demos and single-fault scenarios; not for rule libraries.
+
+| Method | Body | Response |
+|---|---|---|
+| `GET` | — | 200 `{"active": bool, "fault": {...}}` |
+| `POST` | fault request JSON | 201 `{"active": true, "fault": {...}}` |
+| `DELETE` | — | 200 `{"active": false}` |
+
+POST body fields by `type`:
+
+| `type` | Required | Optional | Defaults |
+|---|---|---|---|
+| `latency` | `delay` (e.g. `"500ms"`) | `jitter` (duration) | — |
+| `error`   | — | `status_code` (int), `message` (string) | 500, `"injected fault"` |
+| `hang`    | `duration` | — | — |
+
+```go
+mux.Handle("/admin/fault", atropos.FaultAdminHandler())
+```
+
+```bash
+curl -X POST localhost:8080/admin/fault -d '{"type":"latency","delay":"500ms"}'
+curl localhost:8080/admin/fault
+curl -X DELETE localhost:8080/admin/fault
+```
+
+#### `CacheBoxAdminHandler(cb)` — `/admin/cachebox`
+
+Runtime cache-box control: read stats, replace the delay source with a fitted lognormal distribution, or clear the store.
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| `GET` | `/admin/cachebox` | — | 200 `Stats` JSON |
+| `POST` | `/admin/cachebox/delay` | `{"mu":float, "sigma":float, "seed"?:uint64}` | 204 |
+| `DELETE` | `/admin/cachebox` | — | 204 (store cleared; lifetime counters preserved) |
+
+```go
+mux.Handle("/admin/cachebox", atropos.CacheBoxAdminHandler(cb))
+mux.Handle("/admin/cachebox/", atropos.CacheBoxAdminHandler(cb))
+```
+
+#### `RulesAdminHandler(eval)` — `/admin/rules`
+
+Runtime rule-set management backed by a `StaticEvaluator`. POST atomically replaces the entire rule list.
+
+| Method | Body | Response |
+|---|---|---|
+| `GET` | — | 200 `[]StaticRule` JSON |
+| `POST` | `[]StaticRule` JSON | 204 |
+
+```go
+eval := atropos.NewStaticEvaluator()
+atropos.Configure(atropos.WithEvaluator(eval))
+mux.Handle("/admin/rules", atropos.RulesAdminHandler(eval))
+```
+
+### 8. Prometheus Metrics
+
+```go
+mux.Handle("/metrics", atropos.MetricsHandler())
+```
+
+Exposes `http_server_requests_total`, `http_server_request_duration_seconds`, `http_client_requests_total`, `http_client_request_duration_seconds` — each labeled by method, path, status, and service.
 
 ## Design Decisions
 
@@ -197,7 +341,7 @@ This gives precise timing correlation without implying a "successful" span lifec
 
 ### Fault lifecycle: linear ramp phases
 
-All faults share a base `FaultConfig` with `Duration`, `RampUp`, and `RampDown`. Resource faults (CPU, I/O) linearly scale intensity during ramp phases. This models real-world degradation patterns better than instant on/off, and lets you observe how services behave under gradually increasing pressure.
+All faults share a base `FaultConfig` with `Duration`, `RampUp`, and `RampDown`. Resource faults (CPU, I/O, memory, disk) linearly scale intensity during ramp phases. This models real-world degradation patterns better than instant on/off, and lets you observe how services behave under gradually increasing pressure.
 
 ### Label threading
 
@@ -224,7 +368,11 @@ Faults can fire at four points:
 Faults run in one of two modes:
 
 - **Inline:** Blocks the request until the fault completes. Used for latency, error, and hang faults where the caller should experience the delay.
-- **Background:** Runs independently of the request lifecycle. Used for resource faults (CPU, I/O) and network proxies that outlive individual requests.
+- **Background:** Runs independently of the request lifecycle. Used for resource faults (CPU, I/O, memory, disk) and network proxies that outlive individual requests.
+
+### Cache-box never blocks the hot path
+
+The cache-box recorder uses a bounded channel with an async drain goroutine. When the channel is full (e.g., a burst of unique requests faster than the recorder can persist), new entries are dropped rather than blocking the request path. Replay reads are O(1) against the in-memory LRU. Oversized responses (> 1 MiB) stream through unchanged via `io.MultiReader` without caching.
 
 ### gRPC in a separate subpackage
 
@@ -259,8 +407,20 @@ The network proxy sits between client and upstream, applying toxic effects to th
 |------|-----------|
 | **CPU** | Duty-cycle spinning across goroutines pinned to OS threads. Detects CPU quota from cgroup (Docker/k8s) or `runtime.NumCPU()`. Maps to iBench SoI11/12/15 (integer, FP, vector pressure). |
 | **I/O** | Creates random files and reads them at controlled rate using a shared token bucket. |
+| **Memory** | RAM hogger that allocates and touches pages to exert real memory pressure. Ramp phases scale the allocation curve. |
+| **Disk** | Controlled disk-fill and I/O-rate faults targeting a working directory. |
 
-Both support linear ramp-up and ramp-down phases.
+All four support linear ramp-up and ramp-down phases.
+
+### Cache-box (testing primitive, not a failure mode)
+
+| Mode | Effect |
+|------|--------|
+| **Passthrough** | Normal operation; records request/response pairs for later replay |
+| **Replay** | Serves cached response; zero upstream CPU, zero queueing |
+| **Replay-with-delay** | Serves cached response after synthetic latency (observed or fitted distribution) |
+
+See `VISION.md` for the full cache-box experimental methodology.
 
 ## Attribute Namespace
 
@@ -274,6 +434,7 @@ All attributes are prefixed with `atropos.` for clean coexistence with standard 
 | `atropos.grpc.*` | method, user_agent |
 | `atropos.net.*` | conn.id, conn.remote_addr, conn.affected, upstream.addr, dial_duration_ms, bytes_up, bytes_down |
 | `atropos.resource.*` | target_load, target_rate, ramp_up_ms, ramp_down_ms |
+| `atropos.cachebox.*` | key, mode, hit, observed_latency_us, synthetic_latency_us, oversize |
 
 ## Init Options
 
@@ -287,11 +448,103 @@ All attributes are prefixed with `atropos.` for clean coexistence with standard 
 | `WithSampler(s)` | `AlwaysSample` | Custom `sdktrace.Sampler` |
 | `WithTracerProvider(tp)` | builds one | Bring your own `TracerProvider` |
 
+## Configure Options
+
+Wire up the package-level default interceptor via `atropos.Configure(opts ...ConfigureOption)`:
+
+| Option | Purpose |
+|--------|---------|
+| `WithEvaluator(e Evaluator)` | Attach a rule-matching evaluator to drive fault decisions |
+| `WithCacheBoxCoordinator(cb *cachebox.CacheBox)` | Enable egress cache-box (passthrough/replay/replay-with-delay) |
+
+Call `Configure` after `Init` and before serving traffic. Each option replaces its slot; missing options keep their existing wiring.
+
+---
+
+## Ongoing Development
+
+Active work in flight. Branches are called out where relevant.
+
+### SDK ↔ manteion wire protocol (on `feat/admin-endpoints`, not yet merged)
+
+The next merge brings the SDK-side of the manteion integration:
+
+- `RegisterRequest` / `RegisterResponse` wire types for SDK startup registration
+- `Register(ctx, url)` — `POST /api/v1/sdk/register` against the manteion control plane
+- `Apply(resp *RegisterResponse)` — install intent state (active fault, compiled rules, cache-box config) returned by manteion
+- `CompiledRule` / `CompiledComposition` / `CompiledFault` decoders for manteion's wire format (inline, network, resource categories — all six toxic types, all four resource types)
+- `FaultRegistry` in the interceptor with dedup-by-rule + graceful shutdown so multiple overlapping rules don't start duplicate background faults
+- `StartPolicy` on `Decision` so non-inline faults can force Background execution cleanly
+
+Already exposed on main: `RulesAdminHandler` (manteion can push rules via HTTP right now), `CacheBoxAdminHandler` (manteion can swap the delay source with a fitted lognormal). The missing pieces above are for the SDK-initiated path (SDK registers with manteion on startup, pulls rules via register response) rather than the manteion-initiated push path that already works.
+
+### Cache-box Stage 2 and 3
+
+**Stage 2** — extend the modal dispatch to ingress HTTP and gRPC. The `Decision.CacheBox` field, key strategies, store, and recorder are already protocol-agnostic — only the middleware/interceptor glue is missing.
+
+**Stage 3** — wire the recorder's `PushFunc` hook so that:
+- Cached entries flow from the SDK to manteion asynchronously (for cross-pod replay consistency)
+- Fitted distribution parameters (lognormal mu/sigma) flow from manteion back to the SDK, replacing the in-process observed-delay source with a statistical one — the `POST /admin/cachebox/delay` endpoint is already shipped; manteion just needs to call it.
+
+### Polyglot bindings for DeathStarBench
+
+Branch: `chore/polyglot-bindings`. Design doc: `docs/plans/2026-04-19-polyglot-bindings.md`.
+
+DeathStarBench has 10 languages but only 3 RPC protocols (Thrift, gRPC, HTTP). The plan is a protocol-aware sidecar proxy (`atropos-proxy` binary reusing this codebase) that target services talk to via `localhost:PROXY_PORT`. One implementation per protocol covers every language — no per-language SDK port required for the baseline case.
+
+---
+
+## Not Yet Implemented
+
+Features in scope for the research agenda (`VISION.md`) but with no code yet.
+
+### Cache-box on ingress + gRPC
+
+Egress HTTP works today (Stage 1). The ingress middleware and gRPC interceptors need the same modal dispatch. Protocol-agnostic primitives (`Decision.CacheBox`, key functions, store, recorder) are already in place.
+
+### OPA-backed evaluator
+
+The `Evaluator` interface is deliberately minimal so it can be backed by multiple implementations. An `OPAEvaluator` using `github.com/open-policy-agent/opa/rego` would let manteion publish Rego policy bundles (policies + system metrics as JSON data) that the SDK polls and evaluates in-process. See `VISION.md` § Policy-Driven Experiment Loop for the argument and the adversarial policy search framing.
+
+### Topology-aware span enrichment
+
+Enrich spans with cloud-provider metadata (availability domain, fault domain, region, rack, host ID) from IMDS so trace queries can reason about physical topology ("show me all traces that crossed fault domain boundaries"). Reading the metadata is a handful of HTTP calls; designing the enrichment schema to distinguish fault-domain failure from TOR-switch failure is the interesting part.
+
+### Scoped attributes with schema constraints
+
+A schema pushed by manteion that defines allowed attribute keys, cardinality bounds per key per time window, temporary attributes with lifetimes, and type constraints. Mitigates the common Jaeger/Tempo problem where unconstrained attribute cardinality blows up storage and query performance.
+
+### Configuration version correlation
+
+Services report their current config version / feature-flag state as a resource attribute; manteion tracks version transitions and timestamps them; a Grafana annotation query overlays these on trace latency panels so "config rolled at 14:32" lines up visually with "p99 doubled at 14:33."
+
+### Cross-layer event correlation
+
+Atropos spans carry a correlation ID that links to metrics exemplars and structured log entries. When a fault fires, it records the correlation ID in the span, emits a metric exemplar with the same ID, and writes a structured log line with the ID — so a query engine can join across all three stores for a single incident.
+
+### eBPF probes for non-Go services
+
+Complement language SDKs / the protocol proxy with kernel-level syscall instrumentation (connect, accept, read, write, close). Provides infrastructure-level signals (syscall latency, connection counts, TCP retransmits) that application-level instrumentation cannot see. Open question is correlating eBPF events with OTel spans in the same process.
+
+---
+
+## Future Directions
+
+Longer-horizon ideas explored in `VISION.md` and the broader faults-lab agenda.
+
+**Interventional performance attribution.** The cache-box primitive is the core; the surrounding methodology (baseline → isolation → combination experiments, two-mode decomposition, pod-placement randomization for infrastructure confounds) is detailed in `VISION.md`. A workshop paper draft lives in `docs/paper-intro-draft.md`.
+
+**Adversarial policy search.** OPA policies that react to live system metrics create feedback loops — "when CPU > 70% and queue_depth > 100, inject egress latency" — that surface cascading failures invisible to static chaos testing. The policy itself becomes a replayable test case.
+
+**Ecosystem gaps worth addressing.** Several pain points in Jaeger, Zipkin, Tempo, and the OTel Collector that atropos is positioned to address — programmatic trace diff for A/B experiments, tail-based sampling with cross-span context, root cause ranking with fault state + config versions + topology boundaries, live dependency health scores from egress interceptors, service graph with fault annotations, and tighter chaos-tracing integration than the current Chaos Toolkit + OTel stitching. Natural follow-on work once the control plane (manteion) is fully wired.
+
+---
+
 ## Cross-Language Portability
 
-The public API is intentionally minimal and portable across language bindings:
+The public API is intentionally minimal so language bindings can stay thin. For polyglot meshes (DeathStarBench, Social Network), the preferred path is the protocol-aware sidecar proxy described in `docs/plans/2026-04-19-polyglot-bindings.md` — not a full native SDK port per language.
 
-| Go | Python | Java | Node/TS |
+| Go (today) | Python | Java | Node/TS |
 |----|--------|------|---------|
 | `Init(ctx, opts...)` | `init(**opts)` | `Atropos.init(opts)` | `init(opts)` |
 | `Span(ctx, name, attrs...)` | `@atropos.span("name", **kw)` | `@AtroposSpan("name")` | `atropos.span("name", attrs, fn)` |
@@ -300,87 +553,9 @@ The public API is intentionally minimal and portable across language bindings:
 
 ---
 
-## Roadmap
+## Related Repos
 
-### P0: Manteion -- Rule Coordination Oracle
-
-A central service that pushes rule and configuration changes to SDK instances. Each atropos-go SDK registers with manteion on startup. Manteion:
-
-- Pushes evaluator rule updates (fault definitions, targeting predicates, sampling rates) to registered SDKs in real time.
-- Coordinates global-level properties: kill switches, blast radius caps, experiment enrollment.
-- Probes each SDK instance for health, confirming the agent is reachable and responsive.
-- Provides a control plane for operators to stage experiments, review active faults, and emergency-stop.
-
-This is the piece that turns atropos from a library into a platform. Without it, every service needs its own static rule configuration.
-
-### P1: Topology-Aware Span Enrichment
-
-Cloud providers (OCI, AWS, GCP) expose instance metadata: availability domain, fault domain, region, rack, host ID. Enriching spans with these attributes enables queries like "show me all traces that crossed fault domain boundaries" or "which AZ was involved in this latency spike."
-
-The hard part is not reading the metadata (that is a handful of HTTP calls to IMDS). The hard part is knowing which attributes directly correlate to lower-level infrastructure faults. A fault domain failure looks different from a TOR switch failure, but both present as "some requests are slow." The enrichment schema needs to capture enough topology to distinguish these failure modes in trace queries without requiring the developer to understand the physical infrastructure.
-
-Relevant prior art: Jaeger's long-standing request for service dependency topology ([jaegertracing/jaeger#782](https://github.com/jaegertracing/jaeger#782)), Tempo's service graph feature, and the OpenTelemetry resource semantic conventions for cloud infrastructure.
-
-### P2: Response Caching and Replay
-
-Cache responses at egress points so that when a fault is injected (or a downstream is genuinely down), the service can replay the last known good response instead of propagating the failure. This turns atropos into a tool that can both inject faults and partially mitigate them, which is valuable for testing graceful degradation paths.
-
-Design considerations:
-- Cache keying strategy (method + path + normalized query? Request hash?)
-- TTL and invalidation (stale data is its own fault mode)
-- Size bounds (memory pressure from caching is itself a resource concern)
-- Selective caching (not all endpoints are safe to replay -- mutations, side effects)
-
-### P3: Scoped Attributes with Schema Constraints
-
-Developer-added attributes like `queue_depth` and `consumer_id` are powerful for trace correlation, but unconstrained attribute cardinality pollutes the trace database. High-cardinality attributes (user IDs, request IDs) can blow up storage costs and degrade query performance in backends like Tempo and Jaeger.
-
-This needs a schema that defines the design space:
-- **Allowed keys:** Whitelist of attribute names per service or globally.
-- **Cardinality bounds:** Max distinct values per key per time window.
-- **Lifetime:** Temporary attributes that are recorded for N minutes during an experiment, then automatically stop being emitted.
-- **Type constraints:** Enforce that `queue_depth` is always an int, `tenant` is always a string from a known set.
-
-The schema could be pushed by manteion alongside rule updates, giving operators control over what gets recorded without code changes.
-
-Related ecosystem pain: Jaeger has open issues around attribute-based filtering and trace search performance degradation with high cardinality ([jaegertracing/jaeger#2083](https://github.com/jaegertracing/jaeger#2083)). The OpenTelemetry Collector has a `filter` processor, but it operates on spans not individual attributes, and does not support cardinality-aware decisions.
-
-### P4: Configuration Version Correlation
-
-Services are redeployed constantly. A latency spike that correlates with a config change in an upstream service is a different problem than one that correlates with a code deploy. Recording timestamps of version changes across services -- config version, binary version, feature flag state -- and surfacing them in trace dashboards as vertical markers gives operators an immediate "what changed?" signal.
-
-Implementation: each service reports its current config version as a resource attribute. Manteion tracks version transitions and timestamps them. A Grafana annotation query overlays these on trace latency panels.
-
-This addresses a real gap in existing tools. Jaeger, Zipkin, and Tempo all show you what happened but not what changed. The correlation between "config rolled at 14:32" and "p99 latency doubled at 14:33" is currently a manual exercise.
-
-### P5: eBPF Probes for Non-Go Services
-
-The current SDK is Go-only. For polyglot environments, eBPF probes can instrument services without language-specific SDKs by attaching to kernel-level syscalls (connect, accept, read, write, close). This gives TCP-level visibility and basic fault injection (packet delay, drop, corruption) for any process.
-
-eBPF probes would complement language SDKs rather than replace them: they provide infrastructure-level signals (syscall latency, connection counts, TCP retransmits) while SDK spans provide application-level context (which handler, which tenant, which business operation).
-
-The open question is how to correlate eBPF events with OTel spans. One approach: eBPF probes tag events with the thread ID and timestamp, and a userspace correlator matches them to active spans in the same process using the OTel SDK's span context. For uninstrumented services, eBPF events stand alone but can still be correlated by connection tuple (src:port, dst:port).
-
-### P6: Cross-Layer Event Correlation
-
-Traces, metrics, and logs are three pillars, but the connections between them are weak in practice. A span tells you a request was slow; a metric tells you CPU was high; a log tells you a GC pause happened. Correlating all three for a single incident is manual work.
-
-Direction: atropos spans could carry a correlation ID that links to metrics exemplars and structured log entries. When a fault fires, it records the correlation ID in the span, emits a metric exemplar with the same ID, and writes a structured log line with the ID. A query engine (or Grafana datasource plugin) can then join across all three stores.
-
-This is an important direction. Pinned for future design.
-
-### Ecosystem Gaps Worth Addressing
-
-Features and pain points observed across Jaeger, Zipkin, Tempo, and the OpenTelemetry Collector that atropos is positioned to address:
-
-**Trace comparison and diff.** Jaeger has a trace comparison UI but it is limited to visual side-by-side. Open issues ([jaeger-ui#252](https://github.com/jaegertracing/jaeger-ui/issues/252), [jaeger-ui#513](https://github.com/jaegertracing/jaeger-ui/issues/513)) highlight that the diff shows structural differences but not latency diffs, and breaks when the same service runs on different nodes ([jaeger-ui#447](https://github.com/jaegertracing/jaeger-ui/issues/447)). There is no programmatic trace diff that can identify structural changes (new spans, missing spans, latency shifts) between a baseline and an experiment run. Grafana has a separate request for trace comparison ([grafana#35531](https://github.com/grafana/grafana/issues/35531)). Atropos experiments naturally produce A/B trace sets; building a diff tool on top is a natural extension.
-
-**Tail-based sampling with context.** The OTel Collector supports tail-based sampling, but decisions are made on span attributes alone. The collector's filter processor ([otel-contrib#29093](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/29093)) cannot express "and logic" across spans within a trace for filtering decisions. Atropos has richer context (evaluator decisions, fault injection state, label predicates) that could inform smarter sampling: always sample traces that were affected by faults, always sample traces that crossed topology boundaries, downsample routine health checks.
-
-**Root cause ranking.** Tempo and Jaeger surface trace data but leave root cause analysis to the operator. Tempo's query performance degrades significantly at scale ([tempo#5679](https://github.com/grafana/tempo/issues/5679)), making manual investigation harder. A service that knows which faults are active, which config versions are deployed, and which infrastructure boundaries were crossed could rank probable root causes for anomalous traces.
-
-**Dependency health signals.** Zipkin's dependency graph is derived from trace data after the fact. Atropos egress interceptors see every outbound call in real time and can maintain a live dependency health score per upstream, detecting degradation before it shows up in aggregated metrics.
-
-**Service graph with fault annotations.** Tempo's service graph shows topology but not fault state. Overlaying active fault experiments on the service graph gives operators a real-time view of what is being tested where.
-
-**Chaos-tracing integration.** The Chaos Toolkit has an OTel extension ([chaostracing.oltp](https://chaostoolkit.org/drivers/opentracing/)), but it treats observability and fault injection as separate concerns connected only by timestamps. Atropos unifies both in a single SDK: the fault injection IS the instrumentation, so every fault naturally produces correlated trace data without external stitching.
+- **`manteion-go`** — central control plane (rules, SDK registration, policy distribution, zeus proxy)
+- **`manteion-ui`** — React admin UI on top of manteion
+- **`zeus-go`** — k6 workload runner and Archer attack orchestrator
+- **`service-beds`** — Online Boutique microservices in Go, target testbed
