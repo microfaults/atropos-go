@@ -91,6 +91,14 @@ func EgressTransport(base http.RoundTripper, opts ...MiddlewareOption) http.Roun
 		httpClientRequestDuration.WithLabelValues(r.Method, status, target).Observe(duration)
 		httpClientRequestsTotal.WithLabelValues(r.Method, status, target).Inc()
 
+		if resp != nil {
+			if mode := resp.Header.Get("X-Atropos-Cache-Mode"); mode != "" {
+				cacheBoxHitsTotal.Inc()
+			} else if resp.Header.Get("X-Atropos-Cache-Key") != "" {
+				cacheBoxRecordsTotal.Inc()
+			}
+		}
+
 		return resp, err
 	})
 }

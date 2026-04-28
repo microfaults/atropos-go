@@ -9,6 +9,40 @@ import (
 	"testing"
 )
 
+func TestFaultAdmin_PostCPUStress(t *testing.T) {
+	eval := &DemoEvaluator{}
+	handler := FaultAdminHandlerWith(eval, nil)
+
+	body := `{"category":"resource","type":"cpu","config":{"duration":"5s","target_load":0.7}}`
+	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", rec.Code, rec.Body.String())
+	}
+	if eval.Active() == nil {
+		t.Fatal("expected active fault after POST")
+	}
+}
+
+func TestFaultAdmin_PostNetworkLatency(t *testing.T) {
+	eval := &DemoEvaluator{}
+	resolver := func(target string) (string, string, error) {
+		return ":19099", "localhost:6379", nil
+	}
+	handler := FaultAdminHandlerWith(eval, resolver)
+
+	body := `{"category":"network","type":"latency","config":{"target":"redis","delay":"100ms","duration":"5s"}}`
+	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body = %s", rec.Code, rec.Body.String())
+	}
+}
+
 func resetDemoEval() {
 	demoEval = nil
 	demoEvalOnce = sync.Once{}
@@ -28,7 +62,7 @@ func TestFaultAdmin_PostLatency(t *testing.T) {
 		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	var status faultStatus
+	var status FaultStatus
 	json.NewDecoder(rec.Body).Decode(&status)
 	if !status.Active {
 		t.Fatal("expected active=true")
@@ -81,7 +115,7 @@ func TestFaultAdmin_PostError(t *testing.T) {
 		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	var status faultStatus
+	var status FaultStatus
 	json.NewDecoder(rec.Body).Decode(&status)
 	if status.Fault.StatusCode != 503 {
 		t.Fatalf("expected status_code=503, got %d", status.Fault.StatusCode)

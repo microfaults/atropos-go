@@ -48,15 +48,15 @@ func handleCacheBoxStats(w http.ResponseWriter, cb *CacheBox) {
 	json.NewEncoder(w).Encode(cb.Stats())
 }
 
-// delayRequest is the JSON body for POST /admin/cachebox/delay.
-type delayRequest struct {
+// DelayRequest is the JSON body for POST /admin/cachebox/delay.
+type DelayRequest struct {
 	Mu    float64 `json:"mu"`
 	Sigma float64 `json:"sigma"`
 	Seed  uint64  `json:"seed"`
 }
 
 func handleCacheBoxDelay(w http.ResponseWriter, r *http.Request, cb *CacheBox) {
-	var req delayRequest
+	var req DelayRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"invalid json: %s"}`, err), http.StatusBadRequest)
 		return

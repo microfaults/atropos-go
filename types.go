@@ -60,6 +60,20 @@ const (
 	Inline     = evaluator.Inline
 )
 
+// StartPolicy controls how the fault registry deduplicates service-scoped faults.
+type StartPolicy = evaluator.StartPolicy
+
+// Re-export StartPolicy constants.
+const (
+	DeduplicateByRule = evaluator.DeduplicateByRule
+	DeduplicateByType = evaluator.DeduplicateByType
+	AlwaysStart       = evaluator.AlwaysStart
+)
+
+// NetworkResolver resolves a target into listen and upstream addresses for
+// network fault proxies.
+type NetworkResolver func(target string) (listen, upstream string, err error)
+
 // CacheBoxAction identifies a cache-box operation the evaluator has chosen.
 type CacheBoxAction = evaluator.CacheBoxAction
 
@@ -103,6 +117,9 @@ type CacheBoxMemStoreConfig = cachebox.MemStoreConfig
 
 // CacheBoxDelaySource produces delays for replay_with_delay mode.
 type CacheBoxDelaySource = cachebox.DelaySource
+
+// CacheBoxStats is the combined store + recorder stats snapshot.
+type CacheBoxStats = cachebox.Stats
 
 // KeyStrategy names a built-in cache-box key derivation strategy.
 type KeyStrategy = cachebox.KeyStrategy
