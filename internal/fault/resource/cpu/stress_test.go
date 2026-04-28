@@ -174,5 +174,29 @@ func TestStress_RampUp(t *testing.T) {
 		d.Workers, d.PerWorkerLoad, result.ActualDuration)
 }
 
+func TestStress_CancelDoesNotOvershoot(t *testing.T) {
+	// High load + large window = long burn phase per cycle.
+	// Without the fix, Stop() during a burn phase could delay up to 90ms.
+	s := newStress(0.9, 5*time.Second, 0, 0)
+
+	handle, err := s.Start(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	handle.Stop()
+
+	result := <-handle.Done()
+
+	if result.ActualDuration < 250*time.Millisecond {
+		t.Fatalf("too fast: %s (expected ~300ms)", result.ActualDuration)
+	}
+	if result.ActualDuration > 400*time.Millisecond {
+		t.Fatalf("overshoot: %s (expected ≤400ms, burn phase leaked past cancellation)", result.ActualDuration)
+	}
+	t.Logf("stopped after %s (within tolerance)", result.ActualDuration)
+}
+
 // Verify Stress implements fault.Fault at compile time.
 var _ fault.Fault = (*Stress)(nil)

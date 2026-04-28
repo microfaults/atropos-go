@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"atropos-go/internal/fault"
 )
 
 // DemoEvaluator is a trivial Evaluator for demos and development.
@@ -15,7 +17,7 @@ import (
 type DemoEvaluator struct {
 	mu       sync.RWMutex
 	decision *Decision
-	req      *faultRequest // keep original request for GET serialization
+	req      *FaultRequest // keep original request for GET serialization
 }
 
 // Evaluate implements Evaluator.
@@ -26,7 +28,7 @@ func (d *DemoEvaluator) Evaluate(_ context.Context, _ Request) *Decision {
 }
 
 // Set activates a fault. All subsequent Evaluate calls return this decision.
-func (d *DemoEvaluator) Set(decision *Decision, req *faultRequest) {
+func (d *DemoEvaluator) Set(decision *Decision, req *FaultRequest) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.decision = decision
@@ -42,26 +44,35 @@ func (d *DemoEvaluator) Clear() {
 }
 
 // Active returns the current fault request, or nil if inactive.
-func (d *DemoEvaluator) Active() *faultRequest {
+func (d *DemoEvaluator) Active() *FaultRequest {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.req
 }
 
-// faultRequest is the JSON body for POST /admin/fault.
-type faultRequest struct {
-	Type       string `json:"type"`                  // "latency", "error", "hang"
-	Delay      string `json:"delay,omitempty"`        // duration string for latency
-	Jitter     string `json:"jitter,omitempty"`       // duration string for latency jitter
-	Duration   string `json:"duration,omitempty"`     // duration string for hang
-	StatusCode int    `json:"status_code,omitempty"`  // HTTP status for error fault
-	Message    string `json:"message,omitempty"`      // error message for error fault
+// FaultRequest is the JSON body for POST /admin/fault.
+type FaultRequest struct {
+	Category   string          `json:"category,omitempty"`     // "inline" (default), "network", "resource"
+	Type       string          `json:"type"`                   // fault type within category
+	Delay      string          `json:"delay,omitempty"`        // duration string for inline latency
+	Jitter     string          `json:"jitter,omitempty"`       // duration string for inline latency jitter
+	Duration   string          `json:"duration,omitempty"`     // duration string for inline hang
+	StatusCode int             `json:"status_code,omitempty"`  // HTTP status for inline error fault
+	Message    string          `json:"message,omitempty"`      // error message for inline error fault
+	Config     json.RawMessage `json:"config,omitempty"`       // extended config for network/resource
 }
 
-// faultStatus is the JSON response for GET /admin/fault.
-type faultStatus struct {
+func (r *FaultRequest) effectiveCategory() string {
+	if r.Category == "" {
+		return "inline"
+	}
+	return r.Category
+}
+
+// FaultStatus is the JSON response for GET /admin/fault.
+type FaultStatus struct {
 	Active bool          `json:"active"`
-	Fault  *faultRequest `json:"fault,omitempty"`
+	Fault  *FaultRequest `json:"fault,omitempty"`
 }
 
 var (
@@ -93,20 +104,28 @@ func ensureDemoEval() *DemoEvaluator {
 func FaultAdminHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		eval := ensureDemoEval()
-		w.Header().Set("Content-Type", "application/json")
+		FaultAdminHandlerWith(eval, nil).ServeHTTP(w, r)
+	})
+}
 
+// FaultAdminHandlerWith returns an http.Handler wired to the given evaluator
+// and optional NetworkResolver. Use this constructor when the admin endpoint
+// needs to accept network-category faults.
+func FaultAdminHandlerWith(eval *DemoEvaluator, resolve NetworkResolver) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		switch r.Method {
 		case http.MethodPost:
-			handleFaultPost(w, r, eval)
+			handleFaultPost(w, r, eval, resolve)
 		case http.MethodDelete:
 			eval.Clear()
-			json.NewEncoder(w).Encode(faultStatus{Active: false})
+			json.NewEncoder(w).Encode(FaultStatus{Active: false})
 		case http.MethodGet:
 			req := eval.Active()
 			if req != nil {
-				json.NewEncoder(w).Encode(faultStatus{Active: true, Fault: req})
+				json.NewEncoder(w).Encode(FaultStatus{Active: true, Fault: req})
 			} else {
-				json.NewEncoder(w).Encode(faultStatus{Active: false})
+				json.NewEncoder(w).Encode(FaultStatus{Active: false})
 			}
 		default:
 			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
@@ -114,60 +133,138 @@ func FaultAdminHandler() http.Handler {
 	})
 }
 
-func handleFaultPost(w http.ResponseWriter, r *http.Request, eval *DemoEvaluator) {
-	var req faultRequest
+func handleFaultPost(w http.ResponseWriter, r *http.Request, eval *DemoEvaluator, resolve NetworkResolver) {
+	var req FaultRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"invalid json: %s"}`, err), http.StatusBadRequest)
 		return
 	}
 
-	var f Fault
+	f, err := buildFault(req, resolve)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusBadRequest)
+		return
+	}
+
+	mode := Inline
+	if req.effectiveCategory() != "inline" {
+		mode = Background
+	}
+
+	decision := &Decision{
+		Name:   "admin",
+		Fault:  f,
+		Reason: "admin",
+		Mode:   mode,
+	}
+	eval.Set(decision, &req)
+
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(FaultStatus{Active: true, Fault: &req})
+}
+
+// buildFault dispatches fault construction by category. Shared between
+// admin.go (handleFaultPost) and register.go (applyActiveFault).
+func buildFault(req FaultRequest, resolve NetworkResolver) (Fault, error) {
+	switch req.effectiveCategory() {
+	case "inline":
+		return buildInlineFault(req)
+	case "network":
+		return buildNetworkFault(req, resolve)
+	case "resource":
+		return buildResourceFault(req)
+	default:
+		return nil, fmt.Errorf("unknown category %q", req.Category)
+	}
+}
+
+func buildInlineFault(req FaultRequest) (Fault, error) {
 	switch req.Type {
 	case "latency":
 		delay, err := time.ParseDuration(req.Delay)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"invalid delay: %s"}`, err), http.StatusBadRequest)
-			return
+			return nil, fmt.Errorf("invalid delay %q: %w", req.Delay, err)
 		}
 		var jitter time.Duration
 		if req.Jitter != "" {
 			jitter, err = time.ParseDuration(req.Jitter)
 			if err != nil {
-				http.Error(w, fmt.Sprintf(`{"error":"invalid jitter: %s"}`, err), http.StatusBadRequest)
-				return
+				return nil, fmt.Errorf("invalid jitter %q: %w", req.Jitter, err)
 			}
 		}
-		f = NewLatencyFault(delay, jitter)
-
+		return NewLatencyFault(delay, jitter), nil
 	case "error":
-		if req.StatusCode == 0 {
-			req.StatusCode = http.StatusInternalServerError
+		status := req.StatusCode
+		if status == 0 {
+			status = http.StatusInternalServerError
 		}
-		if req.Message == "" {
-			req.Message = "injected fault"
+		msg := req.Message
+		if msg == "" {
+			msg = "injected fault"
 		}
-		f = NewErrorFault(req.StatusCode, req.Message)
-
+		return NewErrorFault(status, msg), nil
 	case "hang":
 		dur, err := time.ParseDuration(req.Duration)
 		if err != nil {
-			http.Error(w, fmt.Sprintf(`{"error":"invalid duration: %s"}`, err), http.StatusBadRequest)
-			return
+			return nil, fmt.Errorf("invalid hang duration %q: %w", req.Duration, err)
 		}
-		f = NewHangFault(dur)
-
+		return NewHangFault(dur), nil
 	default:
-		http.Error(w, `{"error":"unknown fault type, must be: latency, error, hang"}`, http.StatusBadRequest)
-		return
+		return nil, fmt.Errorf("unknown inline fault type %q", req.Type)
 	}
+}
 
-	decision := &Decision{
-		Fault:  f,
-		Reason: "admin",
-		Mode:   Inline,
+func buildNetworkFault(req FaultRequest, resolve NetworkResolver) (Fault, error) {
+	if resolve == nil {
+		return nil, fmt.Errorf("network fault %q requires a NetworkResolver", req.Type)
 	}
-	eval.Set(decision, &req)
+	cfg := req.Config
+	if cfg == nil {
+		cfg = json.RawMessage(`{}`)
+	}
+	var envelope struct {
+		Duration string `json:"duration"`
+	}
+	if err := json.Unmarshal(cfg, &envelope); err != nil {
+		return nil, fmt.Errorf("decode network config: %w", err)
+	}
+	dur, err := time.ParseDuration(envelope.Duration)
+	if err != nil {
+		return nil, fmt.Errorf("invalid network duration %q: %w", envelope.Duration, err)
+	}
+	baseCfg := fault.FaultConfig{Duration: dur}
+	return decodeNetworkFault(req.Type, cfg, baseCfg, resolve)
+}
 
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(faultStatus{Active: true, Fault: &req})
+func buildResourceFault(req FaultRequest) (Fault, error) {
+	cfg := req.Config
+	if cfg == nil {
+		cfg = json.RawMessage(`{}`)
+	}
+	var envelope struct {
+		Duration string `json:"duration"`
+		RampUp   string `json:"ramp_up"`
+		RampDown string `json:"ramp_down"`
+	}
+	if err := json.Unmarshal(cfg, &envelope); err != nil {
+		return nil, fmt.Errorf("decode resource config: %w", err)
+	}
+	dur, err := time.ParseDuration(envelope.Duration)
+	if err != nil {
+		return nil, fmt.Errorf("invalid resource duration %q: %w", envelope.Duration, err)
+	}
+	baseCfg := fault.FaultConfig{Duration: dur}
+	if envelope.RampUp != "" {
+		baseCfg.RampUp, err = time.ParseDuration(envelope.RampUp)
+		if err != nil {
+			return nil, fmt.Errorf("invalid ramp_up %q: %w", envelope.RampUp, err)
+		}
+	}
+	if envelope.RampDown != "" {
+		baseCfg.RampDown, err = time.ParseDuration(envelope.RampDown)
+		if err != nil {
+			return nil, fmt.Errorf("invalid ramp_down %q: %w", envelope.RampDown, err)
+		}
+	}
+	return decodeResourceFault(req.Type, cfg, baseCfg)
 }
