@@ -31,6 +31,21 @@ var (
 		Name: "http_client_requests_total",
 		Help: "Total HTTP client requests.",
 	}, []string{"method", "status_code", "target"})
+
+	cacheBoxHitsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "atropos_cachebox_hits_total",
+		Help: "Total cache-box hits (replay served from cache).",
+	})
+
+	cacheBoxMissesTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "atropos_cachebox_misses_total",
+		Help: "Total cache-box misses (fell back to passthrough).",
+	})
+
+	cacheBoxRecordsTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "atropos_cachebox_records_total",
+		Help: "Total cache-box records (passthrough responses captured).",
+	})
 )
 
 func init() {
@@ -39,6 +54,9 @@ func init() {
 		httpServerRequestsTotal,
 		httpClientRequestDuration,
 		httpClientRequestsTotal,
+		cacheBoxHitsTotal,
+		cacheBoxMissesTotal,
+		cacheBoxRecordsTotal,
 	)
 }
 

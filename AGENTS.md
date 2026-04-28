@@ -93,3 +93,48 @@ eval := atropos.NewStaticEvaluator()
 atropos.Configure(atropos.WithEvaluator(eval))
 mux.Handle("/admin/rules", atropos.RulesAdminHandler(eval))
 ```
+
+## SDK Bootstrap
+
+Services embedding atropos-go register with manteion on startup so manteion can serve them rules and reconcile intent on rolling deploys.
+
+### Types
+
+- `RegisterRequest{ID, Service, Version, Address}` — the POST body.
+- `RegisterResponse{Status, Rules, ActiveFault, FreezeCfg}` — the response. Rules/ActiveFault/FreezeCfg are populated when manteion has intent tracked for the service.
+- `CompiledRule`, `CompiledFault`, `CompiledComposition`, `CompiledCompositionMember` — the JSON wire format for rules, mirroring `manteion-go/internal/ruleconv`. `CompiledComposition` is carried on the wire but not yet executable on the SDK side; `DecodeCompiledRules` errors on composition rules.
+
+### Functions
+
+- `Register(ctx, manteionURL, req) (RegisterResponse, error)` — POSTs to `manteionURL + /api/v1/sdk/register` with a 5s default timeout.
+- `Apply(resp, ApplyTargets{Evaluator, DemoEval, CacheBox}) error` — installs rules, active fault, and freeze config onto the provided SDK objects. Missing targets for populated response fields are errors.
+- `DecodeCompiledRules([]CompiledRule) ([]StaticRule, error)` — lower-level helper used by Apply.
+
+### Typical Usage
+
+```go
+eval := atropos.NewStaticEvaluator()
+demo := &atropos.DemoEvaluator{}
+cb := atropos.NewCacheBox(atropos.CacheBoxConfig{Store: atropos.NewCacheBoxMemStore(1024)})
+
+atropos.Configure(atropos.WithEvaluator(eval), atropos.WithCacheBoxCoordinator(cb))
+
+resp, err := atropos.Register(ctx, os.Getenv("ATROPOS_MANTEION_URL"), atropos.RegisterRequest{
+    ID:      os.Getenv("POD_NAME"),
+    Service: os.Getenv("SERVICE_NAME"),
+    Address: fmt.Sprintf("http://%s:9090", os.Getenv("POD_IP")),
+})
+if err != nil {
+    log.Fatalf("register: %v", err)
+}
+if err := atropos.Apply(resp, atropos.ApplyTargets{Evaluator: eval, DemoEval: demo, CacheBox: cb}); err != nil {
+    log.Fatalf("apply: %v", err)
+}
+```
+
+### Limitations (current)
+
+- `DecodeCompiledRules` supports all three fault categories: inline (latency, error, hang), network (latency, loss, blackhole, drip, rst, throttle), and resource (cpu, memory, disk, io). Network faults require a `NetworkResolver` option via `WithNetworkResolver`.
+- The `disk` resource type is decoded by the SDK but is not in manteion's `validFaultTypes` — it is SDK-only and cannot be assigned via manteion rules.
+- Composition rules are rejected on decode — the SDK has no composition evaluator yet.
+- `DecodeCompiledRules` sorts decoded rules by `Priority` descending (higher = evaluated first). Equal-priority rules preserve input order.
