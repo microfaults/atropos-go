@@ -34,9 +34,8 @@ func (p InjectionPoint) String() string {
 
 // Request carries context for the evaluator decision.
 type Request struct {
-	Point   InjectionPoint
-	Labels  map[string]string
-	Payload any // optional parsed request body
+	Point  InjectionPoint
+	Labels map[string]string
 }
 
 // Mode indicates how the fault runs relative to the request.
@@ -55,6 +54,28 @@ func (m Mode) String() string {
 		return "inline"
 	default:
 		return fmt.Sprintf("mode(%d)", int(m))
+	}
+}
+
+// StartPolicy controls how the fault registry deduplicates service-scoped faults.
+type StartPolicy int
+
+const (
+	DeduplicateByRule StartPolicy = iota
+	DeduplicateByType // reserved, not yet implemented
+	AlwaysStart
+)
+
+func (p StartPolicy) String() string {
+	switch p {
+	case DeduplicateByRule:
+		return "deduplicate_by_rule"
+	case DeduplicateByType:
+		return "deduplicate_by_type"
+	case AlwaysStart:
+		return "always_start"
+	default:
+		return fmt.Sprintf("start_policy(%d)", int(p))
 	}
 }
 
@@ -102,10 +123,12 @@ func (a CacheBoxAction) String() string {
 // implementations must enforce this. The interceptor dispatches cache-box
 // decisions separately from fault decisions.
 type Decision struct {
-	Fault    fault.Fault
-	Reason   string
-	Mode     Mode
-	CacheBox CacheBoxAction
+	Name        string
+	Fault       fault.Fault
+	Reason      string
+	Mode        Mode
+	CacheBox    CacheBoxAction
+	StartPolicy StartPolicy
 }
 
 // Evaluator is the rule engine contract. Must be safe for concurrent use.

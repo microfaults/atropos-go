@@ -205,6 +205,9 @@ func dutyCycle(ctx context.Context, targetLoad float64, totalDuration, rampUp, r
 
 		// Burn phase: tight loop IS the workload.
 		burnDeadline := time.Now().Add(burnTime)
+		if dl, ok := ctx.Deadline(); ok && dl.Before(burnDeadline) {
+			burnDeadline = dl
+		}
 		for time.Now().Before(burnDeadline) {
 			select {
 			case <-ctx.Done():

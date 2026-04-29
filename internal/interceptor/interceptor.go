@@ -7,6 +7,7 @@ import (
 	"atropos-go/internal/cachebox"
 	"atropos-go/internal/evaluator"
 	fault "atropos-go/internal/fault"
+	inlinefault "atropos-go/internal/fault/inline"
 	"atropos-go/internal/trace"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -21,6 +22,12 @@ func WithCacheBox(cb *cachebox.CacheBox) Option {
 	return func(i *Interceptor) { i.cacheBox = cb }
 }
 
+// WithRegistry attaches a fault registry for deduplicating service-scoped
+// faults (network proxies, CPU stress, etc.).
+func WithRegistry(r *FaultRegistry) Option {
+	return func(i *Interceptor) { i.registry = r }
+}
+
 // Interceptor ties the evaluator, fault execution, OTel, and cache-box
 // together. It is the per-service policy dispatcher -- middleware layers
 // call into it at each injection point.
@@ -28,6 +35,7 @@ type Interceptor struct {
 	eval     evaluator.Evaluator
 	tracer   trace.Tracer
 	cacheBox *cachebox.CacheBox
+	registry *FaultRegistry
 }
 
 // noopEval never matches (tracing only, no faults).
@@ -78,12 +86,23 @@ func (i *Interceptor) Evaluate(ctx context.Context, req evaluator.Request) *eval
 	return i.eval.Evaluate(ctx, req)
 }
 
-// StartFault validates the fault on a decision, creates a fault-injection
-// span, and starts the fault. Returns an empty CheckResult if the decision
-// is nil or has no fault (i.e. a cache-box-only decision).
+// isInlineFault reports whether f is one of the inline fault types (latency,
+// error, hang) that execute in the request goroutine.
+func isInlineFault(f fault.Fault) bool {
+	switch f.(type) {
+	case *inlinefault.Latency, *inlinefault.Error, *inlinefault.Hang:
+		return true
+	default:
+		return false
+	}
+}
+
+// StartFault validates the fault on a decision and starts it. Non-inline
+// faults are forced to Background mode. If a registry is configured,
+// non-inline faults are routed through it for deduplication.
 //
-// The decision is assumed to be the output of a prior Evaluate call; this
-// method does not re-run the evaluator.
+// Returns an empty CheckResult if the decision is nil, has no fault, or was
+// deduplicated by the registry.
 func (i *Interceptor) StartFault(ctx context.Context, req evaluator.Request, decision *evaluator.Decision) (CheckResult, error) {
 	if decision == nil || decision.Fault == nil {
 		return CheckResult{}, nil
@@ -94,37 +113,96 @@ func (i *Interceptor) StartFault(ctx context.Context, req evaluator.Request, dec
 	}
 
 	faultType := fmt.Sprintf("%T", decision.Fault)
+
+	// Force Background mode for non-inline faults.
+	effectiveMode := decision.Mode
+	if !isInlineFault(decision.Fault) {
+		effectiveMode = evaluator.Background
+	}
+
+	// Registry path: non-inline faults with a registry get deduped.
+	if i.registry != nil && !isInlineFault(decision.Fault) {
+		return i.startRegistered(ctx, req, decision, faultType, effectiveMode)
+	}
+
+	// Direct path: inline faults (or no registry configured).
+	return i.startDirect(ctx, req, decision, faultType, effectiveMode)
+}
+
+// startDirect is the inline-fault path. It creates a span, wires up events,
+// starts the fault, and hooks the result callback.
+func (i *Interceptor) startDirect(ctx context.Context, req evaluator.Request, decision *evaluator.Decision, faultType string, mode evaluator.Mode) (CheckResult, error) {
 	ctx, span := i.tracer.Start(ctx, trace.SpanFaultInject,
 		attribute.String(trace.AttrFaultType, faultType),
 		attribute.String(trace.AttrFaultInjectionPoint, req.Point.String()),
 		attribute.String(trace.AttrFaultReason, decision.Reason),
 	)
-
-	// Thread request labels into the span for trace correlation.
 	for k, v := range req.Labels {
 		span.SetAttributes(attribute.String(k, v))
 	}
-
-	// If the fault can emit events, wire it up to the span.
 	if ea, ok := decision.Fault.(fault.EventAware); ok {
 		ea.SetEventEmitter(func(name string, attrs ...attribute.KeyValue) {
 			span.AddEvent(name, attrs...)
 		})
 	}
 
-	// Start the fault with the span-carrying context.
 	handle, err := decision.Fault.Start(ctx)
 	if err != nil {
 		span.EndWithError(err)
 		return CheckResult{}, fmt.Errorf("interceptor: fault start failed: %w", err)
 	}
-
-	// Hook into the handle: when the fault ends, record the result on the span.
 	handle.SetOnResult(func(r fault.Result) {
 		span.RecordResult(r)
 	})
 
-	return CheckResult{Handle: handle, Decision: decision}, nil
+	d := *decision
+	d.Mode = mode
+	return CheckResult{Handle: handle, Decision: &d}, nil
+}
+
+// startRegistered routes non-inline faults through the registry for
+// deduplication. The span is anchored to the registry context so faults can
+// outlive the triggering request.
+func (i *Interceptor) startRegistered(ctx context.Context, req evaluator.Request, decision *evaluator.Decision, faultType string, mode evaluator.Mode) (CheckResult, error) {
+	key := decision.Name
+	if key == "" {
+		key = faultType
+	}
+
+	handle, deduped, err := i.registry.StartOrJoin(key, decision.StartPolicy, func(regCtx context.Context) (*fault.Handle, error) {
+		_, span := i.tracer.Start(regCtx, trace.SpanFaultInject,
+			attribute.String(trace.AttrFaultType, faultType),
+			attribute.String(trace.AttrFaultInjectionPoint, req.Point.String()),
+			attribute.String(trace.AttrFaultReason, decision.Reason),
+		)
+		for k, v := range req.Labels {
+			span.SetAttributes(attribute.String(k, v))
+		}
+		if ea, ok := decision.Fault.(fault.EventAware); ok {
+			ea.SetEventEmitter(func(name string, attrs ...attribute.KeyValue) {
+				span.AddEvent(name, attrs...)
+			})
+		}
+		h, err := decision.Fault.Start(regCtx)
+		if err != nil {
+			span.EndWithError(err)
+			return nil, err
+		}
+		h.SetOnResult(func(r fault.Result) {
+			span.RecordResult(r)
+		})
+		return h, nil
+	})
+	if err != nil {
+		return CheckResult{}, fmt.Errorf("interceptor: fault start failed: %w", err)
+	}
+	if deduped {
+		return CheckResult{}, nil
+	}
+
+	d := *decision
+	d.Mode = mode
+	return CheckResult{Handle: handle, Decision: &d}, nil
 }
 
 // Check is a convenience that evaluates and (if appropriate) starts a fault.
