@@ -77,6 +77,43 @@ func Register(ctx context.Context, baseURL string, req RegisterRequest) (Registe
 	return resp, nil
 }
 
+// RegisterWithClient is Register but uses the supplied *http.Client.
+// Use when you need explicit transport / timeout control (e.g. ManteionClient).
+func RegisterWithClient(ctx context.Context, hc *http.Client, baseURL string, req RegisterRequest) (RegisterResponse, error) {
+	return registerWith(ctx, hc, baseURL, req)
+}
+
+// registerWith is the private implementation shared by RegisterWithClient.
+func registerWith(ctx context.Context, hc *http.Client, baseURL string, req RegisterRequest) (RegisterResponse, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return RegisterResponse{}, fmt.Errorf("marshal register request: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, registerTimeout)
+	defer cancel()
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		baseURL+"/api/v1/sdk/register", bytes.NewReader(body))
+	if err != nil {
+		return RegisterResponse{}, fmt.Errorf("new register request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpResp, err := hc.Do(httpReq)
+	if err != nil {
+		return RegisterResponse{}, fmt.Errorf("send register request: %w", err)
+	}
+	defer httpResp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+	if httpResp.StatusCode != http.StatusCreated {
+		return RegisterResponse{}, fmt.Errorf("register returned status %d: %s",
+			httpResp.StatusCode, string(respBody))
+	}
+	var resp RegisterResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return RegisterResponse{}, fmt.Errorf("decode register response: %w", err)
+	}
+	return resp, nil
+}
+
 // ApplyTargets names the SDK objects Apply mutates. Nil targets mean "this SDK
 // instance doesn't support that capability"; if the response references that
 // capability, Apply returns an error.
