@@ -34,47 +34,14 @@ type RegisterResponse struct {
 // registerTimeout is the default per-call deadline for Register.
 const registerTimeout = 5 * time.Second
 
-// Register POSTs a registration to manteion and returns the decoded response.
+// Register POSTs a registration to manteion using http.DefaultClient.
 // The returned response may contain rules, active_fault, and freeze_cfg if
 // manteion has intent tracked for the registering service.
 //
 // baseURL is manteion's base URL (e.g. "http://manteion.control.svc:8080").
 // The request is subject to registerTimeout (5s) unless ctx has an earlier deadline.
 func Register(ctx context.Context, baseURL string, req RegisterRequest) (RegisterResponse, error) {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return RegisterResponse{}, fmt.Errorf("marshal register request: %w", err)
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, registerTimeout)
-	defer cancel()
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		baseURL+"/api/v1/sdk/register", bytes.NewReader(body))
-	if err != nil {
-		return RegisterResponse{}, fmt.Errorf("new register request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-
-	httpResp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		return RegisterResponse{}, fmt.Errorf("send register request: %w", err)
-	}
-	defer httpResp.Body.Close()
-
-	// 1 MiB body cap; a truncated/erroring read still surfaces as a decode
-	// failure below, so dropping the ReadAll error loses no diagnostic value.
-	respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
-	if httpResp.StatusCode != http.StatusCreated {
-		return RegisterResponse{}, fmt.Errorf("register returned status %d: %s",
-			httpResp.StatusCode, string(respBody))
-	}
-
-	var resp RegisterResponse
-	if err := json.Unmarshal(respBody, &resp); err != nil {
-		return RegisterResponse{}, fmt.Errorf("decode register response: %w", err)
-	}
-	return resp, nil
+	return registerWith(ctx, http.DefaultClient, baseURL, req)
 }
 
 // RegisterWithClient is Register but uses the supplied *http.Client.
@@ -83,30 +50,39 @@ func RegisterWithClient(ctx context.Context, hc *http.Client, baseURL string, re
 	return registerWith(ctx, hc, baseURL, req)
 }
 
-// registerWith is the private implementation shared by RegisterWithClient.
+// registerWith is the private implementation shared by Register and RegisterWithClient.
+// It marshals req, POSTs to baseURL+"/api/v1/sdk/register" with a 5s timeout
+// (registerTimeout) layered onto ctx, and decodes the response. Response body
+// is read under a 1 MiB cap; a truncated/erroring read still surfaces as a
+// decode failure below, so dropping the ReadAll error loses no diagnostic value.
 func registerWith(ctx context.Context, hc *http.Client, baseURL string, req RegisterRequest) (RegisterResponse, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return RegisterResponse{}, fmt.Errorf("marshal register request: %w", err)
 	}
+
 	ctx, cancel := context.WithTimeout(ctx, registerTimeout)
 	defer cancel()
+
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		baseURL+"/api/v1/sdk/register", bytes.NewReader(body))
 	if err != nil {
 		return RegisterResponse{}, fmt.Errorf("new register request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+
 	httpResp, err := hc.Do(httpReq)
 	if err != nil {
 		return RegisterResponse{}, fmt.Errorf("send register request: %w", err)
 	}
 	defer httpResp.Body.Close()
+
 	respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
 	if httpResp.StatusCode != http.StatusCreated {
 		return RegisterResponse{}, fmt.Errorf("register returned status %d: %s",
 			httpResp.StatusCode, string(respBody))
 	}
+
 	var resp RegisterResponse
 	if err := json.Unmarshal(respBody, &resp); err != nil {
 		return RegisterResponse{}, fmt.Errorf("decode register response: %w", err)
