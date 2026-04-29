@@ -89,6 +89,20 @@ func TestRegister_NonCreatedStatus(t *testing.T) {
 	}
 }
 
+func TestRegisterWithClient_UsesSuppliedClient(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(atropos.RegisterResponse{Status: "registered"})
+	}))
+	defer server.Close()
+
+	custom := &http.Client{Timeout: 3 * time.Second}
+	resp, err := atropos.RegisterWithClient(context.Background(), custom, server.URL, atropos.RegisterRequest{ID: "pod-1", Service: "svc", Address: "http://10.0.0.1:8080"})
+	if err != nil || resp.Status != "registered" {
+		t.Fatalf("RegisterWithClient: err=%v status=%q", err, resp.Status)
+	}
+}
+
 func TestApply_SetsRules(t *testing.T) {
 	eval := atropos.NewStaticEvaluator()
 	resp := atropos.RegisterResponse{
