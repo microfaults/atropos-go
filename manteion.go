@@ -35,6 +35,11 @@ func ConnectManteion(ctx context.Context, serviceName string, opts ...ManteionOp
 		return nil, nil
 	}
 
+	if cfg.serviceVersion == "" {
+		cfg.logger.Warn("manteion: serviceVersion is empty; experiments may not attribute correctly",
+			"hint", "set MANTEION_SERVICE_VERSION or pass WithManteionServiceVersion()")
+	}
+
 	if cfg.targets.Evaluator == nil {
 		return nil, errors.New("ConnectManteion: WithApplyTargets must be set with a non-nil Evaluator")
 	}
@@ -71,6 +76,7 @@ func ConnectManteion(ctx context.Context, serviceName string, opts ...ManteionOp
 	}
 
 	pollCtx, cancel := context.WithCancel(context.Background())
+	c.pollCtx = pollCtx
 	c.cancel = cancel
 
 	// Channel used by the SSE listener to trigger an immediate poll tick.
@@ -130,9 +136,37 @@ func WithApplyTargets(t ApplyTargets) ManteionOption {
 	return manteionOptionFunc(func(c *manteionConfig) { c.targets = t })
 }
 
+// WithAddress sets the advertised address included in the register payload.
+// Precedence: WithAddress > MANTEION_ADVERTISE_ADDR > POD_IP > "".
+func WithAddress(addr string) ManteionOption {
+	return manteionOptionFunc(func(c *manteionConfig) { c.address = addr })
+}
+
+// WithManteionServiceVersion sets the service version reported in the register
+// payload. Experiments use this to attribute fault behaviour to a specific
+// version. Precedence: WithManteionServiceVersion > MANTEION_SERVICE_VERSION > "".
+func WithManteionServiceVersion(v string) ManteionOption {
+	return manteionOptionFunc(func(c *manteionConfig) { c.serviceVersion = v })
+}
+
 // WithHTTPClient injects a custom *http.Client. Default: 10s timeout.
 func WithHTTPClient(hc *http.Client) ManteionOption {
 	return manteionOptionFunc(func(c *manteionConfig) { c.httpClient = hc })
+}
+
+// WithAuthFunc applies fn to every outgoing manteion request. Use for
+// rotation, JWT refresh, signed requests, etc. Called per-request; keep cheap.
+func WithAuthFunc(fn func(*http.Request) error) ManteionOption {
+	return manteionOptionFunc(func(c *manteionConfig) { c.authFn = fn })
+}
+
+// WithAuthHeader is a convenience for static header injection.
+// Equivalent to WithAuthFunc that sets req.Header.Set(name, value).
+func WithAuthHeader(name, value string) ManteionOption {
+	return WithAuthFunc(func(r *http.Request) error {
+		r.Header.Set(name, value)
+		return nil
+	})
 }
 
 // WithLogger sets the slog logger used by ManteionClient. Default: slog.Default().
@@ -143,6 +177,7 @@ func WithLogger(l *slog.Logger) ManteionOption {
 type manteionConfig struct {
 	serviceName    string
 	serviceVersion string
+	address        string
 	url            string
 	instanceID     string
 	initTimeout    time.Duration
@@ -151,6 +186,7 @@ type manteionConfig struct {
 	targets        ApplyTargets
 	httpClient     *http.Client
 	logger         *slog.Logger
+	authFn         func(*http.Request) error
 }
 
 func defaultManteionConfig(serviceName string) manteionConfig {
@@ -168,13 +204,20 @@ func defaultManteionConfig(serviceName string) manteionConfig {
 		}
 	}
 
+	addr := os.Getenv("MANTEION_ADVERTISE_ADDR")
+	if addr == "" {
+		addr = os.Getenv("POD_IP")
+	}
+
 	return manteionConfig{
-		serviceName:  serviceName,
-		url:          url,
-		instanceID:   instanceID,
-		initTimeout:  initTimeout,
-		pollInterval: 10 * time.Second,
-		httpClient:   &http.Client{Timeout: 10 * time.Second},
-		logger:       slog.Default(),
+		serviceName:    serviceName,
+		serviceVersion: os.Getenv("MANTEION_SERVICE_VERSION"),
+		address:        addr,
+		url:            url,
+		instanceID:     instanceID,
+		initTimeout:    initTimeout,
+		pollInterval:   10 * time.Second,
+		httpClient:     &http.Client{Timeout: 10 * time.Second},
+		logger:         slog.Default(),
 	}
 }
