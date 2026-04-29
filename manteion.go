@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"time"
@@ -143,7 +144,13 @@ func WithApplyTargets(t ApplyTargets) ManteionOption {
 }
 
 // WithAddress sets the advertised address included in the register payload.
-// Precedence: WithAddress > MANTEION_ADVERTISE_ADDR > POD_IP > "".
+// Precedence: WithAddress > MANTEION_ADVERTISE_ADDR > first non-loopback IPv4
+// detected on a local interface > "".
+//
+// Auto-detection picks the first non-loopback IPv4 from net.InterfaceAddrs(),
+// which on multi-NIC hosts (or with virtual bridges like docker0/cni0) may not
+// be the address manteion can actually reach. For production, prefer
+// WithAddress or MANTEION_ADVERTISE_ADDR.
 func WithAddress(addr string) ManteionOption {
 	return manteionOptionFunc(func(c *manteionConfig) { c.address = addr })
 }
@@ -151,6 +158,11 @@ func WithAddress(addr string) ManteionOption {
 // WithManteionServiceVersion sets the service version reported in the register
 // payload. Experiments use this to attribute fault behaviour to a specific
 // version. Precedence: WithManteionServiceVersion > MANTEION_SERVICE_VERSION > "".
+//
+// Note: this is distinct from WithServiceVersion (in options.go), which sets
+// the OTel `service.version` resource attribute on traces. Most callers will
+// want to set both with the same value — they cover related-but-separate
+// concerns (manteion experiment attribution vs OTel tracing metadata).
 func WithManteionServiceVersion(v string) ManteionOption {
 	return manteionOptionFunc(func(c *manteionConfig) { c.serviceVersion = v })
 }
@@ -212,7 +224,7 @@ func defaultManteionConfig(serviceName string) manteionConfig {
 
 	addr := os.Getenv("MANTEION_ADVERTISE_ADDR")
 	if addr == "" {
-		addr = os.Getenv("POD_IP")
+		addr = localIPv4()
 	}
 
 	return manteionConfig{
@@ -226,4 +238,30 @@ func defaultManteionConfig(serviceName string) manteionConfig {
 		httpClient:     &http.Client{Timeout: 10 * time.Second},
 		logger:         slog.Default(),
 	}
+}
+
+// localIPv4 returns the first non-loopback IPv4 address found on any local
+// network interface, or "" if none. Used as a platform-agnostic fallback for
+// the manteion register payload's Address field when neither WithAddress nor
+// MANTEION_ADVERTISE_ADDR is set.
+//
+// Caveat: on multi-NIC hosts (or with virtual bridges like docker0/cni0),
+// this picks the first matching interface in iteration order, which may not
+// be the address manteion can actually reach. Prefer explicit configuration
+// in production.
+func localIPv4() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ""
+	}
+	for _, a := range addrs {
+		ipnet, ok := a.(*net.IPNet)
+		if !ok || ipnet.IP.IsLoopback() {
+			continue
+		}
+		if ip4 := ipnet.IP.To4(); ip4 != nil {
+			return ip4.String()
+		}
+	}
+	return ""
 }
