@@ -3,6 +3,7 @@ package atropos
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -322,6 +323,77 @@ func TestFetchRules_BodyLimitEnforced(t *testing.T) {
 	err := c.fetchRules(t.Context())
 	if err == nil {
 		t.Fatal("expected error from truncated 10 MiB body, got nil")
+	}
+}
+
+// ---------- SSE stream parsing ----------
+
+// newTestSSEClient returns a ManteionClient wired to srv for SSE tests.
+func newTestSSEClient(t *testing.T, srv *httptest.Server) *ManteionClient {
+	t.Helper()
+	return &ManteionClient{
+		cfg:       manteionConfig{url: srv.URL, serviceName: "svc"},
+		sseClient: &http.Client{Timeout: 5 * time.Second},
+		logger:    slog.New(slog.DiscardHandler),
+	}
+}
+
+// TestSSEStream_LargeLineScannerBuffer confirms the scanner can handle a
+// single SSE line up to 1 MiB without returning a bufio.ErrTooLong error.
+func TestSSEStream_LargeLineScannerBuffer(t *testing.T) {
+	const size = 600 * 1024 // 600 KiB — under the 1 MiB cap
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		// Single data: line of 600 KiB, then a blank line to dispatch, then close.
+		fmt.Fprintf(w, "data: %s\n\n", string(make([]byte, size)))
+	}))
+	defer srv.Close()
+
+	c := newTestSSEClient(t, srv)
+	triggered := false
+	err := c.sseStream(t.Context(), srv.URL+"/api/v1/sdk/events", func() { triggered = true })
+	if err != nil {
+		t.Fatalf("sseStream returned error on 600 KiB line: %v", err)
+	}
+	// No rules_changed event was sent, so the trigger should not have fired.
+	if triggered {
+		t.Fatal("triggerPoll fired unexpectedly")
+	}
+}
+
+// TestSSEStream_EventParsing_NoSpace confirms event: without a trailing space
+// (i.e. "event:rules_changed") is still recognised after TrimSpace.
+func TestSSEStream_EventParsing_NoSpace(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		// No space after the colon — spec allows both forms.
+		fmt.Fprint(w, "event:rules_changed\n\n")
+	}))
+	defer srv.Close()
+
+	c := newTestSSEClient(t, srv)
+	triggered := false
+	c.sseStream(t.Context(), srv.URL+"/api/v1/sdk/events", func() { triggered = true })
+	if !triggered {
+		t.Fatal("triggerPoll not fired for event:rules_changed (no space)")
+	}
+}
+
+// TestSSEStream_OnlyRulesChangedTriggers sends a heartbeat event followed by
+// a rules_changed event and confirms only the latter fires triggerPoll.
+func TestSSEStream_OnlyRulesChangedTriggers(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "event: heartbeat\n\nevent: rules_changed\n\n")
+	}))
+	defer srv.Close()
+
+	c := newTestSSEClient(t, srv)
+	count := 0
+	c.sseStream(t.Context(), srv.URL+"/api/v1/sdk/events", func() { count++ })
+	if count != 1 {
+		t.Fatalf("triggerPoll fired %d times, want exactly 1", count)
 	}
 }
 

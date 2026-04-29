@@ -44,12 +44,18 @@ func ConnectManteion(ctx context.Context, serviceName string, opts ...ManteionOp
 		return nil, errors.New("ConnectManteion: WithApplyTargets must be set with a non-nil Evaluator")
 	}
 
-	// SSE client: same transport (connection pooling, TLS config) but no
-	// Timeout — SSE responses stream indefinitely. The context on each
-	// request bounds the lifetime instead.
-	sseClient := &http.Client{
-		Transport: cfg.httpClient.Transport,
+	// SSE client: clone the user's transport (or DefaultTransport) so the
+	// SSE connection has its own pool and doesn't compete with short-lived
+	// calls. MaxIdleConnsPerHost=1 because we only hold one SSE connection
+	// per client; IdleConnTimeout=0 because the stream holds itself open.
+	base := http.DefaultTransport.(*http.Transport)
+	if t, ok := cfg.httpClient.Transport.(*http.Transport); ok && t != nil {
+		base = t
 	}
+	sseTransport := base.Clone()
+	sseTransport.MaxIdleConnsPerHost = 1
+	sseTransport.IdleConnTimeout = 0
+	sseClient := &http.Client{Transport: sseTransport}
 
 	c := &ManteionClient{
 		cfg:        cfg,

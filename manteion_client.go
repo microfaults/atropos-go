@@ -306,6 +306,9 @@ func (c *ManteionClient) sseStream(ctx context.Context, sseURL string, triggerPo
 	if err != nil {
 		return err
 	}
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Cache-Control", "no-cache")
+
 	// sseClient has no Timeout so the connection can stream indefinitely.
 	// The request context (cancelled by Close) bounds the lifetime.
 	resp, err := c.sseClient.Do(req)
@@ -319,10 +322,23 @@ func (c *ManteionClient) sseStream(ctx context.Context, sseURL string, triggerPo
 	}
 
 	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 0, 8192), 1<<20) // grow up to 1 MiB per line
+
+	var event string
 	for sc.Scan() {
 		line := sc.Text()
-		if strings.HasPrefix(line, "event: rules_changed") {
-			triggerPoll()
+		switch {
+		case line == "":
+			// Blank line = event boundary per SSE spec.
+			if event == "rules_changed" {
+				triggerPoll()
+			}
+			event = ""
+		case strings.HasPrefix(line, ":"):
+			// Comment / keepalive — ignore.
+		case strings.HasPrefix(line, "event:"):
+			event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		// data: lines ignored — we only care about the event name today.
 		}
 	}
 	return sc.Err()
