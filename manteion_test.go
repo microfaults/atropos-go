@@ -179,18 +179,19 @@ func TestManteionClient_PollLoop_Recovery(t *testing.T) {
 	defer srv.Close()
 
 	eval := newTestEvaluator()
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+
 	c := &ManteionClient{
 		cfg:        manteionConfig{url: srv.URL, serviceName: "svc", pollInterval: 50 * time.Millisecond},
 		httpClient: &http.Client{Timeout: 5 * time.Second},
 		targets:    ApplyTargets{Evaluator: eval},
 		logger:     slog.New(slog.DiscardHandler),
+		pollCtx:    ctx,
 	}
 	c.status.Store(int32(ManteionConnected))
 
 	trigger := make(chan struct{}, 1)
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
-	defer cancel()
-
 	c.wg.Go(func() { c.pollLoopWithTrigger(ctx, trigger) })
 
 	// Wait until status recovers to Connected.
@@ -282,5 +283,111 @@ func TestConnectManteion_NoEvaluator_Error(t *testing.T) {
 	_, err := ConnectManteion(t.Context(), "svc", WithManteionURL("http://localhost:9999"))
 	if err == nil {
 		t.Fatal("expected error when Evaluator is nil")
+	}
+}
+
+// ---------- fetchRules: 1 MiB body limit ----------
+
+// TestFetchRules_BodyLimitEnforced sends a 10 MiB rules response and asserts
+// that fetchRules returns an error (json.Unmarshal on a truncated body fails),
+// proving the LimitReader cap fires before memory usage can grow unbounded.
+func TestFetchRules_BodyLimitEnforced(t *testing.T) {
+	const tenMiB = 10 << 20
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/sdk/rules" {
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		// Write a JSON prefix, then pad to 10 MiB with spaces so the body is
+		// syntactically valid up to the limit but too large to pass through.
+		w.Write([]byte(`{"version":1,"rules":[`))
+		pad := make([]byte, tenMiB)
+		for i := range pad {
+			pad[i] = ' '
+		}
+		w.Write(pad)
+		w.Write([]byte(`]}`))
+	}))
+	defer srv.Close()
+
+	c := &ManteionClient{
+		cfg:        manteionConfig{url: srv.URL, serviceName: "svc"},
+		httpClient: &http.Client{Timeout: 5 * time.Second},
+		targets:    ApplyTargets{Evaluator: newTestEvaluator()},
+		logger:     slog.New(slog.DiscardHandler),
+	}
+
+	err := c.fetchRules(t.Context())
+	if err == nil {
+		t.Fatal("expected error from truncated 10 MiB body, got nil")
+	}
+}
+
+// ---------- Close: shutdown-while-registering ----------
+
+// TestClose_WaitsForRegisterGoroutine adds a goroutine to the WaitGroup
+// (simulating the re-register path in pollLoopWithTrigger) and asserts that
+// Close blocks on wg.Wait() until that goroutine finishes.
+//
+// The goroutine does not use the HTTP client — it blocks on an internal gate
+// so context cancellation (triggered by Close) doesn't race it to completion
+// before we can observe the blocking behaviour.
+func TestClose_WaitsForRegisterGoroutine(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// deregister call from Close
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	pollCtx, cancel := context.WithCancel(context.Background())
+
+	c := &ManteionClient{
+		cfg: manteionConfig{
+			url:         srv.URL,
+			serviceName: "svc",
+			instanceID:  "test-instance",
+		},
+		httpClient: &http.Client{Timeout: 5 * time.Second},
+		targets:    ApplyTargets{Evaluator: newTestEvaluator()},
+		logger:     slog.New(slog.DiscardHandler),
+		pollCtx:    pollCtx,
+		cancel:     cancel,
+	}
+
+	// gate blocks the goroutine until we signal, independent of context.
+	gate := make(chan struct{})
+	goroutineReached := make(chan struct{})
+
+	c.wg.Go(func() {
+		close(goroutineReached) // signal we're inside the goroutine
+		<-gate                  // block until unblocked by the test
+	})
+
+	// Wait until the goroutine is running before calling Close.
+	<-goroutineReached
+
+	// Kick off Close in the background; it must block on wg.Wait().
+	closeDone := make(chan struct{})
+	go func() {
+		defer close(closeDone)
+		c.Close(t.Context())
+	}()
+
+	// Close should be blocked on wg.Wait() — confirm it hasn't returned yet.
+	select {
+	case <-closeDone:
+		t.Fatal("Close returned before WaitGroup goroutine finished")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Unblock the goroutine; Close must now complete promptly.
+	close(gate)
+	select {
+	case <-closeDone:
+		// success
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return within 2s after WaitGroup goroutine finished")
 	}
 }
