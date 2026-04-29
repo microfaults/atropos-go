@@ -41,8 +41,24 @@ type ManteionClient struct {
 	lastPollAt  atomic.Int64 // unix nanos; 0 = never polled
 	status      atomic.Int32
 
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	pollCtx context.Context    // cancelled by Close; passed to register goroutines
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup
+}
+
+// newReq builds a manteion-bound request with auth applied.
+// Single chokepoint for all outgoing manteion requests in this client.
+func (c *ManteionClient) newReq(ctx context.Context, method, url string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	if c.cfg.authFn != nil {
+		if err := c.cfg.authFn(req); err != nil {
+			return nil, fmt.Errorf("auth: %w", err)
+		}
+	}
+	return req, nil
 }
 
 // Status returns the current connectivity status.
@@ -55,6 +71,7 @@ func (c *ManteionClient) Status() ManteionStatus {
 
 // Close cancels the poll loop, waits for it to exit, and sends a best-effort
 // deregister to manteion. Safe to call on a nil receiver (offline mode).
+// Always returns nil today (best-effort); reserved for future fatal-error reporting.
 func (c *ManteionClient) Close(ctx context.Context) error {
 	if c == nil {
 		return nil
@@ -68,7 +85,7 @@ func (c *ManteionClient) Close(ctx context.Context) error {
 	dctx, dcancel := context.WithTimeout(ctx, 2*time.Second)
 	defer dcancel()
 	deregisterURL := c.cfg.url + "/api/v1/sdk/register/" + url.PathEscape(c.cfg.instanceID)
-	req, err := http.NewRequestWithContext(dctx, http.MethodDelete, deregisterURL, nil)
+	req, err := c.newReq(dctx, http.MethodDelete, deregisterURL, nil)
 	if err != nil {
 		c.logger.Warn("build deregister request failed", "error", err)
 		return nil
@@ -78,7 +95,11 @@ func (c *ManteionClient) Close(ctx context.Context) error {
 		c.logger.Warn("deregister failed", "error", err)
 		return nil
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode/100 != 2 {
+		c.logger.Warn("deregister returned non-2xx", "status", resp.StatusCode)
+	}
 	return nil
 }
 
@@ -91,7 +112,7 @@ func (c *ManteionClient) waitForReady(ctx context.Context) error {
 
 	backoff := 500 * time.Millisecond
 	for attempt := 1; ; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.url+"/api/v1/sdk/init", nil)
+		req, err := c.newReq(ctx, http.MethodGet, c.cfg.url+"/api/v1/sdk/init", nil)
 		if err != nil {
 			return fmt.Errorf("build init request: %w", err)
 		}
@@ -102,6 +123,10 @@ func (c *ManteionClient) waitForReady(ctx context.Context) error {
 			if resp.StatusCode == http.StatusOK {
 				c.logger.Info("manteion ready", "attempts", attempt)
 				return nil
+			}
+			if resp.StatusCode != http.StatusServiceUnavailable {
+				c.logger.Warn("manteion init returned unexpected status",
+					"status", resp.StatusCode, "attempt", attempt)
 			}
 		}
 
@@ -121,7 +146,7 @@ func (c *ManteionClient) register(ctx context.Context) error {
 		ID:      c.cfg.instanceID,
 		Service: c.cfg.serviceName,
 		Version: c.cfg.serviceVersion,
-		Address: os.Getenv("POD_IP"),
+		Address: c.cfg.address,
 	})
 	if err != nil {
 		return err
@@ -154,8 +179,12 @@ func (c *ManteionClient) pollLoopWithTrigger(ctx context.Context, trigger <-chan
 				"error", err,
 			)
 
+			// Trigger a re-register exactly once when we first cross 6 consecutive
+			// failures. Manteion may have lost our registration (restart, eviction);
+			// re-register is idempotent on the same instanceID. We don't re-fire on
+			// every subsequent failure to avoid hammering a struggling server.
 			if consecutiveFailures == 6 {
-				go c.register(ctx)
+				c.wg.Go(func() { _ = c.register(c.pollCtx) })
 			}
 			return
 		}
@@ -165,7 +194,7 @@ func (c *ManteionClient) pollLoopWithTrigger(ctx context.Context, trigger <-chan
 			// Force a full rule pull: manteion may have restarted or accumulated
 			// changes we missed. Re-register with same instanceID (idempotent upsert).
 			c.ruleVersion.Store(0)
-			go c.register(ctx)
+			c.wg.Go(func() { _ = c.register(c.pollCtx) })
 		}
 		consecutiveFailures = 0
 		c.lastPollAt.Store(time.Now().UnixNano())
@@ -194,7 +223,7 @@ func (c *ManteionClient) fetchRules(ctx context.Context) error {
 	}
 	fullURL := c.cfg.url + "/api/v1/sdk/rules?" + q.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
+	req, err := c.newReq(ctx, http.MethodGet, fullURL, nil)
 	if err != nil {
 		return fmt.Errorf("build rules request: %w", err)
 	}
@@ -209,11 +238,15 @@ func (c *ManteionClient) fetchRules(ctx context.Context) error {
 		return nil
 
 	case http.StatusOK:
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if err != nil {
+			return fmt.Errorf("read rules body: %w", err)
+		}
 		var payload struct {
 			Version uint64         `json:"version"`
 			Rules   []CompiledRule `json:"rules"`
 		}
-		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		if err := json.Unmarshal(body, &payload); err != nil {
 			return fmt.Errorf("decode rules: %w", err)
 		}
 
@@ -269,7 +302,7 @@ func (c *ManteionClient) listenSSE(ctx context.Context, triggerPoll func()) {
 }
 
 func (c *ManteionClient) sseStream(ctx context.Context, sseURL string, triggerPoll func()) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sseURL, nil)
+	req, err := c.newReq(ctx, http.MethodGet, sseURL, nil)
 	if err != nil {
 		return err
 	}
@@ -302,6 +335,8 @@ func generateInstanceID() string {
 		host = "unknown"
 	}
 	b := make([]byte, 4)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		return host + "-" + strconv.FormatInt(time.Now().UnixNano(), 16)
+	}
 	return host + "-" + hex.EncodeToString(b)
 }
