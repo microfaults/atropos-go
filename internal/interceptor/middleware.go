@@ -4,8 +4,8 @@ import (
 	"log"
 	"net/http"
 
-	"atropos-go/internal/evaluator"
-	"atropos-go/internal/trace"
+	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 
 	"go.opentelemetry.io/otel/baggage"
 )

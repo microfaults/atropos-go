@@ -2,11 +2,11 @@
 package atropos
 
 import (
-	"atropos-go/internal/cachebox"
-	"atropos-go/internal/evaluator"
-	"atropos-go/internal/fault"
-	"atropos-go/internal/interceptor"
-	"atropos-go/internal/trace"
+	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
+	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
+	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
+	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 )
 
 // --- Fault types ---

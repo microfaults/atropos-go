@@ -10,9 +10,9 @@ import (
 	"syscall"
 	"time"
 
-	"atropos-go/internal/fault"
-	"atropos-go/internal/fault/resource"
-	"atropos-go/internal/fault/resource/cpu"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault/resource"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault/resource/cpu"
 )
 
 func main() {

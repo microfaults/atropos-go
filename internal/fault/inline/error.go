@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	fault "atropos-go/internal/fault"
+	fault "git.ucsc.edu/microfaults/atropos-go/internal/fault"
 )
 
 // Error is an inline fault that completes immediately with a configured

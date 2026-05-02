@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"atropos-go/internal/cachebox"
+	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 )
 
 // CachePushConfig configures a CachePushClient.

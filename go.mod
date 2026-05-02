@@ -1,4 +1,4 @@
-module atropos-go
+module git.ucsc.edu/microfaults/atropos-go
 
 go 1.25.5
 

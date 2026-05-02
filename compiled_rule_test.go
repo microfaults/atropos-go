@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"atropos-go/internal/fault/inline"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault/inline"
 )
 
 func TestDecodeCompiledRules_Latency(t *testing.T) {

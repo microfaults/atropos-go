@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"atropos-go/internal/cachebox"
-	"atropos-go/internal/evaluator"
-	"atropos-go/internal/trace"
+	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
+	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 )
 
 // newTestInterceptor builds an interceptor with the given rules and a fresh

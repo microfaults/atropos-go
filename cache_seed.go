@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"time"
 
-	"atropos-go/internal/cachebox"
+	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 )
 
 const seedTimeout = 30 * time.Second

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"atropos-go/internal/evaluator"
-	"atropos-go/internal/fault/inline"
+	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault/inline"
 
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
