@@ -9,9 +9,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/microfaults/atropos-go/internal/cachebox"
-	"github.com/microfaults/atropos-go/internal/evaluator"
-	"github.com/microfaults/atropos-go/internal/trace"
+	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
+	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 
 	"go.opentelemetry.io/otel/attribute"
 )

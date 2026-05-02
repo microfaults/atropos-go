@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	fault "github.com/microfaults/atropos-go/internal/fault"
+	fault "git.ucsc.edu/microfaults/atropos-go/internal/fault"
 )
 
 // startEchoServer starts a TCP server that echoes back everything it receives.

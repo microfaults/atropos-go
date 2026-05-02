@@ -9,8 +9,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/microfaults/atropos-go/internal/fault"
-	"github.com/microfaults/atropos-go/internal/fault/resource/disk"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault/resource/disk"
 )
 
 func main() {

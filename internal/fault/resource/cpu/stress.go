@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/microfaults/atropos-go/internal/fault"
-	"github.com/microfaults/atropos-go/internal/fault/resource"
-	"github.com/microfaults/atropos-go/internal/trace"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault/resource"
+	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 
 	"go.opentelemetry.io/otel/attribute"
 )

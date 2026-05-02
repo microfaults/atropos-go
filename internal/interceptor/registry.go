@@ -4,8 +4,8 @@ import (
 	"context"
 	"sync"
 
-	"github.com/microfaults/atropos-go/internal/evaluator"
-	"github.com/microfaults/atropos-go/internal/fault"
+	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
 )
 
 type registryEntry struct {

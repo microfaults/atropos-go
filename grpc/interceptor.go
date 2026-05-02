@@ -6,9 +6,9 @@ import (
 	"context"
 	"log"
 
-	"github.com/microfaults/atropos-go/internal/evaluator"
-	"github.com/microfaults/atropos-go/internal/interceptor"
-	"github.com/microfaults/atropos-go/internal/trace"
+	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
+	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"

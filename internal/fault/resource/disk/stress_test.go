@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/microfaults/atropos-go/internal/fault"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
 )
 
 func newStress(writeRate, maxDisk int64, duration, rampUp, rampDown time.Duration) *Stress {
