@@ -11,7 +11,7 @@ import (
 	"time"
 
 	atropos "atropos-go"
-	"atropos-go/internal/cachebox"
+	"github.com/microfaults/atropos-go/internal/cachebox"
 )
 
 func TestCachePushClient_BatchByCount(t *testing.T) {

@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"atropos-go/internal/evaluator"
-	"atropos-go/internal/fault"
+	"github.com/microfaults/atropos-go/internal/evaluator"
+	"github.com/microfaults/atropos-go/internal/fault"
 )
 
 func newStubFault(duration time.Duration) fault.Fault {

@@ -9,7 +9,7 @@ import (
 	"time"
 
 	atropos "atropos-go"
-	"atropos-go/internal/cachebox"
+	"github.com/microfaults/atropos-go/internal/cachebox"
 )
 
 func TestSeed_PopulatesStore(t *testing.T) {

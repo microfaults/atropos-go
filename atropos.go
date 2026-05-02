@@ -3,9 +3,9 @@
 package atropos
 
 import (
-	"atropos-go/internal/cachebox"
-	"atropos-go/internal/interceptor"
-	"atropos-go/internal/trace"
+	"github.com/microfaults/atropos-go/internal/cachebox"
+	"github.com/microfaults/atropos-go/internal/interceptor"
+	"github.com/microfaults/atropos-go/internal/trace"
 )
 
 var defaultInterceptor *Interceptor

@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"atropos-go/internal/evaluator"
-	"atropos-go/internal/fault/inline"
-	"atropos-go/internal/interceptor"
-	"atropos-go/internal/trace"
+	"github.com/microfaults/atropos-go/internal/evaluator"
+	"github.com/microfaults/atropos-go/internal/fault/inline"
+	"github.com/microfaults/atropos-go/internal/interceptor"
+	"github.com/microfaults/atropos-go/internal/trace"
 
 	"go.opentelemetry.io/otel"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"

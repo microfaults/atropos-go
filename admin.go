@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"atropos-go/internal/fault"
+	"github.com/microfaults/atropos-go/internal/fault"
 )
 
 // DemoEvaluator is a trivial Evaluator for demos and development.

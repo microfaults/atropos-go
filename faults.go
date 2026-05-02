@@ -4,13 +4,13 @@ package atropos
 import (
 	"time"
 
-	"atropos-go/internal/fault"
-	"atropos-go/internal/fault/inline"
-	"atropos-go/internal/fault/resource"
-	"atropos-go/internal/fault/resource/cpu"
-	"atropos-go/internal/fault/resource/disk"
-	iostress "atropos-go/internal/fault/resource/io"
-	"atropos-go/internal/fault/resource/memory"
+	"github.com/microfaults/atropos-go/internal/fault"
+	"github.com/microfaults/atropos-go/internal/fault/inline"
+	"github.com/microfaults/atropos-go/internal/fault/resource"
+	"github.com/microfaults/atropos-go/internal/fault/resource/cpu"
+	"github.com/microfaults/atropos-go/internal/fault/resource/disk"
+	iostress "github.com/microfaults/atropos-go/internal/fault/resource/io"
+	"github.com/microfaults/atropos-go/internal/fault/resource/memory"
 )
 
 // NewLatencyFault creates a fault that delays by base + rand(jitter).

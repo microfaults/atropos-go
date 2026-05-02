@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"time"
 
-	"atropos-go/internal/cachebox"
+	"github.com/microfaults/atropos-go/internal/cachebox"
 )
 
 // RegisterRequest is the POST body for /api/v1/sdk/register.

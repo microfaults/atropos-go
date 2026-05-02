@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"atropos-go/internal/fault"
+	"github.com/microfaults/atropos-go/internal/fault"
 )
 
 func newStress(readRate int64, fileSize, fileCount, workers int, duration, rampUp, rampDown time.Duration) *Stress {

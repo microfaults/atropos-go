@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"atropos-go/internal/fault"
+	"github.com/microfaults/atropos-go/internal/fault"
 )
 
 // pageSize is the OS page size used for page-touching allocations.

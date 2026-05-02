@@ -1,4 +1,4 @@
-module atropos-go
+module github.com/microfaults/atropos-go
 
 go 1.25.5
 

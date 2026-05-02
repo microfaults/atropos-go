@@ -5,7 +5,7 @@ import (
 	"os"
 	"time"
 
-	"atropos-go/internal/fault"
+	"github.com/microfaults/atropos-go/internal/fault"
 )
 
 const (

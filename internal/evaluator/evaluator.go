@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	fault "atropos-go/internal/fault"
+	fault "github.com/microfaults/atropos-go/internal/fault"
 )
 
 // InjectionPoint identifies where a fault check occurs.
