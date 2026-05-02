@@ -3,7 +3,7 @@ package memory
 import (
 	"fmt"
 
-	"atropos-go/internal/fault"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
 )
 
 // Default config values.

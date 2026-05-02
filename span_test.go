@@ -5,10 +5,10 @@ import (
 	"testing"
 	"time"
 
-	"atropos-go/internal/evaluator"
-	"atropos-go/internal/fault/inline"
-	"atropos-go/internal/interceptor"
-	"atropos-go/internal/trace"
+	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault/inline"
+	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
+	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"

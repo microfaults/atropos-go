@@ -5,7 +5,7 @@ import (
 	"os"
 	"time"
 
-	"atropos-go/internal/fault"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
 )
 
 // IOMode selects which I/O direction(s) the fault exercises.

@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	fault "atropos-go/internal/fault"
+	fault "git.ucsc.edu/microfaults/atropos-go/internal/fault"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -12,7 +12,7 @@ import (
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
-const tracerName = "atropos-go/fault"
+const tracerName = "git.ucsc.edu/microfaults/atropos-go/fault"
 
 // Tracer creates and manages spans.
 type Tracer interface {

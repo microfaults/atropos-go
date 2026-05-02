@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	fault "atropos-go/internal/fault"
+	fault "git.ucsc.edu/microfaults/atropos-go/internal/fault"
 )
 
 func TestLatency_Basic(t *testing.T) {

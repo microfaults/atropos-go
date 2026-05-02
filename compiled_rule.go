@@ -6,14 +6,14 @@ import (
 	"sort"
 	"time"
 
-	"atropos-go/internal/fault"
-	"atropos-go/internal/fault/inline"
-	"atropos-go/internal/fault/network"
-	"atropos-go/internal/fault/resource"
-	"atropos-go/internal/fault/resource/cpu"
-	"atropos-go/internal/fault/resource/disk"
-	iostress "atropos-go/internal/fault/resource/io"
-	"atropos-go/internal/fault/resource/memory"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault/inline"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault/network"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault/resource"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault/resource/cpu"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault/resource/disk"
+	iostress "git.ucsc.edu/microfaults/atropos-go/internal/fault/resource/io"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault/resource/memory"
 )
 
 // CompiledRule is the wire format received from manteion's poll/register

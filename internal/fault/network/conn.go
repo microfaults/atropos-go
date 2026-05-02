@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"atropos-go/internal/trace"
+	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 
 	"go.opentelemetry.io/otel/attribute"
 )

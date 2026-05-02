@@ -4,11 +4,11 @@ import (
 	"context"
 	"fmt"
 
-	"atropos-go/internal/cachebox"
-	"atropos-go/internal/evaluator"
-	fault "atropos-go/internal/fault"
-	inlinefault "atropos-go/internal/fault/inline"
-	"atropos-go/internal/trace"
+	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
+	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	fault "git.ucsc.edu/microfaults/atropos-go/internal/fault"
+	inlinefault "git.ucsc.edu/microfaults/atropos-go/internal/fault/inline"
+	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 
 	"go.opentelemetry.io/otel/attribute"
 )
