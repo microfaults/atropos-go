@@ -10,7 +10,8 @@ import (
 	"testing"
 	"time"
 
-	atropos "atropos-go"
+	atropos "git.ucsc.edu/microfaults/atropos-go"
+
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 )
 
