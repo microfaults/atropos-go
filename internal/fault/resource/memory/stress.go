@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -61,11 +62,27 @@ func (s *Stress) Start(ctx context.Context) (*fault.Handle, error) {
 	chunkSize := s.EffectiveChunkSize()
 	thrashWorkers := s.EffectiveThrashWorkers()
 
-	// Compute how many bytes we need to allocate.
-	targetTotal := uint64(s.TargetLoad * float64(available))
-	var targetBytes uint64
-	if targetTotal > currentUsage {
-		targetBytes = targetTotal - currentUsage
+	// Targeting is INCREMENTAL: TargetLoad × available is the additional
+	// pressure we add on top of baseline, not an absolute total to drive to.
+	// See resource/config.go and ambiguities.md A15 for design notes.
+	if available == 0 {
+		return nil, fmt.Errorf("memory stress: AvailableMemory() returned 0; cannot determine capacity")
+	}
+	if currentUsage >= available {
+		// Either detection sources are inconsistent (cgroup CurrentUsage
+		// paired with /proc-fallback AvailableMemory under an unlimited
+		// cgroup) or the system is genuinely at capacity. We cannot
+		// allocate safely; refuse to start so the caller can log it.
+		return nil, fmt.Errorf("memory stress: detection inconsistent or capacity exhausted (currentUsage=%d >= available=%d); refusing to start", currentUsage, available)
+	}
+
+	targetBytes := uint64(s.TargetLoad * float64(available))
+	// OOM safety cap. Incremental targeting means we never reduce targetBytes
+	// because of high baseline; we only cap to avoid pushing total past
+	// capacity. After the currentUsage >= available guard above, the
+	// subtraction here is always non-negative.
+	if currentUsage+targetBytes > available {
+		targetBytes = available - currentUsage
 	}
 
 	// How many chunks to reach target.

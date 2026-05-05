@@ -17,9 +17,20 @@ import (
 type Config struct {
 	fault.FaultConfig
 
-	// TargetLoad is the fraction of the resource to consume (0.0, 1.0].
-	// For CPU: fraction of all available cores (cgroup-aware).
-	// For Memory: fraction of available capacity.
+	// TargetLoad is the INCREMENTAL fraction of the resource to add on top
+	// of baseline (0.0, 1.0]. Setting 0.10 adds 10% × capacity of new load;
+	// it does NOT drive total utilisation to 10%.
+	//
+	// Consumed by:
+	//   - CPU:    spawns ⌈TargetLoad × cores⌉ workers, each duty-cycling
+	//             at TargetLoad of every Window
+	//   - Memory: allocates TargetLoad × AvailableMemory bytes, capped only
+	//             for OOM safety (never reduced to "match" baseline)
+	//
+	// Ignored by IO and Disk, which use explicit rate knobs (ReadRate /
+	// WriteRate in bytes/sec). See ambiguities.md A15 for the structural
+	// follow-up.
+	//
 	// Intensity ramps linearly during RampUp/RampDown phases.
 	TargetLoad float64
 
@@ -27,6 +38,9 @@ type Config struct {
 	// Within each window the fault is active for (load × window) and
 	// idle for the remainder. Smaller windows give finer control.
 	// Defaults to 100ms if zero.
+	//
+	// Used by CPU. Memory has no duty cycle (allocations are sticky);
+	// IO and Disk shape via token-bucket refill rate, not Window.
 	Window time.Duration
 }
 

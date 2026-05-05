@@ -274,6 +274,43 @@ These are *not* bugs. They're judgment calls where the better answer depends on 
 
 ---
 
+## A15 — `TargetLoad` and `Window` on shared `resource.Config` are dead fields for IO and Disk
+
+**Location:** `internal/fault/resource/config.go:24,30`; consumed by `cpu/`, `memory/`. Ignored by `io/`, `disk/`.
+
+**Decision:** Kept `TargetLoad` and `Window` on the shared `resource.Config` base. IO and Disk inherit them via struct embedding but never read them; their pressure is configured through explicit rate knobs (`ReadRate`, `WriteRate` in bytes/sec).
+
+**Reasoning at the time:**
+- IO and Disk are flow-shaped resources where bytes/sec is the natural intervention unit. `TargetLoad × capacity` doesn't map cleanly to disk bandwidth without per-host benchmarking, and the canonical fault-injection question is "add N MB/s of pressure," not "drive disk to 50% utilisation."
+- Moving `TargetLoad`/`Window` off the shared base onto per-fault configs (`cpu.Config`, `memory.Config`) is the cleaner shape but touches every wire-decode path in `compiled_rule.go`. Out of scope for the incremental-targeting fix that landed alongside this note.
+
+**Why it's worth revisiting:**
+- Dead knobs are a foot-gun: `target_load: 0.5` on a disk-stress rule is silently ignored. The type system claims a uniformity that doesn't hold.
+- Only the faults that consume a field should declare it.
+- Pairs naturally with A16 (compiled-rule wire format for resource fault config).
+
+**Revisit when:** `compiled_rule.go` decoders are touched for any reason, or when adding a new resource fault that has yet another shape (e.g., GPU, network bandwidth as a resource).
+
+---
+
+## A16 — Compiled-rule wire format for resource faults is flat, not nested per-fault config
+
+**Location:** `compiled_rule.go` (`decodeResourceFault`)
+
+**Decision:** Rule JSON has resource-fault parameters at the top level of the resource decision (e.g., `{"type": "memory", "target_load": 0.02, "duration_ms": 30000, ...}`) rather than under a per-fault config object (`{"type": "memory", "config": {"target_load": 0.02, ...}}`).
+
+**Reasoning at the time:**
+- Current decoders work; changing the wire shape requires coordinated changes in manteion-go's `ruleconv`, the `FaultRequest` struct, and any stored rule blobs in Postgres.
+- The nested `FaultRequest{Category, Type, DurationMs, Config json.RawMessage}` shape is part of a separate cleanup (V5 long-running-fault plan, fix H). Cheaper to do both at once when the time comes.
+
+**Why it's worth revisiting:**
+- A nested config object aligns with the per-fault config types (`memory.Config`, `cpu.Config` if split per A15) and makes per-type schema validation cleaner — Manteion can validate `Config` payloads against per-type schemas before fanout.
+- Rule serialization is friendlier to consumers (UI, audit log) when each fault type owns its own config schema.
+
+**Revisit when:** the V5 long-running-fault plan's `FaultRequest` cleanup ships, or when Manteion adds per-type schema validation at the API layer.
+
+---
+
 ## Summary: what this list is *not*
 
 - Not a bug list — every item above compiles, tests pass, race detector clean.
