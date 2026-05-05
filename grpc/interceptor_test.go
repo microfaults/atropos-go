@@ -46,7 +46,9 @@ func TestInterceptors_NoFault(t *testing.T) {
 
 	t.Run("UnaryClient", func(t *testing.T) {
 		fn := UnaryClientInterceptor(i)
-		err := fn(ctx, "/test.Service/Call", "req", "reply", nil, func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, opts ...grpc.CallOption) error { return nil })
+		err := fn(ctx, "/test.Service/Call", "req", "reply", nil, func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
+			return nil
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -54,7 +56,9 @@ func TestInterceptors_NoFault(t *testing.T) {
 
 	t.Run("StreamClient", func(t *testing.T) {
 		fn := StreamClientInterceptor(i)
-		cs, err := fn(ctx, &grpc.StreamDesc{StreamName: "Stream"}, nil, "/test.Service/Stream", func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) { return &fakeClientStream{}, nil })
+		cs, err := fn(ctx, &grpc.StreamDesc{StreamName: "Stream"}, nil, "/test.Service/Stream", func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+			return &fakeClientStream{}, nil
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -104,7 +108,6 @@ func TestExtractGRPCLabels(t *testing.T) {
 	}
 }
 
-
 func TestStreamServerInterceptor_WithFault(t *testing.T) {
 	eval := &testEvaluator{
 		decision: &evaluator.Decision{
@@ -133,7 +136,6 @@ func TestStreamServerInterceptor_WithFault(t *testing.T) {
 	}
 }
 
-
 func TestUnaryClientInterceptor_WithFault(t *testing.T) {
 	eval := &testEvaluator{
 		decision: &evaluator.Decision{
@@ -160,7 +162,6 @@ func TestUnaryClientInterceptor_WithFault(t *testing.T) {
 		t.Fatalf("expected >= 20ms from fault, got %s", elapsed)
 	}
 }
-
 
 type fakeServerStream struct {
 	grpc.ServerStream

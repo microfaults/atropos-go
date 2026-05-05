@@ -14,13 +14,13 @@ import (
 )
 
 func main() {
-	writeRate  := flag.Int64("writerate", 10*1024*1024, "target write bandwidth in bytes/sec (default 10 MB/s)")
-	maxDisk    := flag.Int64("maxdisk", 512*1024*1024, "max bytes to occupy on disk before overwriting (default 512 MB)")
-	chunkSize  := flag.Int64("chunksize", 1*1024*1024, "bytes per write op (default 1 MB)")
-	duration   := flag.Duration("duration", 5*time.Second, "total fault duration")
-	rampUp     := flag.Duration("rampup", 0, "ramp-up period (0 = instant)")
-	rampDown   := flag.Duration("rampdown", 0, "ramp-down period (0 = instant)")
-	path       := flag.String("path", "", "directory for temp file (default: os.TempDir())")
+	writeRate := flag.Int64("writerate", 10*1024*1024, "target write bandwidth in bytes/sec (default 10 MB/s)")
+	maxDisk := flag.Int64("maxdisk", 512*1024*1024, "max bytes to occupy on disk before overwriting (default 512 MB)")
+	chunkSize := flag.Int64("chunksize", 1*1024*1024, "bytes per write op (default 1 MB)")
+	duration := flag.Duration("duration", 5*time.Second, "total fault duration")
+	rampUp := flag.Duration("rampup", 0, "ramp-up period (0 = instant)")
+	rampDown := flag.Duration("rampdown", 0, "ramp-down period (0 = instant)")
+	path := flag.String("path", "", "directory for temp file (default: os.TempDir())")
 	flag.Parse()
 
 	fmt.Println("╔══════════════════════════════════════════╗")
