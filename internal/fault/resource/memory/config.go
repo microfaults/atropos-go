@@ -8,7 +8,7 @@ import (
 
 // Default config values.
 const (
-	DefaultChunkSize    = 1 << 20 // 1 MiB per allocation chunk
+	DefaultChunkSize     = 1 << 20 // 1 MiB per allocation chunk
 	DefaultThrashWorkers = 2
 )
 

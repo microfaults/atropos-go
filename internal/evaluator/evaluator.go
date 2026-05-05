@@ -62,7 +62,7 @@ type StartPolicy int
 
 const (
 	DeduplicateByRule StartPolicy = iota
-	DeduplicateByType // reserved, not yet implemented
+	DeduplicateByType             // reserved, not yet implemented
 	AlwaysStart
 )
 

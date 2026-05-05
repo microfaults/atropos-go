@@ -41,7 +41,7 @@ type ManteionClient struct {
 	lastPollAt  atomic.Int64 // unix nanos; 0 = never polled
 	status      atomic.Int32
 
-	pollCtx context.Context    // cancelled by Close; passed to register goroutines
+	pollCtx context.Context // cancelled by Close; passed to register goroutines
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 }
@@ -338,7 +338,7 @@ func (c *ManteionClient) sseStream(ctx context.Context, sseURL string, triggerPo
 			// Comment / keepalive — ignore.
 		case strings.HasPrefix(line, "event:"):
 			event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-		// data: lines ignored — we only care about the event name today.
+			// data: lines ignored — we only care about the event name today.
 		}
 	}
 	return sc.Err()

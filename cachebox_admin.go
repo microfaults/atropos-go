@@ -1,9 +1,9 @@
 package atropos
 
 import (
-	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 	"encoding/json"
 	"fmt"
+	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 	"net/http"
 	"strings"
 )

@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	DefaultWriteRate = 10 * 1024 * 1024 // 10 MB/s
+	DefaultWriteRate = 10 * 1024 * 1024  // 10 MB/s
 	DefaultMaxDisk   = 512 * 1024 * 1024 // 512 MB
 	DefaultChunkSize = 1 * 1024 * 1024   // 1 MB per write op
 

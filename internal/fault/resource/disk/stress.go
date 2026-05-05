@@ -18,10 +18,13 @@ import (
 // pressure storage bandwidth.
 //
 // Phase 1 (grow):   appends chunks until the file reaches MaxDiskUsage,
-//                   occupying real disk space.
+//
+//	occupying real disk space.
+//
 // Phase 2 (sustain): seeks back to 0 and overwrites in a loop for the
-//                   remainder of the duration, sustaining bandwidth pressure
-//                   without growing further.
+//
+//	remainder of the duration, sustaining bandwidth pressure
+//	without growing further.
 //
 // The write rate is throttled by a token bucket and follows the
 // ramp-up → steady → ramp-down timeline from FaultConfig.

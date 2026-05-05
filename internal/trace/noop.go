@@ -17,7 +17,7 @@ func (t *noopTracer) Start(ctx context.Context, _ string, _ ...attribute.KeyValu
 	return ctx, &noopSpan{}
 }
 
-func (s *noopSpan) SetAttributes(_ ...attribute.KeyValue) {}
+func (s *noopSpan) SetAttributes(_ ...attribute.KeyValue)      {}
 func (s *noopSpan) AddEvent(_ string, _ ...attribute.KeyValue) {}
 func (s *noopSpan) RecordResult(_ fault.Result)                {}
 func (s *noopSpan) EndWithError(_ error)                       {}

@@ -129,8 +129,14 @@ func (p *Proxy) handleAffected(ctx context.Context, client *net.TCPConn, connID 
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); p.streamWorker(ctx, client, serverTCP, upToxic, client, serverTCP, connID, "upstream") }()
-	go func() { defer wg.Done(); p.streamWorker(ctx, serverTCP, client, downToxic, client, serverTCP, connID, "downstream") }()
+	go func() {
+		defer wg.Done()
+		p.streamWorker(ctx, client, serverTCP, upToxic, client, serverTCP, connID, "upstream")
+	}()
+	go func() {
+		defer wg.Done()
+		p.streamWorker(ctx, serverTCP, client, downToxic, client, serverTCP, connID, "downstream")
+	}()
 	wg.Wait()
 
 	p.emitEvent(trace.EventNetConnClosed,

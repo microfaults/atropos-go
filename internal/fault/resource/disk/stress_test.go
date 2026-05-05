@@ -135,8 +135,8 @@ func TestStress_InvalidConfig(t *testing.T) {
 func TestStress_SingleFile(t *testing.T) {
 	// Verify only one temp file is created, grows to MaxDiskUsage, then overwrites.
 	tmpDir := t.TempDir()
-	chunkSize := int64(4 * 1024)           // 4 KB chunks
-	maxDisk := int64(4 * chunkSize)        // cap at 4 chunks = 16 KB
+	chunkSize := int64(4 * 1024)    // 4 KB chunks
+	maxDisk := int64(4 * chunkSize) // cap at 4 chunks = 16 KB
 
 	s := &Stress{
 		Config: Config{
@@ -176,7 +176,7 @@ func TestStress_SingleFile(t *testing.T) {
 func TestStress_WriteRateAccuracy(t *testing.T) {
 	// ChunkSize must be << WriteRate×duration so the token bucket can grant
 	// many tokens and we get an accurate rate measurement.
-	chunkSize := int64(4 * 1024) // 4 KB
+	chunkSize := int64(4 * 1024)  // 4 KB
 	writeRate := int64(64 * 1024) // 64 KB/s → ~128 KB over 2s
 	s := &Stress{
 		Config: Config{

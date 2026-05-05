@@ -52,14 +52,14 @@ func (d *DemoEvaluator) Active() *FaultRequest {
 
 // FaultRequest is the JSON body for POST /admin/fault.
 type FaultRequest struct {
-	Category   string          `json:"category,omitempty"`     // "inline" (default), "network", "resource"
-	Type       string          `json:"type"`                   // fault type within category
-	Delay      string          `json:"delay,omitempty"`        // duration string for inline latency
-	Jitter     string          `json:"jitter,omitempty"`       // duration string for inline latency jitter
-	Duration   string          `json:"duration,omitempty"`     // duration string for inline hang
-	StatusCode int             `json:"status_code,omitempty"`  // HTTP status for inline error fault
-	Message    string          `json:"message,omitempty"`      // error message for inline error fault
-	Config     json.RawMessage `json:"config,omitempty"`       // extended config for network/resource
+	Category   string          `json:"category,omitempty"`    // "inline" (default), "network", "resource"
+	Type       string          `json:"type"`                  // fault type within category
+	Delay      string          `json:"delay,omitempty"`       // duration string for inline latency
+	Jitter     string          `json:"jitter,omitempty"`      // duration string for inline latency jitter
+	Duration   string          `json:"duration,omitempty"`    // duration string for inline hang
+	StatusCode int             `json:"status_code,omitempty"` // HTTP status for inline error fault
+	Message    string          `json:"message,omitempty"`     // error message for inline error fault
+	Config     json.RawMessage `json:"config,omitempty"`      // extended config for network/resource
 }
 
 func (r *FaultRequest) effectiveCategory() string {

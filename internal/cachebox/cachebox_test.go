@@ -429,9 +429,9 @@ func (b *blockingStore) Put(string, *Entry) {
 	<-b.release
 }
 
-func (b *blockingStore) Delete(string)  {}
-func (b *blockingStore) Len() int       { return 0 }
-func (b *blockingStore) Clear()         {}
+func (b *blockingStore) Delete(string) {}
+func (b *blockingStore) Len() int      { return 0 }
+func (b *blockingStore) Clear()        {}
 func (b *blockingStore) Stats() StoreStats {
 	return StoreStats{}
 }
