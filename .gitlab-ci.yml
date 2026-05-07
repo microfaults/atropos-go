@@ -40,14 +40,6 @@ stages:
 
 .go-base:
   image: golang:1.25
-  variables:
-    GOMODCACHE: ${CI_PROJECT_DIR}/.gomodcache
-    GOCACHE: ${CI_PROJECT_DIR}/.gocache
-  cache:
-    key: go-${CI_COMMIT_REF_SLUG}
-    paths:
-      - .gomodcache
-      - .gocache
 
 go-verify:
   extends: .go-base
