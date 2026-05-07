@@ -106,8 +106,15 @@ type CacheBox = cachebox.CacheBox
 // CacheBoxConfig is the cache-box constructor config.
 type CacheBoxConfig = cachebox.Config
 
-// CacheBoxEntry is a single cached HTTP response.
+// CacheBoxEntry is the SDK's in-memory representation of a cached HTTP response.
+// Contains atomic.Int64 (HitCount) and Go-native types (http.Header, time.Duration).
+// NOT JSON-serializable — use CacheBoxWireEntry for wire transfer.
 type CacheBoxEntry = cachebox.Entry
+
+// CacheBoxWireEntry is the JSON-serializable transfer format for cache entries.
+// Used for all SDK <-> manteion communication (ingest and preload).
+// Convert with EntryToWire / WireToEntry.
+type CacheBoxWireEntry = cachebox.WireEntry
 
 // CacheBoxStore is the cache-box persistence contract.
 type CacheBoxStore = cachebox.Store
@@ -141,6 +148,16 @@ func NewCacheBox(cfg CacheBoxConfig) *CacheBox {
 // maxEntries means unbounded -- use with caution in production.
 func NewCacheBoxMemStore(maxEntries int) CacheBoxStore {
 	return cachebox.NewMemStore(cachebox.MemStoreConfig{MaxEntries: maxEntries})
+}
+
+// CacheBoxEntryToWire converts an in-memory Entry to a WireEntry for serialization.
+func CacheBoxEntryToWire(e *CacheBoxEntry) CacheBoxWireEntry {
+	return cachebox.EntryToWire(e)
+}
+
+// CacheBoxWireToEntry converts a WireEntry back to an in-memory Entry.
+func CacheBoxWireToEntry(w *CacheBoxWireEntry) *CacheBoxEntry {
+	return cachebox.WireToEntry(w)
 }
 
 // --- Trace types ---

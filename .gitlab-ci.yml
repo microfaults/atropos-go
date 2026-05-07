@@ -95,6 +95,19 @@ go-integration:
     - cd ../manteion-go
     - go build ./...
 
+# OpenAPI spec freshness gate.
+openapi-check:
+  stage: check
+  image: golang:1.25
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop"'
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq python3 python3-yaml
+    - go install github.com/swaggo/swag/v2/cmd/swag@v2.0.0-rc5
+    - export PATH=$PATH:$(go env GOPATH)/bin
+  script:
+    - make openapi-check
+
 # ---------------------------------------------------------------------------
 # Release — manual version tagging
 # ---------------------------------------------------------------------------

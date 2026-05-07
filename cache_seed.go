@@ -24,11 +24,11 @@ type seedResponse struct {
 // Returns the number of entries seeded. Fit parameters (mu/sigma for
 // replay_with_delay) come through RegisterResponse.FreezeCfg via Apply,
 // not through Seed.
-func Seed(ctx context.Context, baseURL, service string, store CacheBoxStore) (int, error) {
+func Seed(ctx context.Context, baseURL, service, runID string, store CacheBoxStore) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, seedTimeout)
 	defer cancel()
 
-	url := baseURL + "/api/v1/cache/entries?service=" + service
+	url := baseURL + "/api/v1/cache/entries?service=" + service + "&run_id=" + runID
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return 0, fmt.Errorf("seed: new request: %w", err)

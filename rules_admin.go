@@ -34,14 +34,14 @@ func RulesAdminHandler(eval *StaticEvaluator) http.Handler {
 		case http.MethodPost:
 			var rules []StaticRule
 			if err := json.NewDecoder(r.Body).Decode(&rules); err != nil {
-				http.Error(w, fmt.Sprintf(`{"error":"invalid json: %s"}`, err), http.StatusBadRequest)
+				jsonError(w, fmt.Sprintf("invalid json: %s", err), http.StatusBadRequest)
 				return
 			}
 			eval.SetRules(rules)
 			w.WriteHeader(http.StatusNoContent)
 
 		default:
-			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
 }

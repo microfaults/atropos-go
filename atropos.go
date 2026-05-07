@@ -1,3 +1,10 @@
+// @title       Atropos SDK Admin API
+// @version     1.0
+// @description Admin and health handlers exposed by the atropos-go SDK.
+// @description Host services mount these handlers on an internal/admin mux.
+// @description The generated spec documents the recommended mount paths used
+// @description by README examples.
+//
 // Package atropos provides OpenTelemetry instrumentation and fault
 // injection for Go services. See README.md for architecture and usage.
 package atropos

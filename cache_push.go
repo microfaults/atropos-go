@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -18,9 +18,11 @@ type CachePushConfig struct {
 	BaseURL  string
 	Service  string
 	Instance string
+	RunID    string        // experiment run this push belongs to
 	MaxBatch int           // default 100
 	MaxWait  time.Duration // default 5s
 	Client   *http.Client  // default http.DefaultClient
+	Logger   *slog.Logger  // default slog.Default()
 }
 
 // CachePushStats reports push counters.
@@ -45,7 +47,9 @@ type CachePushClient struct {
 	baseURL  string
 	service  string
 	instance string
+	runID    string
 	client   *http.Client
+	logger   *slog.Logger
 	maxBatch int
 	maxWait  time.Duration
 
@@ -76,11 +80,16 @@ func NewCachePushClient(cfg CachePushConfig) *CachePushClient {
 	if cfg.Client == nil {
 		cfg.Client = http.DefaultClient
 	}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
 	return &CachePushClient{
 		baseURL:  cfg.BaseURL,
 		service:  cfg.Service,
 		instance: cfg.Instance,
+		runID:    cfg.RunID,
 		client:   cfg.Client,
+		logger:   cfg.Logger,
 		maxBatch: cfg.MaxBatch,
 		maxWait:  cfg.MaxWait,
 		batch:    make([]cachebox.WireEntry, 0, cfg.MaxBatch),
@@ -146,6 +155,7 @@ func (c *CachePushClient) flushLocked() {
 type ingestEnvelope struct {
 	Service  string               `json:"service"`
 	Instance string               `json:"instance"`
+	RunID    string               `json:"run_id"`
 	Entries  []cachebox.WireEntry `json:"entries"`
 }
 
@@ -155,10 +165,11 @@ func (c *CachePushClient) post(entries []cachebox.WireEntry) {
 	body, err := json.Marshal(ingestEnvelope{
 		Service:  c.service,
 		Instance: c.instance,
+		RunID:    c.runID,
 		Entries:  entries,
 	})
 	if err != nil {
-		log.Printf("atropos: cache push marshal error: %v", err)
+		c.logger.Warn("cache push marshal error", "error", err)
 		c.dropped.Add(int64(len(entries)))
 		return
 	}
@@ -176,14 +187,14 @@ func (c *CachePushClient) post(entries []cachebox.WireEntry) {
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		log.Printf("atropos: cache push failed: %v", err)
+		c.logger.Warn("cache push failed", "error", err)
 		c.dropped.Add(int64(len(entries)))
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		log.Printf("atropos: cache push returned %d", resp.StatusCode)
+		c.logger.Warn("cache push rejected", "status", resp.StatusCode)
 		c.dropped.Add(int64(len(entries)))
 		return
 	}

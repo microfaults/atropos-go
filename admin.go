@@ -128,7 +128,7 @@ func FaultAdminHandlerWith(eval *DemoEvaluator, resolve NetworkResolver) http.Ha
 				json.NewEncoder(w).Encode(FaultStatus{Active: false})
 			}
 		default:
-			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
 }
@@ -136,13 +136,13 @@ func FaultAdminHandlerWith(eval *DemoEvaluator, resolve NetworkResolver) http.Ha
 func handleFaultPost(w http.ResponseWriter, r *http.Request, eval *DemoEvaluator, resolve NetworkResolver) {
 	var req FaultRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"invalid json: %s"}`, err), http.StatusBadRequest)
+		jsonError(w, fmt.Sprintf("invalid json: %s", err), http.StatusBadRequest)
 		return
 	}
 
 	f, err := buildFault(req, resolve)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err), http.StatusBadRequest)
+		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 

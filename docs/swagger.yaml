@@ -1,0 +1,445 @@
+components:
+  schemas:
+    atropos.CacheBoxStats:
+      properties:
+        recorder:
+          $ref: '#/components/schemas/cachebox.RecorderStats'
+        store:
+          $ref: '#/components/schemas/cachebox.StoreStats'
+      type: object
+    atropos.CacheBoxWireEntry:
+      properties:
+        body:
+          items:
+            type: integer
+          type: array
+          uniqueItems: false
+        header:
+          additionalProperties:
+            items:
+              type: string
+            type: array
+          type: object
+        key:
+          type: string
+        observed_latency_us:
+          type: integer
+        recorded_at:
+          type: string
+        status_code:
+          type: integer
+      type: object
+    atropos.DelayRequest:
+      properties:
+        mu:
+          type: number
+        seed:
+          type: integer
+        sigma:
+          type: number
+      type: object
+    atropos.ErrorResponse:
+      properties:
+        error:
+          example: invalid json
+          type: string
+      type: object
+    atropos.FaultRequest:
+      properties:
+        category:
+          description: '"inline" (default), "network", "resource"'
+          type: string
+        config:
+          description: extended config for network/resource
+          items:
+            type: integer
+          type: array
+          uniqueItems: false
+        delay:
+          description: duration string for inline latency
+          type: string
+        duration:
+          description: duration string for inline hang
+          type: string
+        jitter:
+          description: duration string for inline latency jitter
+          type: string
+        message:
+          description: error message for inline error fault
+          type: string
+        status_code:
+          description: HTTP status for inline error fault
+          type: integer
+        type:
+          description: fault type within category
+          type: string
+      type: object
+    atropos.FaultStatus:
+      properties:
+        active:
+          type: boolean
+        fault:
+          $ref: '#/components/schemas/atropos.FaultRequest'
+      type: object
+    atropos.HealthStatus:
+      properties:
+        last_successful_poll_at:
+          type: string
+        manteion_url:
+          type: string
+        rule_count:
+          type: integer
+        rule_version:
+          type: integer
+        stale_for:
+          description: 'StaleFor is the human-readable duration since LastSuccessfulPollAt.
+
+            Empty if never polled. Helps ops dashboards distinguish a 5s vs 5h DEGRADED.'
+          type: string
+        status:
+          type: string
+      type: object
+    atropos.StaticRule:
+      properties:
+        decision:
+          $ref: '#/components/schemas/evaluator.Decision'
+        labels:
+          additionalProperties:
+            type: string
+          description: all must match (AND semantics); empty = wildcard
+          type: object
+        name:
+          type: string
+        point:
+          $ref: '#/components/schemas/evaluator.InjectionPoint'
+      type: object
+    cachebox.RecorderStats:
+      properties:
+        dropped:
+          type: integer
+        pending:
+          type: integer
+        recorded:
+          type: integer
+      type: object
+    cachebox.StoreStats:
+      properties:
+        bytesUsed:
+          type: integer
+        entries:
+          type: integer
+        evictions:
+          type: integer
+        hits:
+          type: integer
+        misses:
+          type: integer
+      type: object
+    evaluator.CacheBoxAction:
+      enum:
+      - 0
+      - 1
+      - 2
+      - 3
+      type: integer
+      x-enum-varnames:
+      - CacheBoxNone
+      - CacheBoxPassthrough
+      - CacheBoxReplay
+      - CacheBoxReplayDelay
+    evaluator.Decision:
+      description: returned on match (copied, not aliased)
+      properties:
+        cacheBox:
+          $ref: '#/components/schemas/evaluator.CacheBoxAction'
+        fault: {}
+        mode:
+          $ref: '#/components/schemas/evaluator.Mode'
+        name:
+          type: string
+        reason:
+          type: string
+        startPolicy:
+          $ref: '#/components/schemas/evaluator.StartPolicy'
+      type: object
+    evaluator.InjectionPoint:
+      enum:
+      - 0
+      - 1
+      - 2
+      - 3
+      type: integer
+      x-enum-comments:
+        Custom: developer-annotated code block
+        Egress: outbound call to a dependency
+        Ingress: inbound request hitting the service
+        Transient: after request completion (side effects)
+      x-enum-varnames:
+      - Ingress
+      - Egress
+      - Transient
+      - Custom
+    evaluator.Mode:
+      enum:
+      - 0
+      - 1
+      type: integer
+      x-enum-comments:
+        Background: independent of request lifecycle
+        Inline: blocks until fault completes
+      x-enum-varnames:
+      - Background
+      - Inline
+    evaluator.StartPolicy:
+      enum:
+      - 0
+      - 1
+      - 2
+      type: integer
+      x-enum-comments:
+        DeduplicateByType: reserved, not yet implemented
+      x-enum-varnames:
+      - DeduplicateByRule
+      - DeduplicateByType
+      - AlwaysStart
+info:
+  description: 'Admin and health handlers exposed by the atropos-go SDK.
+
+    Host services mount these handlers on an internal/admin mux.
+
+    The generated spec documents the recommended mount paths used
+
+    by README examples.'
+  title: Atropos SDK Admin API
+  version: '1.0'
+openapi: 3.1.0
+paths:
+  /admin/cachebox:
+    delete:
+      responses:
+        '204':
+          description: cache cleared
+        '405':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/atropos.ErrorResponse'
+          description: method not allowed
+      summary: Clear cache-box entries
+      tags:
+      - admin
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/atropos.CacheBoxStats'
+          description: OK
+        '405':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/atropos.ErrorResponse'
+          description: method not allowed
+      summary: Inspect cache-box state
+      tags:
+      - admin
+  /admin/cachebox/delay:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              oneOf:
+              - type: object
+              - $ref: '#/components/schemas/atropos.DelayRequest'
+                description: delay distribution
+                summary: delay
+        description: delay distribution
+        required: true
+      responses:
+        '204':
+          description: delay source configured
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/atropos.ErrorResponse'
+          description: invalid delay request
+        '405':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/atropos.ErrorResponse'
+          description: method not allowed
+      summary: Configure cache-box replay delay
+      tags:
+      - admin
+  /admin/cachebox/entries:
+    post:
+      description: Inserts wire-format cache entries into the cache-box store.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              oneOf:
+              - type: object
+              - items:
+                  $ref: '#/components/schemas/atropos.CacheBoxWireEntry'
+                title: entries
+                type: array
+        description: cache entries
+        required: true
+      responses:
+        '204':
+          description: entries inserted
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/atropos.ErrorResponse'
+          description: invalid entries
+        '405':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/atropos.ErrorResponse'
+          description: method not allowed
+      summary: Preload cache-box entries
+      tags:
+      - admin
+  /admin/fault:
+    delete:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/atropos.FaultStatus'
+          description: OK
+        '405':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/atropos.ErrorResponse'
+          description: method not allowed
+      summary: Clear active runtime fault
+      tags:
+      - admin
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/atropos.FaultStatus'
+          description: OK
+        '405':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/atropos.ErrorResponse'
+          description: method not allowed
+      summary: Inspect active runtime fault
+      tags:
+      - admin
+    post:
+      description: Installs a single demo/admin fault decision. Inline faults run
+        in request flow; network and resource faults run in the background.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              oneOf:
+              - type: object
+              - $ref: '#/components/schemas/atropos.FaultRequest'
+                description: fault request
+                summary: fault
+        description: fault request
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/atropos.FaultStatus'
+          description: Created
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/atropos.ErrorResponse'
+          description: invalid fault request
+        '405':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/atropos.ErrorResponse'
+          description: method not allowed
+      summary: Activate a runtime fault
+      tags:
+      - admin
+  /admin/rules:
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/atropos.StaticRule'
+                type: array
+          description: OK
+        '405':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/atropos.ErrorResponse'
+          description: method not allowed
+      summary: List runtime rules
+      tags:
+      - admin
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              oneOf:
+              - type: object
+              - items:
+                  $ref: '#/components/schemas/atropos.StaticRule'
+                title: rules
+                type: array
+        description: replacement rules
+        required: true
+      responses:
+        '204':
+          description: rules replaced
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/atropos.ErrorResponse'
+          description: invalid rules
+        '405':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/atropos.ErrorResponse'
+          description: method not allowed
+      summary: Replace runtime rules
+      tags:
+      - admin
+  /health:
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/atropos.HealthStatus'
+          description: OK
+      summary: Report SDK health
+      tags:
+      - health
