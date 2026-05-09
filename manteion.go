@@ -33,6 +33,7 @@ func ConnectManteion(ctx context.Context, serviceName string, opts ...ManteionOp
 	}
 
 	if cfg.offline || cfg.url == "" {
+		cfg.logger.Warn("manteion: running in offline mode (MANTEION_URL is empty or offline mode enabled)")
 		return nil, nil
 	}
 

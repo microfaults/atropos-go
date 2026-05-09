@@ -243,8 +243,10 @@ func (c *ManteionClient) fetchRules(ctx context.Context) error {
 			return fmt.Errorf("read rules body: %w", err)
 		}
 		var payload struct {
-			Version uint64         `json:"version"`
-			Rules   []CompiledRule `json:"rules"`
+			Version      uint64         `json:"version"`
+			Rules        []CompiledRule `json:"rules"`
+			ActiveFaults []FaultRequest `json:"active_faults"`
+			FreezeCfg    *DelayRequest  `json:"freeze_cfg"`
 		}
 		if err := json.Unmarshal(body, &payload); err != nil {
 			return fmt.Errorf("decode rules: %w", err)
@@ -256,10 +258,27 @@ func (c *ManteionClient) fetchRules(ctx context.Context) error {
 			return nil // manteion is alive; this is a data issue
 		}
 
+		// Apply rules (rule engine).
 		c.targets.Evaluator.SetRules(staticRules)
 		c.ruleVersion.Store(payload.Version)
-		c.logger.Info("rules updated", "version", payload.Version, "count", len(staticRules))
+
+		// Apply manual faults (demo evaluator) and freeze config.
+		applyResp := RegisterResponse{
+			Status:       "poll",
+			Rules:        payload.Rules,
+			ActiveFaults: payload.ActiveFaults,
+			FreezeCfg:    payload.FreezeCfg,
+		}
+		if err := Apply(applyResp, c.targets); err != nil {
+			c.logger.Error("apply manual faults failed", "error", err)
+		}
+
+		c.logger.Info("rules updated",
+			"version", payload.Version,
+			"rules_count", len(staticRules),
+			"manual_faults", len(payload.ActiveFaults))
 		return nil
+
 
 	case http.StatusServiceUnavailable:
 		return fmt.Errorf("manteion not ready (503)")
