@@ -66,7 +66,7 @@ func Init(ctx context.Context, opts ...Option) (func(context.Context) error, err
 	// Build resource with service metadata.
 	res, err := resource.Merge(
 		resource.Default(),
-		resource.NewWithAttributes(semconv.SchemaURL,
+		resource.NewWithAttributes(resource.Default().SchemaURL(),
 			semconv.ServiceName(cfg.serviceName),
 			semconv.ServiceVersion(cfg.serviceVersion),
 			semconv.DeploymentEnvironment(cfg.environment),
@@ -83,7 +83,8 @@ func Init(ctx context.Context, opts ...Option) (func(context.Context) error, err
 	}
 
 	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
+		// sdktrace.WithBatcher(exporter),
+		sdktrace.WithSyncer(exporter),
 		sdktrace.WithResource(res),
 		sdktrace.WithSampler(sampler),
 	)

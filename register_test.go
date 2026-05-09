@@ -160,7 +160,7 @@ func TestApply_RulesWithoutEvaluatorErrors(t *testing.T) {
 func TestApply_ActiveFault_InvalidDelay(t *testing.T) {
 	demo := &atropos.DemoEvaluator{}
 	resp := atropos.RegisterResponse{
-		ActiveFault: &atropos.FaultRequest{Type: "latency", Delay: "bogus"},
+		ActiveFaults: []atropos.FaultRequest{{Type: "latency", Config: json.RawMessage(`{"delay":"bogus"}`)}},
 	}
 	err := atropos.Apply(resp, atropos.ApplyTargets{DemoEval: demo})
 	if err == nil {
@@ -177,7 +177,7 @@ func TestApply_ActiveFault_InvalidDelay(t *testing.T) {
 func TestApply_ActiveFault_UnknownType(t *testing.T) {
 	demo := &atropos.DemoEvaluator{}
 	resp := atropos.RegisterResponse{
-		ActiveFault: &atropos.FaultRequest{Type: "quantum"},
+		ActiveFaults: []atropos.FaultRequest{{Type: "quantum"}},
 	}
 	err := atropos.Apply(resp, atropos.ApplyTargets{DemoEval: demo})
 	if err == nil {
@@ -208,16 +208,16 @@ func TestApply_FreezeCfg_NegativeMu(t *testing.T) {
 func TestApply_ActiveFault_CPUStress(t *testing.T) {
 	demo := &atropos.DemoEvaluator{}
 	resp := atropos.RegisterResponse{
-		ActiveFault: &atropos.FaultRequest{
+		ActiveFaults: []atropos.FaultRequest{{
 			Category: "resource",
 			Type:     "cpu",
 			Config:   json.RawMessage(`{"duration":"5s","target_load":0.7}`),
-		},
+		}},
 	}
 	if err := atropos.Apply(resp, atropos.ApplyTargets{DemoEval: demo}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if demo.Active() == nil {
+	if len(demo.Active()) == 0 {
 		t.Fatal("expected active fault")
 	}
 }
@@ -225,11 +225,11 @@ func TestApply_ActiveFault_CPUStress(t *testing.T) {
 func TestApply_ActiveFault_NetworkRequiresResolver(t *testing.T) {
 	demo := &atropos.DemoEvaluator{}
 	resp := atropos.RegisterResponse{
-		ActiveFault: &atropos.FaultRequest{
+		ActiveFaults: []atropos.FaultRequest{{
 			Category: "network",
 			Type:     "latency",
 			Config:   json.RawMessage(`{"target":"redis","delay":"100ms","duration":"5s"}`),
-		},
+		}},
 	}
 	err := atropos.Apply(resp, atropos.ApplyTargets{DemoEval: demo})
 	if err == nil {

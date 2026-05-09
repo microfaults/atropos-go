@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 )
 
@@ -21,7 +20,7 @@ func TestFaultAdmin_PostCPUStress(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201; body = %s", rec.Code, rec.Body.String())
 	}
-	if eval.Active() == nil {
+	if len(eval.Active()) == 0 {
 		t.Fatal("expected active fault after POST")
 	}
 }
@@ -43,17 +42,14 @@ func TestFaultAdmin_PostNetworkLatency(t *testing.T) {
 	}
 }
 
-func resetDemoEval() {
-	demoEval = nil
-	demoEvalOnce = sync.Once{}
-}
+
 
 func TestFaultAdmin_PostLatency(t *testing.T) {
-	resetDemoEval()
-	handler := FaultAdminHandler()
+	eval := &DemoEvaluator{}
+	handler := FaultAdminHandlerWith(eval, nil)
 
 	// POST latency fault
-	body := `{"type":"latency","delay":"200ms","jitter":"50ms"}`
+	body := `{"type":"latency","config":{"delay":"200ms","jitter":"50ms"}}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -67,8 +63,8 @@ func TestFaultAdmin_PostLatency(t *testing.T) {
 	if !status.Active {
 		t.Fatal("expected active=true")
 	}
-	if status.Fault.Type != "latency" {
-		t.Fatalf("expected type=latency, got %s", status.Fault.Type)
+	if status.Faults[0].Type != "latency" {
+		t.Fatalf("expected type=latency, got %s", status.Faults[0].Type)
 	}
 
 	// GET should show active
@@ -103,10 +99,10 @@ func TestFaultAdmin_PostLatency(t *testing.T) {
 }
 
 func TestFaultAdmin_PostError(t *testing.T) {
-	resetDemoEval()
-	handler := FaultAdminHandler()
+	eval := &DemoEvaluator{}
+	handler := FaultAdminHandlerWith(eval, nil)
 
-	body := `{"type":"error","status_code":503,"message":"service down"}`
+	body := `{"type":"error","config":{"status_code":503,"message":"service down"}}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -117,14 +113,14 @@ func TestFaultAdmin_PostError(t *testing.T) {
 
 	var status FaultStatus
 	json.NewDecoder(rec.Body).Decode(&status)
-	if status.Fault.StatusCode != 503 {
-		t.Fatalf("expected status_code=503, got %d", status.Fault.StatusCode)
+	if len(status.Faults) == 0 || !strings.Contains(string(status.Faults[0].Config), "503") {
+		t.Fatalf("expected status_code=503 in config, got %s", string(status.Faults[0].Config))
 	}
 }
 
 func TestFaultAdmin_PostHang(t *testing.T) {
-	resetDemoEval()
-	handler := FaultAdminHandler()
+	eval := &DemoEvaluator{}
+	handler := FaultAdminHandlerWith(eval, nil)
 
 	body := `{"type":"hang","duration":"2s"}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
@@ -137,8 +133,8 @@ func TestFaultAdmin_PostHang(t *testing.T) {
 }
 
 func TestFaultAdmin_InvalidType(t *testing.T) {
-	resetDemoEval()
-	handler := FaultAdminHandler()
+	eval := &DemoEvaluator{}
+	handler := FaultAdminHandlerWith(eval, nil)
 
 	body := `{"type":"explode"}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
@@ -151,8 +147,8 @@ func TestFaultAdmin_InvalidType(t *testing.T) {
 }
 
 func TestFaultAdmin_MissingDelay(t *testing.T) {
-	resetDemoEval()
-	handler := FaultAdminHandler()
+	eval := &DemoEvaluator{}
+	handler := FaultAdminHandlerWith(eval, nil)
 
 	body := `{"type":"latency"}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
@@ -165,8 +161,8 @@ func TestFaultAdmin_MissingDelay(t *testing.T) {
 }
 
 func TestFaultAdmin_InvalidJSON(t *testing.T) {
-	resetDemoEval()
-	handler := FaultAdminHandler()
+	eval := &DemoEvaluator{}
+	handler := FaultAdminHandlerWith(eval, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader("{bad"))
 	rec := httptest.NewRecorder()
@@ -178,8 +174,8 @@ func TestFaultAdmin_InvalidJSON(t *testing.T) {
 }
 
 func TestFaultAdmin_MethodNotAllowed(t *testing.T) {
-	resetDemoEval()
-	handler := FaultAdminHandler()
+	eval := &DemoEvaluator{}
+	handler := FaultAdminHandlerWith(eval, nil)
 
 	req := httptest.NewRequest(http.MethodPut, "/admin/fault", nil)
 	rec := httptest.NewRecorder()
