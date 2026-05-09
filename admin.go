@@ -11,55 +11,114 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
 )
 
-// DemoEvaluator is a trivial Evaluator for demos and development.
-// When a fault is set, every Evaluate call returns that decision.
-// When cleared, no fault is injected. Safe for concurrent use.
-type DemoEvaluator struct {
-	mu       sync.RWMutex
-	decision *Decision
-	req      *FaultRequest // keep original request for GET serialization
+type faultSlot struct {
+	decision        *Decision
+	req             *FaultRequest
+	lastConfirmedAt time.Time
 }
 
-// Evaluate implements Evaluator.
+// DemoEvaluator is a trivial Evaluator for demos and development.
+// It holds at most one fault slot per category.
+// Safe for concurrent use.
+type DemoEvaluator struct {
+	mu    sync.RWMutex
+	slots map[string]*faultSlot // key = Category (one slot per category)
+}
+
+// Evaluate returns the first decision matching the request, in
+// inline > network > resource priority. Specificity is the rule's job.
 func (d *DemoEvaluator) Evaluate(_ context.Context, _ Request) *Decision {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return d.decision
+	for _, cat := range []string{"inline", "network", "resource"} {
+		if slot, ok := d.slots[cat]; ok && slot.decision != nil {
+			return slot.decision
+		}
+	}
+	return nil
 }
 
-// Set activates a fault. All subsequent Evaluate calls return this decision.
+// Set installs or replaces the slot for req.Category.
 func (d *DemoEvaluator) Set(decision *Decision, req *FaultRequest) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.decision = decision
-	d.req = req
+	if d.slots == nil {
+		d.slots = make(map[string]*faultSlot)
+	}
+	d.slots[req.effectiveCategory()] = &faultSlot{
+		decision:        decision,
+		req:             req,
+		lastConfirmedAt: time.Now(),
+	}
 }
 
-// Clear deactivates the fault. Evaluate returns nil after this call.
+// ClearSlot clears the fault slot for a specific category.
+func (d *DemoEvaluator) ClearSlot(category string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.slots, category)
+}
+
+// Clear deactivates all faults.
 func (d *DemoEvaluator) Clear() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.decision = nil
-	d.req = nil
+	d.slots = make(map[string]*faultSlot)
 }
 
-// Active returns the current fault request, or nil if inactive.
-func (d *DemoEvaluator) Active() *FaultRequest {
+// Confirm bumps lastConfirmedAt to now for the given category.
+func (d *DemoEvaluator) Confirm(category string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if s, ok := d.slots[category]; ok {
+		s.lastConfirmedAt = time.Now()
+	}
+}
+
+// ActiveCategories returns the categories of all currently-armed slots.
+func (d *DemoEvaluator) ActiveCategories() []string {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return d.req
+	out := make([]string, 0, len(d.slots))
+	for cat := range d.slots {
+		out = append(out, cat)
+	}
+	return out
+}
+
+// StaleSlots returns categories whose lastConfirmedAt is older than maxAge.
+func (d *DemoEvaluator) StaleSlots(maxAge time.Duration) []string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	cutoff := time.Now().Add(-maxAge)
+	var stale []string
+	for cat, s := range d.slots {
+		if s.lastConfirmedAt.Before(cutoff) {
+			stale = append(stale, cat)
+		}
+	}
+	return stale
+}
+
+// Active returns the list of all active fault requests.
+func (d *DemoEvaluator) Active() []*FaultRequest {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	out := make([]*FaultRequest, 0, len(d.slots))
+	for _, cat := range []string{"inline", "network", "resource"} {
+		if slot, ok := d.slots[cat]; ok && slot.req != nil {
+			out = append(out, slot.req)
+		}
+	}
+	return out
 }
 
 // FaultRequest is the JSON body for POST /admin/fault.
 type FaultRequest struct {
-	Category   string          `json:"category,omitempty"`    // "inline" (default), "network", "resource"
-	Type       string          `json:"type"`                  // fault type within category
-	Delay      string          `json:"delay,omitempty"`       // duration string for inline latency
-	Jitter     string          `json:"jitter,omitempty"`      // duration string for inline latency jitter
-	Duration   string          `json:"duration,omitempty"`    // duration string for inline hang
-	StatusCode int             `json:"status_code,omitempty"` // HTTP status for inline error fault
-	Message    string          `json:"message,omitempty"`     // error message for inline error fault
-	Config     json.RawMessage `json:"config,omitempty"`      // extended config for network/resource
+	Category   string          `json:"category"`             // "inline" (default), "network", "resource"
+	Type       string          `json:"type"`                 // fault type within category
+	DurationMs int64           `json:"duration_ms"`          // 0 = infinite (whitelist enforced server-side)
+	Config     json.RawMessage `json:"config,omitempty"`     // extended config for network/resource/inline
 }
 
 func (r *FaultRequest) effectiveCategory() string {
@@ -71,8 +130,8 @@ func (r *FaultRequest) effectiveCategory() string {
 
 // FaultStatus is the JSON response for GET /admin/fault.
 type FaultStatus struct {
-	Active bool          `json:"active"`
-	Fault  *FaultRequest `json:"fault,omitempty"`
+	Active bool            `json:"active"`
+	Faults []*FaultRequest `json:"faults,omitempty"` // matches new plan shape {"faults": [...]}
 }
 
 var (
@@ -114,16 +173,27 @@ func FaultAdminHandler() http.Handler {
 func FaultAdminHandlerWith(eval *DemoEvaluator, resolve NetworkResolver) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+
+		// Route manually to support DELETE /admin/fault/{category}
+		path := r.URL.Path
+
 		switch r.Method {
 		case http.MethodPost:
 			handleFaultPost(w, r, eval, resolve)
 		case http.MethodDelete:
-			eval.Clear()
+			// check if path is /admin/fault or /admin/fault/{category}
+			if path == "/admin/fault" || path == "/admin/fault/" {
+				eval.Clear()
+			} else {
+				// strip /admin/fault/ to get category
+				cat := path[len("/admin/fault/"):]
+				eval.ClearSlot(cat)
+			}
 			json.NewEncoder(w).Encode(FaultStatus{Active: false})
 		case http.MethodGet:
-			req := eval.Active()
-			if req != nil {
-				json.NewEncoder(w).Encode(FaultStatus{Active: true, Fault: req})
+			reqs := eval.Active()
+			if len(reqs) > 0 {
+				json.NewEncoder(w).Encode(FaultStatus{Active: true, Faults: reqs})
 			} else {
 				json.NewEncoder(w).Encode(FaultStatus{Active: false})
 			}
@@ -160,7 +230,7 @@ func handleFaultPost(w http.ResponseWriter, r *http.Request, eval *DemoEvaluator
 	eval.Set(decision, &req)
 
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(FaultStatus{Active: true, Fault: &req})
+	json.NewEncoder(w).Encode(FaultStatus{Active: true, Faults: []*FaultRequest{&req}})
 }
 
 // buildFault dispatches fault construction by category. Shared between
@@ -179,35 +249,53 @@ func buildFault(req FaultRequest, resolve NetworkResolver) (Fault, error) {
 }
 
 func buildInlineFault(req FaultRequest) (Fault, error) {
+	cfg := req.Config
+	if cfg == nil {
+		cfg = json.RawMessage(`{}`)
+	}
+
 	switch req.Type {
 	case "latency":
-		delay, err := time.ParseDuration(req.Delay)
+		var env struct {
+			Delay  string `json:"delay"`
+			Jitter string `json:"jitter"`
+		}
+		if err := json.Unmarshal(cfg, &env); err != nil {
+			return nil, fmt.Errorf("decode latency config: %w", err)
+		}
+		delay, err := time.ParseDuration(env.Delay)
 		if err != nil {
-			return nil, fmt.Errorf("invalid delay %q: %w", req.Delay, err)
+			return nil, fmt.Errorf("invalid delay %q: %w", env.Delay, err)
 		}
 		var jitter time.Duration
-		if req.Jitter != "" {
-			jitter, err = time.ParseDuration(req.Jitter)
+		if env.Jitter != "" {
+			jitter, err = time.ParseDuration(env.Jitter)
 			if err != nil {
-				return nil, fmt.Errorf("invalid jitter %q: %w", req.Jitter, err)
+				return nil, fmt.Errorf("invalid jitter %q: %w", env.Jitter, err)
 			}
 		}
 		return NewLatencyFault(delay, jitter), nil
 	case "error":
-		status := req.StatusCode
+		var env struct {
+			StatusCode int    `json:"status_code"`
+			Message    string `json:"message"`
+		}
+		if err := json.Unmarshal(cfg, &env); err != nil {
+			return nil, fmt.Errorf("decode error config: %w", err)
+		}
+		status := env.StatusCode
 		if status == 0 {
 			status = http.StatusInternalServerError
 		}
-		msg := req.Message
+		msg := env.Message
 		if msg == "" {
 			msg = "injected fault"
 		}
 		return NewErrorFault(status, msg), nil
 	case "hang":
-		dur, err := time.ParseDuration(req.Duration)
-		if err != nil {
-			return nil, fmt.Errorf("invalid hang duration %q: %w", req.Duration, err)
-		}
+		// hang uses DurationMs from the outer struct, but we need to convert it
+		// to time.Duration for NewHangFault.
+		dur := time.Duration(req.DurationMs) * time.Millisecond
 		return NewHangFault(dur), nil
 	default:
 		return nil, fmt.Errorf("unknown inline fault type %q", req.Type)

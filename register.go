@@ -27,7 +27,7 @@ type RegisterRequest struct {
 type RegisterResponse struct {
 	Status      string         `json:"status"`
 	Rules       []CompiledRule `json:"rules,omitempty"`
-	ActiveFault *FaultRequest  `json:"active_fault,omitempty"`
+	ActiveFaults []FaultRequest `json:"active_faults,omitempty"`
 	FreezeCfg   *DelayRequest  `json:"freeze_cfg,omitempty"`
 }
 
@@ -96,7 +96,7 @@ func registerWith(ctx context.Context, hc *http.Client, baseURL string, req Regi
 type ApplyTargets struct {
 	// Evaluator receives the decoded rule set. Required if resp.Rules is non-empty.
 	Evaluator *StaticEvaluator
-	// DemoEval receives the active fault. Required if resp.ActiveFault is non-nil.
+	// DemoEval receives the active faults. Required if resp.ActiveFaults is non-empty.
 	DemoEval *DemoEvaluator
 	// CacheBox receives the freeze config. Required if resp.FreezeCfg is non-nil.
 	CacheBox *CacheBox
@@ -132,12 +132,30 @@ func Apply(resp RegisterResponse, targets ApplyTargets) error {
 		targets.Evaluator.SetRules(rules)
 	}
 
-	if resp.ActiveFault != nil {
+	if len(resp.ActiveFaults) > 0 {
 		if targets.DemoEval == nil {
-			return fmt.Errorf("apply active_fault: no DemoEval target")
+			return fmt.Errorf("apply active_faults: no DemoEval target")
 		}
-		if err := applyActiveFault(*resp.ActiveFault, targets.DemoEval, targets.NetworkResolver); err != nil {
-			return fmt.Errorf("apply active_fault: %w", err)
+	}
+
+	if targets.DemoEval != nil {
+		// Reconciliation: drop slots not in the response
+		inResponse := make(map[string]bool, len(resp.ActiveFaults))
+		for _, req := range resp.ActiveFaults {
+			inResponse[req.effectiveCategory()] = true
+		}
+		for _, cat := range targets.DemoEval.ActiveCategories() {
+			if !inResponse[cat] {
+				targets.DemoEval.ClearSlot(cat)
+			}
+		}
+
+		// Apply / refresh slots that ARE in the response
+		for _, req := range resp.ActiveFaults {
+			if err := applyActiveFault(req, targets.DemoEval, targets.NetworkResolver); err != nil {
+				return fmt.Errorf("apply active_faults[%s]: %w", req.effectiveCategory(), err)
+			}
+			targets.DemoEval.Confirm(req.effectiveCategory())
 		}
 	}
 
@@ -186,4 +204,32 @@ func applyFreezeCfg(req DelayRequest, cb *CacheBox) error {
 	}
 	cb.SetDelaySource(cachebox.NewDistributionDelaySource(req.Mu, req.Sigma, req.Seed))
 	return nil
+}
+
+// StartFaultWatchdog runs until ctx is cancelled. Every tick, drops any
+// fault slot whose lastConfirmedAt is older than the grace period.
+//
+// Grace = max(3 * pollInterval, 30s). This is the only mechanism that
+// protects against zombie faults when duration_ms = 0 (infinite) AND
+// Manteion crashes.
+func StartFaultWatchdog(ctx context.Context, eval *DemoEvaluator, pollInterval time.Duration, logger interface{ Warn(string, ...any) }) {
+	grace := 3 * pollInterval
+	if grace < 30*time.Second {
+		grace = 30 * time.Second
+	}
+	t := time.NewTicker(1 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			for _, cat := range eval.StaleSlots(grace) {
+				eval.ClearSlot(cat)
+				if logger != nil {
+					logger.Warn("watchdog: dropped stale fault slot", "category", cat, "grace", grace)
+				}
+			}
+		}
+	}
 }

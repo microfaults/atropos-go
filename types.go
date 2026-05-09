@@ -98,6 +98,17 @@ func NewStaticEvaluator(rules ...StaticRule) *StaticEvaluator {
 	return evaluator.NewStaticEvaluator(rules...)
 }
 
+// --- Multi evaluator ---
+
+// MultiEvaluator chains multiple evaluators and returns the first non-nil Decision.
+type MultiEvaluator = evaluator.MultiEvaluator
+
+// NewMultiEvaluator creates a new MultiEvaluator that iterates through the provided
+// evaluators in order.
+func NewMultiEvaluator(evaluators ...Evaluator) *MultiEvaluator {
+	return evaluator.NewMultiEvaluator(evaluators...)
+}
+
 // --- Cache-box types ---
 
 // CacheBox is the runtime cache-box coordinator.

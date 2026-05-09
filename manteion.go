@@ -98,6 +98,11 @@ func ConnectManteion(ctx context.Context, serviceName string, opts ...ManteionOp
 			}
 		})
 	})
+	if c.targets.DemoEval != nil {
+		c.wg.Go(func() {
+			StartFaultWatchdog(pollCtx, c.targets.DemoEval, cfg.pollInterval, c.logger)
+		})
+	}
 	c.status.Store(int32(ManteionConnected))
 	setGlobalClient(c)
 
