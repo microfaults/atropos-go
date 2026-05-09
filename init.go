@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
@@ -54,11 +55,17 @@ func Init(ctx context.Context, opts ...Option) (func(context.Context) error, err
 		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 
-	// Build OTLP exporter.
-	exporter, err := otlptracegrpc.New(ctx,
+	// Build OTLP exporter options.
+	exporterOpts := []otlptracegrpc.Option{
 		otlptracegrpc.WithEndpoint(endpoint),
 		otlptracegrpc.WithDialOption(dialOpts...),
-	)
+	}
+	if cfg.insecure {
+		exporterOpts = append(exporterOpts, otlptracegrpc.WithInsecure())
+	}
+
+	// Build OTLP exporter.
+	exporter, err := otlptracegrpc.New(ctx, exporterOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("atropos: init otlp exporter: %w", err)
 	}
@@ -83,8 +90,7 @@ func Init(ctx context.Context, opts ...Option) (func(context.Context) error, err
 	}
 
 	tp := sdktrace.NewTracerProvider(
-		// sdktrace.WithBatcher(exporter),
-		sdktrace.WithSyncer(exporter),
+		sdktrace.WithBatcher(exporter, sdktrace.WithBatchTimeout(100*time.Millisecond)),
 		sdktrace.WithResource(res),
 		sdktrace.WithSampler(sampler),
 	)
