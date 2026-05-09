@@ -25,10 +25,10 @@ type RegisterRequest struct {
 // intent tracked for the registering service — e.g. during a rolling deploy
 // while an experiment is in progress.
 type RegisterResponse struct {
-	Status      string         `json:"status"`
-	Rules       []CompiledRule `json:"rules,omitempty"`
+	Status       string         `json:"status"`
+	Rules        []CompiledRule `json:"rules,omitempty"`
 	ActiveFaults []FaultRequest `json:"active_faults,omitempty"`
-	FreezeCfg   *DelayRequest  `json:"freeze_cfg,omitempty"`
+	FreezeCfg    *DelayRequest  `json:"freeze_cfg,omitempty"`
 }
 
 // registerTimeout is the default per-call deadline for Register.

@@ -42,8 +42,6 @@ func TestFaultAdmin_PostNetworkLatency(t *testing.T) {
 	}
 }
 
-
-
 func TestFaultAdmin_PostLatency(t *testing.T) {
 	eval := &DemoEvaluator{}
 	handler := FaultAdminHandlerWith(eval, nil)
