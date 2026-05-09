@@ -115,10 +115,10 @@ func (d *DemoEvaluator) Active() []*FaultRequest {
 
 // FaultRequest is the JSON body for POST /admin/fault.
 type FaultRequest struct {
-	Category   string          `json:"category"`             // "inline" (default), "network", "resource"
-	Type       string          `json:"type"`                 // fault type within category
-	DurationMs int64           `json:"duration_ms"`          // 0 = infinite (whitelist enforced server-side)
-	Config     json.RawMessage `json:"config,omitempty"`     // extended config for network/resource/inline
+	Category   string          `json:"category"`         // "inline" (default), "network", "resource"
+	Type       string          `json:"type"`             // fault type within category
+	DurationMs int64           `json:"duration_ms"`      // 0 = infinite (whitelist enforced server-side)
+	Config     json.RawMessage `json:"config,omitempty"` // extended config for network/resource/inline
 }
 
 func (r *FaultRequest) effectiveCategory() string {

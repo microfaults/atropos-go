@@ -279,7 +279,6 @@ func (c *ManteionClient) fetchRules(ctx context.Context) error {
 			"manual_faults", len(payload.ActiveFaults))
 		return nil
 
-
 	case http.StatusServiceUnavailable:
 		return fmt.Errorf("manteion not ready (503)")
 
