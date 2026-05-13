@@ -123,12 +123,13 @@ func (a CacheBoxAction) String() string {
 // implementations must enforce this. The interceptor dispatches cache-box
 // decisions separately from fault decisions.
 type Decision struct {
-	Name        string
-	Fault       fault.Fault
-	Reason      string
-	Mode        Mode
-	CacheBox    CacheBoxAction
-	StartPolicy StartPolicy
+	Name                string
+	Fault               fault.Fault
+	Reason              string
+	Mode                Mode
+	CacheBox            CacheBoxAction
+	CacheBoxKeyStrategy string // "exact" | "exact_with_host" | "exact_with_body"; empty = default
+	StartPolicy         StartPolicy
 }
 
 // Evaluator is the rule engine contract. Must be safe for concurrent use.

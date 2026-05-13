@@ -96,6 +96,15 @@ func NewCachePushClient(cfg CachePushConfig) *CachePushClient {
 	}
 }
 
+// SetRunID updates the run ID after construction. Safe for concurrent use.
+// Entries pushed before SetRunID is called use whatever RunID was set at
+// construction time (possibly empty — manteion will reject those with 400).
+func (c *CachePushClient) SetRunID(runID string) {
+	c.mu.Lock()
+	c.runID = runID
+	c.mu.Unlock()
+}
+
 // PushFunc returns a cachebox.PushFunc that feeds entries into this client.
 func (c *CachePushClient) PushFunc() cachebox.PushFunc {
 	return func(key string, entry *cachebox.Entry) {

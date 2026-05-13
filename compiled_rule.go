@@ -19,6 +19,8 @@ import (
 // CompiledRule is the wire format received from manteion's poll/register
 // endpoints. Manteion resolves FaultSpec references and inlines config;
 // the SDK decodes and constructs evaluator rules locally.
+//
+// Exactly one of Fault, Composition, or CacheBox must be set.
 type CompiledRule struct {
 	Name           string               `json:"name"`
 	InjectionPoint string               `json:"injection_point,omitempty"`
@@ -28,6 +30,13 @@ type CompiledRule struct {
 	StartPolicy    string               `json:"start_policy,omitempty"`
 	Fault          *CompiledFault       `json:"fault,omitempty"`
 	Composition    *CompiledComposition `json:"composition,omitempty"`
+	CacheBox       *CompiledCacheBox    `json:"cachebox,omitempty"`
+}
+
+// CompiledCacheBox is a resolved cache-box action for a rule.
+type CompiledCacheBox struct {
+	Mode        string `json:"mode"`         // "passthrough" | "replay" | "replay_with_delay"
+	KeyStrategy string `json:"key_strategy"` // "exact" | "exact_with_host" | "exact_with_body"
 }
 
 // CompiledFault is a resolved fault spec with config inlined.
@@ -126,11 +135,14 @@ func DecodeCompiledRule(cr CompiledRule, opts ...DecodeOption) (StaticRule, erro
 	}
 
 	if cr.Composition != nil {
-		// DecodeCompiledRules wraps this with the rule name, so the sub-message
-		// only needs to explain why. Cleaner than double-naming the rule.
 		return StaticRule{}, fmt.Errorf(
 			"composition rules are not yet supported by the SDK evaluator",
 		)
+	}
+
+	if cr.CacheBox != nil {
+		sr.Decision.CacheBox = parseCacheBoxMode(cr.CacheBox.Mode)
+		sr.Decision.CacheBoxKeyStrategy = cr.CacheBox.KeyStrategy
 	}
 
 	return sr, nil
@@ -506,5 +518,18 @@ func decodeNetworkToxic(faultType string, config json.RawMessage) (network.Toxic
 
 	default:
 		return nil, fmt.Errorf("unknown network fault type %q", faultType)
+	}
+}
+
+func parseCacheBoxMode(s string) CacheBoxAction {
+	switch s {
+	case "passthrough":
+		return CacheBoxPassthrough
+	case "replay":
+		return CacheBoxReplay
+	case "replay_with_delay":
+		return CacheBoxReplayDelay
+	default:
+		return CacheBoxNone
 	}
 }

@@ -30,12 +30,17 @@ func TestRulesAdminHandler(t *testing.T) {
 		}
 	})
 
-	t.Run("POST with valid rules replaces evaluator rules", func(t *testing.T) {
+	t.Run("POST with valid compiled rules replaces evaluator rules", func(t *testing.T) {
 		eval := NewStaticEvaluator()
 		handler := RulesAdminHandler(eval)
 
-		want := StaticRule{Name: "freeze-productcatalog", Point: Egress}
-		body, err := json.Marshal([]StaticRule{want})
+		compiled := CompiledRule{
+			Name:           "freeze-productcatalog",
+			InjectionPoint: "egress",
+			Mode:           "inline",
+			CacheBox:       &CompiledCacheBox{Mode: "replay", KeyStrategy: "exact"},
+		}
+		body, err := json.Marshal([]CompiledRule{compiled})
 		if err != nil {
 			t.Fatalf("marshal: %v", err)
 		}
@@ -52,11 +57,14 @@ func TestRulesAdminHandler(t *testing.T) {
 		if len(rules) != 1 {
 			t.Fatalf("expected 1 rule after POST, got %d", len(rules))
 		}
-		if rules[0].Name != want.Name {
-			t.Fatalf("expected rule name %q, got %q", want.Name, rules[0].Name)
+		if rules[0].Name != compiled.Name {
+			t.Fatalf("expected rule name %q, got %q", compiled.Name, rules[0].Name)
 		}
-		if rules[0].Point != want.Point {
-			t.Fatalf("expected rule point %v, got %v", want.Point, rules[0].Point)
+		if rules[0].Point != Egress {
+			t.Fatalf("expected rule point %v, got %v", Egress, rules[0].Point)
+		}
+		if rules[0].Decision.CacheBox != CacheBoxReplay {
+			t.Fatalf("expected CacheBoxReplay, got %v", rules[0].Decision.CacheBox)
 		}
 	})
 
