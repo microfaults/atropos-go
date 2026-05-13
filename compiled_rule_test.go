@@ -18,7 +18,7 @@ func TestDecodeCompiledRules_Latency(t *testing.T) {
 		Fault: &CompiledFault{
 			Category:  "inline",
 			FaultType: "latency",
-			Config:    json.RawMessage(`{"delay":"200ms","jitter":"50ms"}`),
+			Params:    json.RawMessage(`{"delay":"200ms","jitter":"50ms"}`),
 		},
 	}}
 
@@ -63,7 +63,7 @@ func TestDecodeCompiledRules_Error(t *testing.T) {
 		Fault: &CompiledFault{
 			Category:  "inline",
 			FaultType: "error",
-			Config:    json.RawMessage(`{"status_code":503,"message":"down"}`),
+			Params:    json.RawMessage(`{"status_code":503,"message":"down"}`),
 		},
 	}}
 
@@ -88,7 +88,7 @@ func TestDecodeCompiledRules_Hang(t *testing.T) {
 		Fault: &CompiledFault{
 			Category:  "inline",
 			FaultType: "hang",
-			Config:    json.RawMessage(`{"duration":"5s"}`),
+			Params:    json.RawMessage(`{"duration":"5s"}`),
 		},
 	}}
 
@@ -132,7 +132,7 @@ func TestDecodeCompiledRules_JSONRoundtrip(t *testing.T) {
 		Fault: &CompiledFault{
 			Category:   "inline",
 			FaultType:  "latency",
-			Config:     json.RawMessage(`{"delay":"100ms"}`),
+			Params:     json.RawMessage(`{"delay":"100ms"}`),
 			DurationMs: 150,
 		},
 	}}
@@ -171,7 +171,7 @@ func TestDecodeCompiledRules_UnknownCategory(t *testing.T) {
 		Fault: &CompiledFault{
 			Category:  "quantum",
 			FaultType: "entangle",
-			Config:    json.RawMessage(`{}`),
+			Params:    json.RawMessage(`{}`),
 		},
 	}}
 
@@ -185,7 +185,7 @@ func TestDecodeCompiledRules_ResourceTypes(t *testing.T) {
 	tests := []struct {
 		name       string
 		ftype      string
-		config     string
+		params     string
 		durationMs int64
 		rampUpMs   int64
 		rampDownMs int64
@@ -203,7 +203,7 @@ func TestDecodeCompiledRules_ResourceTypes(t *testing.T) {
 				Fault: &CompiledFault{
 					Category:   "resource",
 					FaultType:  tc.ftype,
-					Config:     json.RawMessage(tc.config),
+					Params:     json.RawMessage(tc.params),
 					DurationMs: tc.durationMs,
 					RampUpMs:   tc.rampUpMs,
 					RampDownMs: tc.rampDownMs,
@@ -230,7 +230,7 @@ func TestDecodeCompiledRules_UnknownResourceType(t *testing.T) {
 		Fault: &CompiledFault{
 			Category:   "resource",
 			FaultType:  "gpu",
-			Config:     json.RawMessage(`{}`),
+			Params:     json.RawMessage(`{}`),
 			DurationMs: 5000,
 		},
 	}}
@@ -251,15 +251,15 @@ func TestDecodeCompiledRules_NetworkTypes(t *testing.T) {
 	tests := []struct {
 		name   string
 		ftype  string
-		config string
+		params string
 		listen string
 	}{
-		{"latency", "latency", `{"target":"redis","direction":"upstream","delay":"100ms","jitter":"20ms"}`, ":19090"},
-		{"blackhole", "blackhole", `{"target":"redis"}`, ":19091"},
-		{"retransmit_delay", "retransmit_delay", `{"target":"redis","rate":0.3,"delay":"100ms","reset_threshold":5}`, ":19092"},
-		{"drip", "drip", `{"target":"redis","chunk_size":100,"interval":"50ms"}`, ":19093"},
-		{"rst", "rst", `{"target":"redis","after_bytes":4096,"after_duration":"2s"}`, ":19094"},
-		{"throttle", "throttle", `{"target":"redis","bytes_per_sec":1024}`, ":19095"},
+		{"latency", "latency", `{"delay":"100ms","jitter":"20ms"}`, ":19090"},
+		{"blackhole", "blackhole", `{}`, ":19091"},
+		{"retransmit_delay", "retransmit_delay", `{"rate":0.3,"delay":"100ms","reset_threshold":5}`, ":19092"},
+		{"drip", "drip", `{"chunk_size":100,"interval":"50ms"}`, ":19093"},
+		{"rst", "rst", `{"after_bytes":4096,"after_duration":"2s"}`, ":19094"},
+		{"throttle", "throttle", `{"bytes_per_sec":1024}`, ":19095"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -269,7 +269,8 @@ func TestDecodeCompiledRules_NetworkTypes(t *testing.T) {
 				Fault: &CompiledFault{
 					Category:   "network",
 					FaultType:  tc.ftype,
-					Config:     json.RawMessage(tc.config),
+					Network:    &NetworkEnvelope{Host: "proxy", Target: "redis", Direction: "upstream"},
+					Params:     json.RawMessage(tc.params),
 					DurationMs: 10000,
 				},
 			}}
@@ -284,6 +285,61 @@ func TestDecodeCompiledRules_NetworkTypes(t *testing.T) {
 	}
 }
 
+func TestDecodeCompiledRules_NetworkRequiresEnvelope(t *testing.T) {
+	compiled := []CompiledRule{{
+		Name: "net-no-envelope",
+		Mode: "background",
+		Fault: &CompiledFault{
+			Category:   "network",
+			FaultType:  "blackhole",
+			Params:     json.RawMessage(`{}`),
+			DurationMs: 5000,
+		},
+	}}
+	_, err := DecodeCompiledRules(compiled, WithNetworkResolver(stubResolver(":1", "localhost:6379")))
+	if err == nil {
+		t.Fatal("expected error: missing network envelope")
+	}
+}
+
+func TestDecodeCompiledRules_NonNetworkRejectsEnvelope(t *testing.T) {
+	compiled := []CompiledRule{{
+		Name: "inline-with-envelope",
+		Mode: "inline",
+		Fault: &CompiledFault{
+			Category:  "inline",
+			FaultType: "latency",
+			Network:   &NetworkEnvelope{Host: "proxy", Target: "redis"},
+			Params:    json.RawMessage(`{"delay":"10ms"}`),
+		},
+	}}
+	_, err := DecodeCompiledRules(compiled)
+	if err == nil {
+		t.Fatal("expected error: envelope on non-network category")
+	}
+}
+
+func TestDecodeCompiledRules_NetworkInlineHostNotYetSupported(t *testing.T) {
+	compiled := []CompiledRule{{
+		Name: "net-inline-host",
+		Mode: "inline",
+		Fault: &CompiledFault{
+			Category:   "network",
+			FaultType:  "latency",
+			Network:    &NetworkEnvelope{Host: "inline"},
+			Params:     json.RawMessage(`{"delay":"50ms"}`),
+			DurationMs: 5000,
+		},
+	}}
+	_, err := DecodeCompiledRules(compiled)
+	if err == nil {
+		t.Fatal("expected error: inline host not yet supported")
+	}
+	if !strings.Contains(err.Error(), "v6") {
+		t.Errorf("error should mention v6 deferral, got: %v", err)
+	}
+}
+
 func TestDecodeCompiledRules_NetworkNoResolver(t *testing.T) {
 	compiled := []CompiledRule{{
 		Name: "net-no-resolver",
@@ -291,7 +347,8 @@ func TestDecodeCompiledRules_NetworkNoResolver(t *testing.T) {
 		Fault: &CompiledFault{
 			Category:   "network",
 			FaultType:  "blackhole",
-			Config:     json.RawMessage(`{"target":"redis"}`),
+			Network:    &NetworkEnvelope{Host: "proxy", Target: "redis"},
+			Params:     json.RawMessage(`{}`),
 			DurationMs: 5000,
 		},
 	}}
@@ -308,7 +365,8 @@ func TestDecodeCompiledRules_UnknownNetworkType(t *testing.T) {
 		Fault: &CompiledFault{
 			Category:   "network",
 			FaultType:  "quantum_tunnel",
-			Config:     json.RawMessage(`{"target":"redis"}`),
+			Network:    &NetworkEnvelope{Host: "proxy", Target: "redis"},
+			Params:     json.RawMessage(`{}`),
 			DurationMs: 5000,
 		},
 	}}
@@ -325,8 +383,8 @@ func TestDecodeCompiledRules_CompositionRejected(t *testing.T) {
 		Composition: &CompiledComposition{
 			Name: "x", ExecutionMode: "parallel",
 			Members: []CompiledCompositionMember{
-				{Fault: &CompiledFault{Category: "inline", FaultType: "latency", Config: json.RawMessage(`{"delay":"10ms"}`)}},
-				{Fault: &CompiledFault{Category: "inline", FaultType: "error", Config: json.RawMessage(`{"status_code":500}`)}},
+				{Fault: &CompiledFault{Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"10ms"}`)}},
+				{Fault: &CompiledFault{Category: "inline", FaultType: "error", Params: json.RawMessage(`{"status_code":500}`)}},
 			},
 		},
 	}}
@@ -335,26 +393,27 @@ func TestDecodeCompiledRules_CompositionRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for composition rule")
 	}
-	// Assert the guard fired specifically — not some other error path.
-	// DecodeCompiledRules wraps the guard's sub-message with "rule %q:".
 	if !strings.Contains(err.Error(), "comp-rule") {
 		t.Errorf("error should name the rule, got: %v", err)
 	}
 	if !strings.Contains(err.Error(), "composition") {
 		t.Errorf("error should mention composition, got: %v", err)
 	}
+	if !strings.Contains(err.Error(), "v6") {
+		t.Errorf("error should mention v6 deferral, got: %v", err)
+	}
 }
 
 func TestDecodeCompiledRules_PrioritySorted(t *testing.T) {
 	compiled := []CompiledRule{
 		{Name: "low", Mode: "inline", Priority: 1, Fault: &CompiledFault{
-			Category: "inline", FaultType: "latency", Config: json.RawMessage(`{"delay":"10ms"}`),
+			Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"10ms"}`),
 		}},
 		{Name: "high", Mode: "inline", Priority: 10, Fault: &CompiledFault{
-			Category: "inline", FaultType: "latency", Config: json.RawMessage(`{"delay":"20ms"}`),
+			Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"20ms"}`),
 		}},
 		{Name: "mid", Mode: "inline", Priority: 5, Fault: &CompiledFault{
-			Category: "inline", FaultType: "latency", Config: json.RawMessage(`{"delay":"30ms"}`),
+			Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"30ms"}`),
 		}},
 	}
 
@@ -377,10 +436,10 @@ func TestDecodeCompiledRules_PrioritySorted(t *testing.T) {
 func TestDecodeCompiledRules_PriorityStable(t *testing.T) {
 	compiled := []CompiledRule{
 		{Name: "first", Mode: "inline", Priority: 5, Fault: &CompiledFault{
-			Category: "inline", FaultType: "latency", Config: json.RawMessage(`{"delay":"10ms"}`),
+			Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"10ms"}`),
 		}},
 		{Name: "second", Mode: "inline", Priority: 5, Fault: &CompiledFault{
-			Category: "inline", FaultType: "latency", Config: json.RawMessage(`{"delay":"20ms"}`),
+			Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"20ms"}`),
 		}},
 	}
 

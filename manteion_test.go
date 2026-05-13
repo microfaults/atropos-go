@@ -128,7 +128,7 @@ func TestManteionClient_PollLoop_RuleUpdate(t *testing.T) {
 		Fault: &CompiledFault{
 			Category:  "inline",
 			FaultType: "latency",
-			Config:    json.RawMessage(`{"delay":"100ms"}`),
+			Params:    json.RawMessage(`{"delay":"100ms"}`),
 		},
 	}}
 	payload, _ := json.Marshal(map[string]any{"version": 5, "rules": compiled})

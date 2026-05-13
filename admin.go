@@ -215,25 +215,39 @@ func buildInlineFault(req FaultRequest) (Fault, error) {
 }
 
 func buildNetworkFault(req FaultRequest, resolve NetworkResolver) (Fault, error) {
-	if resolve == nil {
-		return nil, fmt.Errorf("network fault %q requires a NetworkResolver", req.Type)
-	}
 	cfg := req.Config
 	if cfg == nil {
 		cfg = json.RawMessage(`{}`)
 	}
-	var envelope struct {
-		Duration string `json:"duration"`
+	// Admin wire format keeps envelope and params merged inside Config for
+	// CLI ergonomics. Split them here to match the new decodeNetworkFault
+	// envelope-based signature.
+	var merged struct {
+		Host      string  `json:"host"`
+		Target    string  `json:"target"`
+		Direction string  `json:"direction"`
+		Scope     float64 `json:"scope"`
+		Duration  string  `json:"duration"`
 	}
-	if err := json.Unmarshal(cfg, &envelope); err != nil {
+	if err := json.Unmarshal(cfg, &merged); err != nil {
 		return nil, fmt.Errorf("decode network config: %w", err)
 	}
-	dur, err := time.ParseDuration(envelope.Duration)
+	dur, err := time.ParseDuration(merged.Duration)
 	if err != nil {
-		return nil, fmt.Errorf("invalid network duration %q: %w", envelope.Duration, err)
+		return nil, fmt.Errorf("invalid network duration %q: %w", merged.Duration, err)
+	}
+	host := merged.Host
+	if host == "" {
+		host = "proxy"
+	}
+	env := &NetworkEnvelope{
+		Host:      host,
+		Target:    merged.Target,
+		Direction: merged.Direction,
+		Scope:     merged.Scope,
 	}
 	baseCfg := fault.FaultConfig{Duration: dur}
-	return decodeNetworkFault(req.Type, cfg, baseCfg, resolve)
+	return decodeNetworkFault(req.Type, env, cfg, baseCfg, resolve)
 }
 
 func buildResourceFault(req FaultRequest) (Fault, error) {

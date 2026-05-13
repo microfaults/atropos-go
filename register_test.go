@@ -42,7 +42,7 @@ func TestRegister_Success(t *testing.T) {
 				Fault: &atropos.CompiledFault{
 					Category:  "inline",
 					FaultType: "latency",
-					Config:    json.RawMessage(`{"delay":"200ms"}`),
+					Params:    json.RawMessage(`{"delay":"200ms"}`),
 				},
 			}},
 		})
@@ -113,7 +113,7 @@ func TestApply_SetsRules(t *testing.T) {
 			Fault: &atropos.CompiledFault{
 				Category:  "inline",
 				FaultType: "latency",
-				Config:    json.RawMessage(`{"delay":"100ms"}`),
+				Params:    json.RawMessage(`{"delay":"100ms"}`),
 			},
 		}},
 	}
@@ -251,7 +251,7 @@ func TestRegisterAndApply_E2E(t *testing.T) {
 				Fault: &atropos.CompiledFault{
 					Category:  "inline",
 					FaultType: "latency",
-					Config:    json.RawMessage(`{"delay":"50ms"}`),
+					Params:    json.RawMessage(`{"delay":"50ms"}`),
 				},
 			}},
 		})
