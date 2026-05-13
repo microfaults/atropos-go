@@ -256,7 +256,7 @@ func TestDecodeCompiledRules_NetworkTypes(t *testing.T) {
 	}{
 		{"latency", "latency", `{"target":"redis","direction":"upstream","delay":"100ms","jitter":"20ms"}`, ":19090"},
 		{"blackhole", "blackhole", `{"target":"redis"}`, ":19091"},
-		{"loss", "loss", `{"target":"redis","rate":0.3,"retransmit_delay":"100ms","reset_threshold":5}`, ":19092"},
+		{"retransmit_delay", "retransmit_delay", `{"target":"redis","rate":0.3,"delay":"100ms","reset_threshold":5}`, ":19092"},
 		{"drip", "drip", `{"target":"redis","chunk_size":100,"interval":"50ms"}`, ":19093"},
 		{"rst", "rst", `{"target":"redis","after_bytes":4096,"after_duration":"2s"}`, ":19094"},
 		{"throttle", "throttle", `{"target":"redis","bytes_per_sec":1024}`, ":19095"},

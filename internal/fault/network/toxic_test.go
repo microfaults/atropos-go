@@ -169,9 +169,9 @@ func TestRST_AfterDuration(t *testing.T) {
 	t.Logf("RST after %s: %v", elapsed, rstErr)
 }
 
-func TestLoss_DelaysLostChunks(t *testing.T) {
-	// 100% loss rate → every chunk gets retransmit delay.
-	toxic := &Loss{Rate: 1.0, RetransmitDelay: 50 * time.Millisecond}
+func TestRetransmitDelay_DelaysLostChunks(t *testing.T) {
+	// 100% rate → every chunk gets retransmit delay.
+	toxic := &RetransmitDelay{Rate: 1.0, Delay: 50 * time.Millisecond}
 	src := strings.NewReader("hello")
 	var dst bytes.Buffer
 
@@ -189,11 +189,11 @@ func TestLoss_DelaysLostChunks(t *testing.T) {
 	if elapsed < 40*time.Millisecond {
 		t.Fatalf("expected >= 40ms delay, got %s", elapsed)
 	}
-	t.Logf("loss (100%%): %s", elapsed)
+	t.Logf("retransmit_delay (100%%): %s", elapsed)
 }
 
-func TestLoss_ResetThreshold(t *testing.T) {
-	toxic := &Loss{Rate: 1.0, RetransmitDelay: 10 * time.Millisecond, ResetThreshold: 2}
+func TestRetransmitDelay_ResetThreshold(t *testing.T) {
+	toxic := &RetransmitDelay{Rate: 1.0, Delay: 10 * time.Millisecond, ResetThreshold: 2}
 	// Need enough data for 2 reads.
 	src := &multiReader{chunks: [][]byte{[]byte("aa"), []byte("bb")}}
 	var dst bytes.Buffer
@@ -204,8 +204,8 @@ func TestLoss_ResetThreshold(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *RSTError, got %T: %v", err, err)
 	}
-	if rstErr.Reason != "packet_loss_threshold" {
-		t.Fatalf("expected reason 'packet_loss_threshold', got %q", rstErr.Reason)
+	if rstErr.Reason != "consecutive_retransmit_threshold" {
+		t.Fatalf("expected reason 'consecutive_retransmit_threshold', got %q", rstErr.Reason)
 	}
 }
 
@@ -217,7 +217,7 @@ var (
 	_ Toxic     = (*RST)(nil)
 	_ ConnToxic = (*RST)(nil)
 	_ Toxic     = (*Throttle)(nil)
-	_ Toxic     = (*Loss)(nil)
+	_ Toxic     = (*RetransmitDelay)(nil)
 	_ Toxic     = (*Drip)(nil)
 )
 

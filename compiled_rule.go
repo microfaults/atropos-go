@@ -449,24 +449,24 @@ func decodeNetworkToxic(faultType string, config json.RawMessage) (network.Toxic
 		}
 		return &network.Latency{Delay: delay, Jitter: jitter}, nil
 
-	case "loss":
+	case "retransmit_delay":
 		var cfg struct {
-			Rate            float64 `json:"rate"`
-			RetransmitDelay string  `json:"retransmit_delay"`
-			ResetThreshold  int     `json:"reset_threshold"`
+			Rate           float64 `json:"rate"`
+			Delay          string  `json:"delay"`
+			ResetThreshold int     `json:"reset_threshold"`
 		}
 		if err := json.Unmarshal(config, &cfg); err != nil {
-			return nil, fmt.Errorf("decode network loss config: %w", err)
+			return nil, fmt.Errorf("decode network retransmit_delay config: %w", err)
 		}
-		l := &network.Loss{Rate: cfg.Rate, ResetThreshold: cfg.ResetThreshold}
-		if cfg.RetransmitDelay != "" {
-			d, err := time.ParseDuration(cfg.RetransmitDelay)
+		r := &network.RetransmitDelay{Rate: cfg.Rate, ResetThreshold: cfg.ResetThreshold}
+		if cfg.Delay != "" {
+			d, err := time.ParseDuration(cfg.Delay)
 			if err != nil {
-				return nil, fmt.Errorf("parse network loss retransmit_delay %q: %w", cfg.RetransmitDelay, err)
+				return nil, fmt.Errorf("parse network retransmit_delay delay %q: %w", cfg.Delay, err)
 			}
-			l.RetransmitDelay = d
+			r.Delay = d
 		}
-		return l, nil
+		return r, nil
 
 	case "blackhole":
 		return &network.Blackhole{}, nil
