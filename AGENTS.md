@@ -134,7 +134,7 @@ if err := atropos.Apply(resp, atropos.ApplyTargets{Evaluator: eval, DemoEval: de
 
 ### Limitations (current)
 
-- `DecodeCompiledRules` supports all three fault categories: inline (latency, error, hang), network (latency, loss, blackhole, drip, rst, throttle), and resource (cpu, memory, disk, io). Network faults require a `NetworkResolver` option via `WithNetworkResolver`.
-- The `disk` resource type is decoded by the SDK but is not in manteion's `validFaultTypes` — it is SDK-only and cannot be assigned via manteion rules.
-- Composition rules are rejected on decode — the SDK has no composition evaluator yet.
+- `DecodeCompiledRules` supports all three fault categories: inline (latency, error, hang), network (latency, retransmit_delay, blackhole, drip, rst, throttle), and resource (cpu, disk, io, memory). Network faults require a `NetworkResolver` option via `WithNetworkResolver`.
+- The `host=inline` path on network faults (per-request response shaping via RoundTripper) is recognized by the wire format but rejected with a v6 deferral error until `ToxicTransport` is implemented.
+- Composition rules are rejected on decode with a v6 deferral error — the SDK has no composition evaluator yet (parallel/sequential fault dispatch with direction inheritance is future work).
 - `DecodeCompiledRules` sorts decoded rules by `Priority` descending (higher = evaluated first). Equal-priority rules preserve input order.

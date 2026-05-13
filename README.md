@@ -26,7 +26,7 @@ A snapshot of what's shipped on `main`. For the research vision (cache-box primi
 |---|---|
 | OTel bootstrap + HTTP/gRPC middleware | Shipped |
 | Inline faults (latency, error, hang) | Shipped |
-| Network faults (TCP proxy: RST, blackhole, loss, latency, throttle, drip) | Shipped |
+| Network faults (TCP proxy: RST, blackhole, retransmit_delay, latency, throttle, drip) | Shipped |
 | Resource faults (CPU, I/O, disk, memory) | Shipped |
 | Cache-box (egress HTTP) — passthrough / replay / replay-with-delay | Shipped (Stage 1) |
 | `FaultAdminHandler` — `/admin/fault` runtime fault control | Shipped |
@@ -80,7 +80,7 @@ A snapshot of what's shipped on `main`. For the research vision (cache-box primi
 │  Fault taxonomy             (internal/fault)                 │
 │                                                              │
 │   inline/     Latency, Error, Hang                           │
-│   network/    TCP proxy with toxics (RST, loss,              │
+│   network/    TCP proxy with toxics (RST, retransmit_delay,  │
 │               blackhole, drip, throttle, latency)            │
 │   resource/   CPU stress, I/O stress, Disk, Memory stress    │
 │                                                              │
@@ -330,7 +330,7 @@ When no fault fires, a `fault.skipped` event is recorded on the hook span. When 
 
 ### Events over spans for network and resource faults
 
-Network faults operate at the TCP level (proxy, RST, blackhole, packet loss). Creating child spans per-connection when the connection itself might be reset or blackholed produces misleading trace data: a span implies a successful lifecycle, but these faults deliberately break that assumption.
+Network faults operate at the TCP level (proxy, RST, blackhole, retransmit_delay). Creating child spans per-connection when the connection itself might be reset or blackholed produces misleading trace data: a span implies a successful lifecycle, but these faults deliberately break that assumption.
 
 Instead, network and resource faults implement the `EventAware` interface. The interceptor injects an event emitter before starting the fault, and the fault emits timestamped events on the parent `fault.inject` span at key moments:
 
@@ -396,7 +396,7 @@ The network proxy sits between client and upstream, applying toxic effects to th
 |-------|--------|
 | **Blackhole** | Accepts connections, never responds |
 | **RST** | Sends TCP reset |
-| **Loss** | Drops packets at configured rate |
+| **RetransmitDelay** | Per-chunk stochastic delay simulating TCP retransmit on perceived loss (does not actually drop bytes — that requires kernel-level `tc netem`) |
 | **Latency** | Adds stream-level delay |
 | **Throttle** | Rate-limits to configured bytes/sec |
 | **Drip** | Writes data in tiny chunks with pauses |

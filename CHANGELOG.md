@@ -4,6 +4,13 @@ All notable changes to atropos-go are documented in this file.
 
 ## Unreleased
 
+### Changed — fault wire format and rename
+
+- **Renamed `network.Loss` → `network.RetransmitDelay`.** The toxic never dropped bytes (userspace TCP can't); it simulated the observable effect via per-chunk delay. The new name reflects what it actually does. Wire-format fault_type renamed `loss` → `retransmit_delay`; config field `retransmit_delay` → `delay`. RST reason string `packet_loss_threshold` → `consecutive_retransmit_threshold`. For true packet drop semantics, use kernel-level `tc netem`.
+- **`CompiledFault` wire format restructured.** The opaque `Config json.RawMessage` blob is split into `Network *NetworkEnvelope` (host/target/direction/scope, only meaningful for network category) + `Params json.RawMessage` (toxic-specific params). Envelope is rejected on non-network categories; required on network.
+- **Network host discriminator.** `NetworkEnvelope.Host` selects `"proxy"` (TCP sidecar; current behaviour) or `"inline"` (per-request response shaping via RoundTripper; v6 — schema lands now, execution deferred).
+- **Composition rules now error with v6 marker** rather than a generic "not supported" message.
+
 ### Added — Cache-Box Stage 1 (egress, HTTP)
 - `internal/cachebox` package: stdlib-only cache-box engine.
   - `Store` interface + `Entry` with `StatusCode`/`Header`/`Body`/`ObservedLatency`/`RecordedAt`/`HitCount`.

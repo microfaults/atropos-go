@@ -101,7 +101,7 @@ Go library that embeds into each service. Provides:
 - HTTP middleware (`IngressMiddleware`, `EgressTransport`) and gRPC interceptors (unary + streaming, separate `grpc/` subpackage)
 - Always-on spans (`Span`) and fault-checked spans (`SpanWithFault`) — continuous trace coverage regardless of whether faults are active
 - Rule evaluation engine (`Evaluator` interface) with label-based predicate matching
-- Fault taxonomy: inline (latency, error, hang), network TCP proxy (RST, blackhole, loss, latency, throttle, drip), resource stress (CPU with cgroup-aware detection, I/O with token-bucket rate control)
+- Fault taxonomy: inline (latency, error, hang), network TCP proxy (RST, blackhole, retransmit_delay, latency, throttle, drip), resource stress (CPU with cgroup-aware detection, I/O with token-bucket rate control)
 - Linear ramp-up/ramp-down phases on all faults for realistic degradation modeling
 - `atropos.*` attribute namespace for clean coexistence with OTel semantic conventions
 - **Cache-box engine (egress, HTTP)**: stdlib-only `internal/cachebox` package with LRU-bounded in-memory store, async recorder, three modes (`passthrough`/`replay`/`replay_with_delay`), three key strategies (`exact`/`exact_with_host`/`exact_with_body`), pluggable delay source (`ObservedDelaySource` + `DistributionDelaySource` lognormal scaffold for Stage 3). Dispatched via `EgressTransport` when the evaluator returns a `CacheBoxAction`. `StaticEvaluator` provides a label-matching rule list for use without a central controller.
