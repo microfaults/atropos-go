@@ -8,6 +8,7 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -46,26 +47,39 @@ func Init(ctx context.Context, opts ...Option) (func(context.Context) error, err
 		endpoint = os.Getenv("COLLECTOR_SERVICE_ADDR")
 	}
 	if endpoint == "" {
-		endpoint = "localhost:4317"
+		if cfg.useHTTP {
+			endpoint = "localhost:4318"
+		} else {
+			endpoint = "localhost:4317"
+		}
 	}
 
-	// Build gRPC dial options.
-	dialOpts := []grpc.DialOption{}
-	if cfg.insecure {
-		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	var exporter sdktrace.SpanExporter
+	var err error
+
+	if cfg.useHTTP {
+		exporterOpts := []otlptracehttp.Option{
+			otlptracehttp.WithEndpoint(endpoint),
+		}
+		if cfg.insecure {
+			exporterOpts = append(exporterOpts, otlptracehttp.WithInsecure())
+		}
+		exporter, err = otlptracehttp.New(ctx, exporterOpts...)
+	} else {
+		dialOpts := []grpc.DialOption{}
+		if cfg.insecure {
+			dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		}
+		exporterOpts := []otlptracegrpc.Option{
+			otlptracegrpc.WithEndpoint(endpoint),
+			otlptracegrpc.WithDialOption(dialOpts...),
+		}
+		if cfg.insecure {
+			exporterOpts = append(exporterOpts, otlptracegrpc.WithInsecure())
+		}
+		exporter, err = otlptracegrpc.New(ctx, exporterOpts...)
 	}
 
-	// Build OTLP exporter options.
-	exporterOpts := []otlptracegrpc.Option{
-		otlptracegrpc.WithEndpoint(endpoint),
-		otlptracegrpc.WithDialOption(dialOpts...),
-	}
-	if cfg.insecure {
-		exporterOpts = append(exporterOpts, otlptracegrpc.WithInsecure())
-	}
-
-	// Build OTLP exporter.
-	exporter, err := otlptracegrpc.New(ctx, exporterOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("atropos: init otlp exporter: %w", err)
 	}
