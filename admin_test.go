@@ -183,3 +183,57 @@ func TestFaultAdmin_MethodNotAllowed(t *testing.T) {
 		t.Fatalf("expected 405, got %d", rec.Code)
 	}
 }
+
+func TestFaultAdmin_MultiSlotIDs(t *testing.T) {
+	eval := &DemoEvaluator{}
+	handler := FaultAdminHandlerWith(eval, nil)
+
+	// POST first inline latency with ID
+	body1 := `{"id":"f1","type":"latency","config":{"delay":"100ms"}}`
+	req1 := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body1))
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusCreated {
+		t.Fatalf("failed to create f1: %s", rec1.Body.String())
+	}
+
+	// POST second inline latency with different ID
+	body2 := `{"id":"f2","type":"latency","config":{"delay":"200ms"}}`
+	req2 := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body2))
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusCreated {
+		t.Fatalf("failed to create f2: %s", rec2.Body.String())
+	}
+
+	// Should have 2 active faults
+	active := eval.Active()
+	if len(active) != 2 {
+		t.Fatalf("expected 2 active faults, got %d", len(active))
+	}
+
+	// DELETE f1
+	reqD := httptest.NewRequest(http.MethodDelete, "/admin/fault/f1", nil)
+	recD := httptest.NewRecorder()
+	handler.ServeHTTP(recD, reqD)
+	if recD.Code != http.StatusOK {
+		t.Fatalf("failed to delete f1: %d", recD.Code)
+	}
+
+	// Should have 1 active fault (f2)
+	active = eval.Active()
+	if len(active) != 1 {
+		t.Fatalf("expected 1 active fault, got %d", len(active))
+	}
+	if active[0].ID != "f2" {
+		t.Fatalf("expected f2 to remain, got %s", active[0].ID)
+	}
+
+	// DELETE all
+	reqD2 := httptest.NewRequest(http.MethodDelete, "/admin/fault", nil)
+	recD2 := httptest.NewRecorder()
+	handler.ServeHTTP(recD2, reqD2)
+	if len(eval.Active()) != 0 {
+		t.Fatal("expected no active faults after global DELETE")
+	}
+}

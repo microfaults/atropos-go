@@ -17,35 +17,43 @@ type faultSlot struct {
 	lastConfirmedAt time.Time
 }
 
-// DemoEvaluator is a trivial Evaluator for demos and development.
-// It holds at most one fault slot per category.
-// Safe for concurrent use.
 type DemoEvaluator struct {
 	mu    sync.RWMutex
-	slots map[string]*faultSlot // key = Category (one slot per category)
+	slots map[string]*faultSlot // key = ID (service+category:type)
 }
 
 // Evaluate returns the first decision matching the request, in
-// inline > network > resource priority. Specificity is the rule's job.
+// inline > network > resource priority. Since multiple slots can exist,
+// it picks the first one found for the highest priority category.
 func (d *DemoEvaluator) Evaluate(_ context.Context, _ Request) *Decision {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+
 	for _, cat := range []string{"inline", "network", "resource"} {
-		if slot, ok := d.slots[cat]; ok && slot.decision != nil {
-			return slot.decision
+		for _, slot := range d.slots {
+			if slot.req.effectiveCategory() == cat && slot.decision != nil {
+				return slot.decision
+			}
 		}
 	}
 	return nil
 }
 
-// Set installs or replaces the slot for req.Category.
+// Set installs or replaces the slot for req.ID.
+// If req.ID is empty, it falls back to effectiveCategory.
 func (d *DemoEvaluator) Set(decision *Decision, req *FaultRequest) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.slots == nil {
 		d.slots = make(map[string]*faultSlot)
 	}
-	d.slots[req.effectiveCategory()] = &faultSlot{
+
+	id := req.ID
+	if id == "" {
+		id = req.effectiveCategory()
+	}
+
+	d.slots[id] = &faultSlot{
 		decision:        decision,
 		req:             req,
 		lastConfirmedAt: time.Now(),
@@ -66,11 +74,11 @@ func (d *DemoEvaluator) Clear() {
 	d.slots = make(map[string]*faultSlot)
 }
 
-// Confirm bumps lastConfirmedAt to now for the given category.
-func (d *DemoEvaluator) Confirm(category string) {
+// Confirm bumps lastConfirmedAt to now for the given ID.
+func (d *DemoEvaluator) Confirm(id string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if s, ok := d.slots[category]; ok {
+	if s, ok := d.slots[id]; ok {
 		s.lastConfirmedAt = time.Now()
 	}
 }
@@ -86,15 +94,15 @@ func (d *DemoEvaluator) ActiveCategories() []string {
 	return out
 }
 
-// StaleSlots returns categories whose lastConfirmedAt is older than maxAge.
+// StaleSlots returns IDs whose lastConfirmedAt is older than maxAge.
 func (d *DemoEvaluator) StaleSlots(maxAge time.Duration) []string {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	cutoff := time.Now().Add(-maxAge)
 	var stale []string
-	for cat, s := range d.slots {
+	for id, s := range d.slots {
 		if s.lastConfirmedAt.Before(cutoff) {
-			stale = append(stale, cat)
+			stale = append(stale, id)
 		}
 	}
 	return stale
@@ -105,16 +113,19 @@ func (d *DemoEvaluator) Active() []*FaultRequest {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	out := make([]*FaultRequest, 0, len(d.slots))
+
 	for _, cat := range []string{"inline", "network", "resource"} {
-		if slot, ok := d.slots[cat]; ok && slot.req != nil {
-			out = append(out, slot.req)
+		for _, slot := range d.slots {
+			if slot.req.effectiveCategory() == cat && slot.req != nil {
+				out = append(out, slot.req)
+			}
 		}
 	}
 	return out
 }
 
-// FaultRequest is the JSON body for POST /admin/fault.
 type FaultRequest struct {
+	ID         string          `json:"id,omitempty"`     // unique identifier (service+category:type)
 	Category   string          `json:"category"`         // "inline" (default), "network", "resource"
 	Type       string          `json:"type"`             // fault type within category
 	DurationMs int64           `json:"duration_ms"`      // 0 = infinite (whitelist enforced server-side)
@@ -185,9 +196,9 @@ func FaultAdminHandlerWith(eval *DemoEvaluator, resolve NetworkResolver) http.Ha
 			if path == "/admin/fault" || path == "/admin/fault/" {
 				eval.Clear()
 			} else {
-				// strip /admin/fault/ to get category
-				cat := path[len("/admin/fault/"):]
-				eval.ClearSlot(cat)
+				// strip /admin/fault/ to get ID
+				id := path[len("/admin/fault/"):]
+				eval.ClearSlot(id)
 			}
 			json.NewEncoder(w).Encode(FaultStatus{Active: false})
 		case http.MethodGet:

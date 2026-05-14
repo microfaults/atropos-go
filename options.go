@@ -10,6 +10,7 @@ type config struct {
 	serviceVersion string
 	environment    string
 	endpoint       string
+	useHTTP        bool
 	insecure       bool
 	sampler        sdktrace.Sampler
 	tracerProvider oteltrace.TracerProvider
@@ -55,6 +56,11 @@ func WithEndpoint(endpoint string) Option {
 // WithInsecure controls TLS on the OTLP exporter. Default true.
 func WithInsecure(insecure bool) Option {
 	return optionFunc(func(c *config) { c.insecure = insecure })
+}
+
+// WithHTTP enables OTLP over HTTP instead of gRPC. Default false.
+func WithHTTP(useHTTP bool) Option {
+	return optionFunc(func(c *config) { c.useHTTP = useHTTP })
 }
 
 // WithSampler overrides the default sampler (AlwaysSample).

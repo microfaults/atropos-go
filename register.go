@@ -140,22 +140,31 @@ func Apply(resp RegisterResponse, targets ApplyTargets) error {
 
 	if targets.DemoEval != nil {
 		// Reconciliation: drop slots not in the response
-		inResponse := make(map[string]bool, len(resp.ActiveFaults))
+		activeIDs := make(map[string]bool)
 		for _, req := range resp.ActiveFaults {
-			inResponse[req.effectiveCategory()] = true
+			id := req.ID
+			if id == "" {
+				id = req.effectiveCategory()
+			}
+			activeIDs[id] = true
 		}
-		for _, cat := range targets.DemoEval.ActiveCategories() {
-			if !inResponse[cat] {
-				targets.DemoEval.ClearSlot(cat)
+
+		for _, id := range targets.DemoEval.ActiveCategories() {
+			if !activeIDs[id] {
+				targets.DemoEval.ClearSlot(id)
 			}
 		}
 
 		// Apply / refresh slots that ARE in the response
 		for _, req := range resp.ActiveFaults {
-			if err := applyActiveFault(req, targets.DemoEval, targets.NetworkResolver); err != nil {
-				return fmt.Errorf("apply active_faults[%s]: %w", req.effectiveCategory(), err)
+			id := req.ID
+			if id == "" {
+				id = req.effectiveCategory()
 			}
-			targets.DemoEval.Confirm(req.effectiveCategory())
+			if err := applyActiveFault(req, targets.DemoEval, targets.NetworkResolver); err != nil {
+				return fmt.Errorf("apply active_faults[%s]: %w", id, err)
+			}
+			targets.DemoEval.Confirm(id)
 		}
 	}
 
