@@ -14,10 +14,11 @@ import (
 
 // RegisterRequest is the POST body for /api/v1/sdk/register.
 type RegisterRequest struct {
-	ID      string `json:"id"`
-	Service string `json:"service"`
-	Version string `json:"version,omitempty"`
-	Address string `json:"address"`
+	ID             string `json:"id"`
+	Service        string `json:"service"`
+	Version        string `json:"version,omitempty"`
+	Address        string `json:"address"`
+	PollIntervalMs int64  `json:"poll_interval_ms,omitempty"` // SDK's poll cadence; manteion uses it for liveness detection
 }
 
 // RegisterResponse is the JSON manteion returns from /api/v1/sdk/register.
