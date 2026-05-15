@@ -10,7 +10,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -69,7 +69,7 @@ func Init(ctx context.Context, opts ...Option) (func(context.Context) error, err
 		resource.NewWithAttributes(semconv.SchemaURL,
 			semconv.ServiceName(cfg.serviceName),
 			semconv.ServiceVersion(cfg.serviceVersion),
-			semconv.DeploymentEnvironment(cfg.environment),
+			semconv.DeploymentEnvironmentName(cfg.environment),
 		),
 	)
 	if err != nil {
