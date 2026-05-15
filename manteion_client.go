@@ -143,10 +143,11 @@ func (c *ManteionClient) waitForReady(ctx context.Context) error {
 // register calls RegisterWithClient then Apply to configure the evaluator.
 func (c *ManteionClient) register(ctx context.Context) error {
 	resp, err := RegisterWithClient(ctx, c.httpClient, c.cfg.url, RegisterRequest{
-		ID:      c.cfg.instanceID,
-		Service: c.cfg.serviceName,
-		Version: c.cfg.serviceVersion,
-		Address: c.cfg.address,
+		ID:             c.cfg.instanceID,
+		Service:        c.cfg.serviceName,
+		Version:        c.cfg.serviceVersion,
+		Address:        c.cfg.address,
+		PollIntervalMs: c.cfg.pollInterval.Milliseconds(),
 	})
 	if err != nil {
 		return err
