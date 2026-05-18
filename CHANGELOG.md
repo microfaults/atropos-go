@@ -4,6 +4,32 @@ All notable changes to atropos-go are documented in this file.
 
 ## Unreleased
 
+### Added — Long-running faults & SDK liveness
+
+- **Multi-slot `DemoEvaluator`.** Active faults are now stored as a map keyed by ID rather than a single decision. New APIs: `Set(decision, req)`, `ClearSlot(id)`, `ActiveIDs()`, `Active()` (returns all `FaultRequest`s), `Confirm(id)` (heartbeat), `StaleSlots(maxAge)`. Per-call `Evaluate` returns the first match in `inline > network > resource` priority, with deterministic lex order within a category. Limitation: still a single decision per `Evaluate` — see `docs/plans/2026-05-17-concurrent-multi-fault-execution.md`.
+- **`MultiEvaluator` composition primitive** (`internal/evaluator/multi.go`, re-exported as `atropos.MultiEvaluator` / `NewMultiEvaluator`). Chains evaluators and returns the first non-nil `Decision`. Intended for wiring a `StaticEvaluator` + `DemoEvaluator` behind one `Evaluator` interface.
+- **Fault watchdog** (`StartFaultWatchdog` in `register.go`). 1 s ticker that reaps slots whose `lastConfirmedAt` is older than `max(3 * pollInterval, 30s)`. Auto-started by `ConnectManteion` whenever `ApplyTargets.DemoEval` is set. Independent of poll cadence so it still runs when the poll loop is wedged.
+- **Poll-interval-in-register.** `RegisterRequest.PollIntervalMs` lets Manteion size its liveness threshold to each SDK's configured cadence.
+- **OTLP HTTP exporter support.** `WithHTTP(bool)` option (`options.go`) selects `otlptracehttp` over the default gRPC exporter. Default port `4318` when HTTP is on. Endpoint resolution is scheme-aware — `OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318` uses `WithEndpointURL`; a bare `host:port` uses `WithEndpoint`. Batch timeout reduced to 100 ms for faster trace egress.
+- **`Apply` reconciliation.** When `ApplyTargets.DemoEval` is set, `Apply` reconciles `resp.ActiveFaults` against currently-armed slots: drops slot IDs not in the response, applies the rest, and `Confirm`s them. Pairs with the watchdog: a confirmed slot survives until the server's lifetime ends or contact is lost long enough that the watchdog steps in. Manteion is authoritative when connected — see the doc on `FaultAdminHandlerWith`.
+- **Per-slot admin DELETE.** `DELETE /admin/fault/{id}` clears one slot; `DELETE /admin/fault` still clears all.
+
+### Changed — Fault wire format (multi-fault)
+
+- **`RegisterResponse.ActiveFault` → `ActiveFaults []FaultRequest`**; **`FaultStatus.Fault` → `Faults []*FaultRequest`**. Manteion-side and admin-status payloads carry arrays now.
+- **`FaultRequest` shape.** New fields: `id` (optional, defaults to category), `duration_ms` (lifecycle hint; `0 = infinite, whitelist enforced server-side`). The old top-level `delay`/`jitter`/`duration`/`status_code`/`message` fields are removed — inline configs now live inside `config` (`{"type":"latency","config":{"delay":"100ms"}}`, `{"type":"hang","config":{"duration":"2s"}}`, etc.), matching the compiled-rule envelope.
+- **Manteion poll body** (`GET /api/v1/sdk/rules`) now carries `active_faults` and `freeze_cfg` alongside `rules`. `fetchRules` routes them through a single `Apply` pass so the configured `NetworkResolver` is wired uniformly (previously rules were decoded twice and briefly published without the resolver — fixed).
+- **Manteion offline mode** logs a warning at `ConnectManteion` time when `MANTEION_URL` is unset or `WithOfflineMode()` is in effect, instead of silently degrading.
+
+### Fixed
+
+- **Network rules briefly resolver-less on poll** — `manteion_client.fetchRules` no longer double-decodes/double-`SetRules`; `Apply` is the single source of truth and `ruleVersion` only advances after it succeeds.
+- **`DemoEvaluator.Evaluate` / `Active` map-iteration non-determinism** — slot IDs are sorted lex order so the chosen decision is stable across calls.
+
+### Docs
+
+- `docs/plans/2026-05-17-concurrent-multi-fault-execution.md` — design note covering the current single-decision-per-`Evaluate` limitation and the three changes needed for true concurrent multi-fault execution (eager arming, per-slot lifecycle, slot-aware registry keys). Referenced from `DemoEvaluator.Evaluate` doc comment.
+
 ### Changed — fault wire format and rename
 
 - **Renamed `network.Loss` → `network.RetransmitDelay`.** The toxic never dropped bytes (userspace TCP can't); it simulated the observable effect via per-chunk delay. The new name reflects what it actually does. Wire-format fault_type renamed `loss` → `retransmit_delay`; config field `retransmit_delay` → `delay`. RST reason string `packet_loss_threshold` → `consecutive_retransmit_threshold`. For true packet drop semantics, use kernel-level `tc netem`.
