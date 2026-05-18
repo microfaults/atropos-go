@@ -50,26 +50,17 @@ components:
           description: '"inline" (default), "network", "resource"'
           type: string
         config:
-          description: extended config for network/resource
+          description: extended config for network/resource/inline
           items:
             type: integer
           type: array
           uniqueItems: false
-        delay:
-          description: duration string for inline latency
-          type: string
-        duration:
-          description: duration string for inline hang
-          type: string
-        jitter:
-          description: duration string for inline latency jitter
-          type: string
-        message:
-          description: error message for inline error fault
-          type: string
-        status_code:
-          description: HTTP status for inline error fault
+        duration_ms:
+          description: 0 = infinite (whitelist enforced server-side)
           type: integer
+        id:
+          description: unique identifier (service+category:type)
+          type: string
         type:
           description: fault type within category
           type: string
@@ -78,8 +69,12 @@ components:
       properties:
         active:
           type: boolean
-        fault:
-          $ref: '#/components/schemas/atropos.FaultRequest'
+        faults:
+          description: 'matches new plan shape {"faults": [...]}'
+          items:
+            $ref: '#/components/schemas/atropos.FaultRequest'
+          type: array
+          uniqueItems: false
       type: object
     atropos.HealthStatus:
       properties:
@@ -152,6 +147,9 @@ components:
       properties:
         cacheBox:
           $ref: '#/components/schemas/evaluator.CacheBoxAction'
+        cacheBoxKeyStrategy:
+          description: '"exact" | "exact_with_host" | "exact_with_body"; empty = default'
+          type: string
         fault: {}
         mode:
           $ref: '#/components/schemas/evaluator.Mode'
