@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -58,8 +59,14 @@ func Init(ctx context.Context, opts ...Option) (func(context.Context) error, err
 	var err error
 
 	if cfg.useHTTP {
-		exporterOpts := []otlptracehttp.Option{
-			otlptracehttp.WithEndpoint(endpoint),
+		// OTLP HTTP: WithEndpoint expects "host:port", but env vars like
+		// OTEL_EXPORTER_OTLP_ENDPOINT typically carry a full URL. Split on
+		// the scheme to pick the right option.
+		var exporterOpts []otlptracehttp.Option
+		if strings.Contains(endpoint, "://") {
+			exporterOpts = append(exporterOpts, otlptracehttp.WithEndpointURL(endpoint))
+		} else {
+			exporterOpts = append(exporterOpts, otlptracehttp.WithEndpoint(endpoint))
 		}
 		if cfg.insecure {
 			exporterOpts = append(exporterOpts, otlptracehttp.WithInsecure())

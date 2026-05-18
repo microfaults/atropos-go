@@ -120,7 +120,7 @@ func TestFaultAdmin_PostHang(t *testing.T) {
 	eval := &DemoEvaluator{}
 	handler := FaultAdminHandlerWith(eval, nil)
 
-	body := `{"type":"hang","duration":"2s"}`
+	body := `{"type":"hang","config":{"duration":"2s"}}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)

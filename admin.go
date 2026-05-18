@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -23,20 +24,39 @@ type DemoEvaluator struct {
 }
 
 // Evaluate returns the first decision matching the request, in
-// inline > network > resource priority. Since multiple slots can exist,
-// it picks the first one found for the highest priority category.
+// inline > network > resource priority. When multiple slots share a category,
+// they are visited in lexicographic ID order so the chosen decision is stable
+// across calls.
+//
+// Limitation: this returns a single decision per call, so only one armed slot
+// is ever effective at a time. Slots in lower-priority categories or with
+// higher-sorting IDs are inert as long as a winning slot exists. See
+// docs/plans/2026-05-17-concurrent-multi-fault-execution.md for the path to
+// true concurrent multi-fault execution.
 func (d *DemoEvaluator) Evaluate(_ context.Context, _ Request) *Decision {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
+	ids := d.sortedIDsLocked()
 	for _, cat := range []string{"inline", "network", "resource"} {
-		for _, slot := range d.slots {
+		for _, id := range ids {
+			slot := d.slots[id]
 			if slot.req.effectiveCategory() == cat && slot.decision != nil {
 				return slot.decision
 			}
 		}
 	}
 	return nil
+}
+
+// sortedIDsLocked returns slot IDs in lexicographic order. Caller must hold d.mu.
+func (d *DemoEvaluator) sortedIDsLocked() []string {
+	ids := make([]string, 0, len(d.slots))
+	for id := range d.slots {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // Set installs or replaces the slot for req.ID.
@@ -60,11 +80,12 @@ func (d *DemoEvaluator) Set(decision *Decision, req *FaultRequest) {
 	}
 }
 
-// ClearSlot clears the fault slot for a specific category.
-func (d *DemoEvaluator) ClearSlot(category string) {
+// ClearSlot deletes the fault slot with the given ID. ID matches the key used
+// by Set (req.ID, or effectiveCategory when req.ID is empty).
+func (d *DemoEvaluator) ClearSlot(id string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	delete(d.slots, category)
+	delete(d.slots, id)
 }
 
 // Clear deactivates all faults.
@@ -83,15 +104,11 @@ func (d *DemoEvaluator) Confirm(id string) {
 	}
 }
 
-// ActiveCategories returns the categories of all currently-armed slots.
-func (d *DemoEvaluator) ActiveCategories() []string {
+// ActiveIDs returns the IDs of all currently-armed slots, in lexicographic order.
+func (d *DemoEvaluator) ActiveIDs() []string {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	out := make([]string, 0, len(d.slots))
-	for cat := range d.slots {
-		out = append(out, cat)
-	}
-	return out
+	return d.sortedIDsLocked()
 }
 
 // StaleSlots returns IDs whose lastConfirmedAt is older than maxAge.
@@ -108,15 +125,18 @@ func (d *DemoEvaluator) StaleSlots(maxAge time.Duration) []string {
 	return stale
 }
 
-// Active returns the list of all active fault requests.
+// Active returns all active fault requests, grouped by category in
+// inline > network > resource order and lexicographic by ID within each group.
 func (d *DemoEvaluator) Active() []*FaultRequest {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	out := make([]*FaultRequest, 0, len(d.slots))
+	ids := d.sortedIDsLocked()
+	out := make([]*FaultRequest, 0, len(ids))
 
 	for _, cat := range []string{"inline", "network", "resource"} {
-		for _, slot := range d.slots {
-			if slot.req.effectiveCategory() == cat && slot.req != nil {
+		for _, id := range ids {
+			slot := d.slots[id]
+			if slot.req != nil && slot.req.effectiveCategory() == cat {
 				out = append(out, slot.req)
 			}
 		}
@@ -181,6 +201,14 @@ func FaultAdminHandler() http.Handler {
 // FaultAdminHandlerWith returns an http.Handler wired to the given evaluator
 // and optional NetworkResolver. Use this constructor when the admin endpoint
 // needs to accept network-category faults.
+//
+// Interaction with Manteion: admin POSTs key the slot by req.ID (or the
+// effectiveCategory when ID is empty). When a ManteionClient is also running,
+// every successful poll runs reconciliation in Apply, which drops slot IDs not
+// present in the server's active_faults response. And because admin POST never
+// calls Confirm, the fault watchdog will reap admin slots after the grace
+// period (max(3*pollInterval, 30s)). Treat admin faults as short-lived overrides
+// when connected to Manteion; in offline mode they persist until DELETEd.
 func FaultAdminHandlerWith(eval *DemoEvaluator, resolve NetworkResolver) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -304,9 +332,16 @@ func buildInlineFault(req FaultRequest) (Fault, error) {
 		}
 		return NewErrorFault(status, msg), nil
 	case "hang":
-		// hang uses DurationMs from the outer struct, but we need to convert it
-		// to time.Duration for NewHangFault.
-		dur := time.Duration(req.DurationMs) * time.Millisecond
+		var env struct {
+			Duration string `json:"duration"`
+		}
+		if err := json.Unmarshal(cfg, &env); err != nil {
+			return nil, fmt.Errorf("decode hang config: %w", err)
+		}
+		dur, err := time.ParseDuration(env.Duration)
+		if err != nil {
+			return nil, fmt.Errorf("invalid hang duration %q: %w", env.Duration, err)
+		}
 		return NewHangFault(dur), nil
 	default:
 		return nil, fmt.Errorf("unknown inline fault type %q", req.Type)

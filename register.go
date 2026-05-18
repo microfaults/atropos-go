@@ -140,7 +140,9 @@ func Apply(resp RegisterResponse, targets ApplyTargets) error {
 	}
 
 	if targets.DemoEval != nil {
-		// Reconciliation: drop slots not in the response
+		// Manteion is authoritative: reconciliation drops any locally-armed slot
+		// not present in active_faults. This includes admin-set slots, which is
+		// intentional — see the doc on FaultAdminHandlerWith.
 		activeIDs := make(map[string]bool)
 		for _, req := range resp.ActiveFaults {
 			id := req.ID
@@ -150,13 +152,14 @@ func Apply(resp RegisterResponse, targets ApplyTargets) error {
 			activeIDs[id] = true
 		}
 
-		for _, id := range targets.DemoEval.ActiveCategories() {
+		for _, id := range targets.DemoEval.ActiveIDs() {
 			if !activeIDs[id] {
 				targets.DemoEval.ClearSlot(id)
 			}
 		}
 
-		// Apply / refresh slots that ARE in the response
+		// Apply / refresh slots that ARE in the response. Confirm refreshes the
+		// watchdog heartbeat so the slot survives until its server-side lifetime ends.
 		for _, req := range resp.ActiveFaults {
 			id := req.ID
 			if id == "" {

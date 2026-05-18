@@ -253,17 +253,9 @@ func (c *ManteionClient) fetchRules(ctx context.Context) error {
 			return fmt.Errorf("decode rules: %w", err)
 		}
 
-		staticRules, err := DecodeCompiledRules(payload.Rules)
-		if err != nil {
-			c.logger.Error("rule conversion failed, keeping stale rules", "error", err)
-			return nil // manteion is alive; this is a data issue
-		}
-
-		// Apply rules (rule engine).
-		c.targets.Evaluator.SetRules(staticRules)
-		c.ruleVersion.Store(payload.Version)
-
-		// Apply manual faults (demo evaluator) and freeze config.
+		// Single application path: Apply decodes rules with the configured
+		// NetworkResolver, reconciles active faults, and installs freeze config.
+		// On error we keep stale state — manteion is alive, the issue is data.
 		applyResp := RegisterResponse{
 			Status:       "poll",
 			Rules:        payload.Rules,
@@ -271,12 +263,14 @@ func (c *ManteionClient) fetchRules(ctx context.Context) error {
 			FreezeCfg:    payload.FreezeCfg,
 		}
 		if err := Apply(applyResp, c.targets); err != nil {
-			c.logger.Error("apply manual faults failed", "error", err)
+			c.logger.Error("apply failed, keeping stale state", "error", err)
+			return nil
 		}
+		c.ruleVersion.Store(payload.Version)
 
 		c.logger.Info("rules updated",
 			"version", payload.Version,
-			"rules_count", len(staticRules),
+			"rules_count", len(payload.Rules),
 			"manual_faults", len(payload.ActiveFaults))
 		return nil
 
