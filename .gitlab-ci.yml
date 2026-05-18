@@ -7,8 +7,14 @@
 #   review  — AI code review (schedule/manual/trigger only)
 #
 # Required CI/CD variables (Settings > CI/CD > Variables):
-#   ANTHROPIC_API_KEY — Anthropic API key          [if LLM_PROVIDER=claude]
-#   GOOGLE_API_KEY    — Google AI API key          [if LLM_PROVIDER=gemini]
+#   ANTHROPIC_API_KEY    — Anthropic API key                    [if LLM_PROVIDER=claude]
+#   GOOGLE_API_KEY       — Google AI API key                    [if LLM_PROVIDER=gemini]
+#   RELEASE_PUSH_TOKEN   — Project access token, write_repository scope.
+#                          Used by release-tag and release-alpha to push the
+#                          newly-created tag back to origin. Mark as Protected
+#                          + Masked. Role must satisfy any Protected-Tags rule
+#                          on `v*` (typically Developer; Maintainer if the
+#                          protection is restricted to maintainers only).
 #
 # Optional:
 #   GITLAB_API_TOKEN  — Project access token (api scope); enables commit comments
@@ -115,6 +121,11 @@ release-tag:
     - apk add --no-cache git
   script:
     - |
+      if [ -z "$RELEASE_PUSH_TOKEN" ]; then
+        echo "ERROR: RELEASE_PUSH_TOKEN is not set. See header for setup." >&2
+        exit 1
+      fi
+      git remote set-url origin "https://oauth2:${RELEASE_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
       LATEST=$(git tag --sort=-version:refname | head -1)
       if [ -z "$LATEST" ]; then
         LATEST="v0.0.0"
@@ -144,6 +155,11 @@ release-alpha:
     - apk add --no-cache git
   script:
     - |
+      if [ -z "$RELEASE_PUSH_TOKEN" ]; then
+        echo "ERROR: RELEASE_PUSH_TOKEN is not set. See header for setup." >&2
+        exit 1
+      fi
+      git remote set-url origin "https://oauth2:${RELEASE_PUSH_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
       LATEST=$(git tag --sort=-version:refname | grep -v alpha | head -1)
       if [ -z "$LATEST" ]; then
         LATEST="v0.0.0"
