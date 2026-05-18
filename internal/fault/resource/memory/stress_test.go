@@ -173,6 +173,29 @@ func TestStress_Thrashing(t *testing.T) {
 		d.ChunksAllocated, d.PeakAllocated, result.ActualDuration)
 }
 
+// TestStress_ThrashingWithRampDown covers the chunks-slice mutation path that
+// runs concurrently with thrash worker reads. Without the fix that stops
+// workers before ramp-down, this triggers the race detector reliably.
+func TestStress_ThrashingWithRampDown(t *testing.T) {
+	s := newStress(0.05, 500*time.Millisecond, 0, 200*time.Millisecond, 64*1024, true, 4)
+
+	handle, err := s.Start(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	result := <-handle.Done()
+	if result.Err != nil {
+		t.Fatalf("unexpected result error: %v", result.Err)
+	}
+	d := result.Detail.(Detail)
+	if !d.ThrashingEnabled {
+		t.Fatal("expected ThrashingEnabled=true")
+	}
+	t.Logf("thrash+rampdown: chunks=%d, peak=%d bytes, %s",
+		d.ChunksAllocated, d.PeakAllocated, result.ActualDuration)
+}
+
 func TestStress_AutoDetectMemory(t *testing.T) {
 	available := AvailableMemory()
 	if available == 0 {

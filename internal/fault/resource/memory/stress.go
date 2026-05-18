@@ -134,19 +134,26 @@ func (s *Stress) Start(ctx context.Context) (*fault.Handle, error) {
 		}
 
 		// ── Phase 2: Hold + optional Thrash ────────────────────────
+		// Thrash workers and the ramp-down release loop both touch the
+		// chunks slice, so we run them strictly sequentially: workers own
+		// the slice during Hold; main owns it during ramp-down. The
+		// workerCtx is a child of stressCtx so the parent timeout still
+		// stops workers if the whole fault is cancelled mid-hold.
 		{
+			workerCtx, workerCancel := context.WithCancel(stressCtx)
 			var thrashWg sync.WaitGroup
 			if s.Thrashing && len(chunks) > 0 {
 				for w := 0; w < thrashWorkers; w++ {
 					thrashWg.Add(1)
 					go func(workerID int) {
 						defer thrashWg.Done()
-						thrashLoop(stressCtx, chunks, workerID)
+						thrashLoop(workerCtx, chunks, workerID, thrashWorkers)
 					}(w)
 				}
 			}
 
-			// Wait for ramp-down phase or context end.
+			// Hold the allocation until the ramp-down window starts (or
+			// the whole fault is cancelled).
 			holdDuration := s.Duration - s.RampUp - s.RampDown
 			if holdDuration > 0 {
 				t := time.NewTimer(holdDuration)
@@ -157,13 +164,18 @@ func (s *Stress) Start(ctx context.Context) (*fault.Handle, error) {
 				}
 			}
 
-			// ── Ramp-down: release chunks linearly ─────────────────
+			// Stop workers before mutating chunks. After this point main
+			// is the only goroutine reading or writing the slice.
+			workerCancel()
+			thrashWg.Wait()
+
+			// ── Ramp-down: release chunks linearly ────────────────
 			if s.RampDown > 0 && len(chunks) > 0 {
 				releaseInterval := s.RampDown / time.Duration(len(chunks))
 				for len(chunks) > 0 {
 					select {
 					case <-stressCtx.Done():
-						goto cleanup
+						goto done
 					default:
 					}
 
@@ -176,18 +188,12 @@ func (s *Stress) Start(ctx context.Context) (*fault.Handle, error) {
 						select {
 						case <-stressCtx.Done():
 							t.Stop()
-							goto cleanup
+							goto done
 						case <-t.C:
 						}
 					}
 				}
 			}
-
-		cleanup:
-			// Signal thrash workers to stop (context is done or ramp
-			// finished) and wait for them.
-			cancel()
-			thrashWg.Wait()
 		}
 
 	done:
@@ -230,16 +236,22 @@ func allocChunk(size int) []byte {
 	return buf
 }
 
-// thrashLoop continuously walks allocated chunks with a stride that
-// crosses page boundaries, maximising TLB misses and page-table walks.
-// Each worker starts at a different offset to spread the pressure.
-func thrashLoop(ctx context.Context, chunks [][]byte, workerID int) {
+// thrashLoop continuously walks the chunks assigned to this worker with a
+// stride that crosses page boundaries, maximising TLB misses and page-table
+// walks. Each worker owns the slots {workerID, workerID+stride, ...} so the
+// per-byte XOR is never concurrent with another worker on the same chunk.
+//
+// Caller guarantees: chunks is not mutated for the lifetime of the worker
+// (see Stress.Start, which stops all thrash workers before ramp-down
+// releases any slot). Together with the disjoint-partition above, that
+// removes every data race on chunks.
+func thrashLoop(ctx context.Context, chunks [][]byte, workerID, stride int) {
 	n := len(chunks)
-	if n == 0 {
+	if n == 0 || stride <= 0 || workerID >= n {
 		return
 	}
 
-	chunkIdx := workerID % n
+	chunkIdx := workerID
 	for {
 		select {
 		case <-ctx.Done():
@@ -248,12 +260,6 @@ func thrashLoop(ctx context.Context, chunks [][]byte, workerID int) {
 		}
 
 		chunk := chunks[chunkIdx]
-		if chunk == nil {
-			// Chunk was released during ramp-down.
-			chunkIdx = (chunkIdx + 1) % n
-			continue
-		}
-
 		size := len(chunk)
 		// Stride across the chunk, doing read-modify-write to prevent
 		// the compiler from optimising the access away.
@@ -261,6 +267,9 @@ func thrashLoop(ctx context.Context, chunks [][]byte, workerID int) {
 			chunk[off] ^= 0xAA
 		}
 
-		chunkIdx = (chunkIdx + 1) % n
+		chunkIdx += stride
+		if chunkIdx >= n {
+			chunkIdx = workerID
+		}
 	}
 }

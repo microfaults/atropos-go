@@ -25,6 +25,7 @@ All notable changes to atropos-go are documented in this file.
 
 - **Network rules briefly resolver-less on poll** — `manteion_client.fetchRules` no longer double-decodes/double-`SetRules`; `Apply` is the single source of truth and `ruleVersion` only advances after it succeeds.
 - **`DemoEvaluator.Evaluate` / `Active` map-iteration non-determinism** — slot IDs are sorted lex order so the chosen decision is stable across calls.
+- **`internal/fault/resource/memory`: data races in thrashing mode** — workers now own disjoint chunk partitions (`{workerID, workerID+stride, ...}`) instead of all cycling through the full slice, eliminating concurrent `chunk[off] ^= 0xAA` on shared bytes. Workers are also stopped (`workerCancel(); thrashWg.Wait()`) *before* the ramp-down release loop mutates the slice, removing the read/write race on `chunks[i]`. Adds `TestStress_ThrashingWithRampDown` to lock in the ramp-down path under `-race`.
 
 ### Docs
 
