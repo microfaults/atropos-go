@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
@@ -21,15 +22,19 @@ type seedResponse struct {
 // Call during service startup, after Register but before serving traffic,
 // to warm the cache for replay experiments.
 //
+// phaseID identifies the experiment phase whose recorded entries to load —
+// manteion keys its cache store by (phase, service).
+//
 // Returns the number of entries seeded. Fit parameters (mu/sigma for
 // replay_with_delay) come through RegisterResponse.FreezeCfg via Apply,
 // not through Seed.
-func Seed(ctx context.Context, baseURL, service, runID string, store CacheBoxStore) (int, error) {
+func Seed(ctx context.Context, baseURL, service, phaseID string, store CacheBoxStore) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, seedTimeout)
 	defer cancel()
 
-	url := baseURL + "/api/v1/cache/entries?service=" + service + "&run_id=" + runID
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	q := url.Values{"service": {service}, "phase_id": {phaseID}}
+	fullURL := baseURL + "/api/v1/cache/entries?" + q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
 	if err != nil {
 		return 0, fmt.Errorf("seed: new request: %w", err)
 	}

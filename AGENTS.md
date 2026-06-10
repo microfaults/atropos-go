@@ -42,17 +42,34 @@ The SDK ships three `http.Handler` factories for runtime control. Mount them on 
 
 | Method | Path           | Body             | Response |
 |--------|----------------|------------------|----------|
-| GET    | `/admin/fault` | —                | 200 `{"active": bool, "fault": {...}}` JSON |
-| POST   | `/admin/fault` | fault request JSON (see below) | 201 `{"active": true, "fault": {...}}` JSON |
+| GET    | `/admin/fault` | —                | 200 `{"active": bool, "faults": [...]}` JSON |
+| POST   | `/admin/fault` | `FaultRequest` JSON (see below) | 201 `{"active": true, "faults": [...]}` JSON |
 | DELETE | `/admin/fault` | —                | 200 `{"active": false}` JSON |
+| DELETE | `/admin/fault/{id}` | —           | 200 `{"active": false}` JSON (clears one slot) |
 
-POST body fields by fault type:
+POST body is the platform's unified `FaultRequest` shape (the same struct
+compiled rules embed): first-class envelope fields plus a `params` object
+whose schema per `(category, fault_type)` is defined by the exported
+`faultparams` package:
 
-| `"type"` | Required fields | Optional fields | Defaults |
-|----------|-----------------|-----------------|----------|
-| `"latency"` | `delay` (duration string, e.g. `"500ms"`) | `jitter` (duration string) | — |
-| `"error"` | — | `status_code` (int), `message` (string) | 500, `"injected fault"` |
-| `"hang"` | `duration` (duration string) | — | — |
+```json
+{
+  "id": "optional-slot-id",
+  "category": "inline|network|resource",
+  "fault_type": "latency",
+  "duration_ms": 5000,
+  "ramp_up_ms": 0,
+  "ramp_down_ms": 0,
+  "network": {"target": "redis", "direction": "upstream", "scope": 1.0},
+  "params": {"delay": "500ms", "jitter": "50ms"}
+}
+```
+
+`network` is required for (and exclusive to) the `network` category.
+Common `params` examples: inline latency `{"delay","jitter"}`; inline error
+`{"status_code","message"}` (defaults 500 / `"injected fault"`); inline hang
+`{"duration"}`; resource cpu `{"target_load","window"}`. See
+`faultparams/params.go` for the full catalogue.
 
 Example mount:
 

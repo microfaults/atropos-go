@@ -18,7 +18,7 @@ type CachePushConfig struct {
 	BaseURL  string
 	Service  string
 	Instance string
-	RunID    string        // experiment run this push belongs to
+	PhaseID  string        // experiment phase this push belongs to
 	MaxBatch int           // default 100
 	MaxWait  time.Duration // default 5s
 	Client   *http.Client  // default http.DefaultClient
@@ -47,7 +47,7 @@ type CachePushClient struct {
 	baseURL  string
 	service  string
 	instance string
-	runID    string
+	phaseID  string
 	client   *http.Client
 	logger   *slog.Logger
 	maxBatch int
@@ -87,7 +87,7 @@ func NewCachePushClient(cfg CachePushConfig) *CachePushClient {
 		baseURL:  cfg.BaseURL,
 		service:  cfg.Service,
 		instance: cfg.Instance,
-		runID:    cfg.RunID,
+		phaseID:  cfg.PhaseID,
 		client:   cfg.Client,
 		logger:   cfg.Logger,
 		maxBatch: cfg.MaxBatch,
@@ -96,14 +96,20 @@ func NewCachePushClient(cfg CachePushConfig) *CachePushClient {
 	}
 }
 
-// SetRunID updates the run ID after construction. Safe for concurrent use.
-// Entries pushed before SetRunID is called use whatever RunID was set at
-// construction time (possibly empty — manteion will reject those with 400).
-func (c *CachePushClient) SetRunID(runID string) {
+// SetPhaseID updates the phase ID after construction. Safe for concurrent
+// use. Entries pushed before SetPhaseID is called use whatever PhaseID was
+// set at construction time (possibly empty — manteion rejects those with 400).
+func (c *CachePushClient) SetPhaseID(phaseID string) {
 	c.mu.Lock()
-	c.runID = runID
+	c.phaseID = phaseID
 	c.mu.Unlock()
 }
+
+// SetRunID updates the phase ID after construction.
+//
+// Deprecated: runs were renamed to phases when manteion moved to the
+// phase-first experiment model; use SetPhaseID.
+func (c *CachePushClient) SetRunID(id string) { c.SetPhaseID(id) }
 
 // PushFunc returns a cachebox.PushFunc that feeds entries into this client.
 func (c *CachePushClient) PushFunc() cachebox.PushFunc {
@@ -164,17 +170,20 @@ func (c *CachePushClient) flushLocked() {
 type ingestEnvelope struct {
 	Service  string               `json:"service"`
 	Instance string               `json:"instance"`
-	RunID    string               `json:"run_id"`
+	PhaseID  string               `json:"phase_id"`
 	Entries  []cachebox.WireEntry `json:"entries"`
 }
 
 // post sends the batch to manteion. It runs WITHOUT the lock held (it is
 // I/O-bound and must not block adds).
 func (c *CachePushClient) post(entries []cachebox.WireEntry) {
+	c.mu.Lock()
+	phaseID := c.phaseID
+	c.mu.Unlock()
 	body, err := json.Marshal(ingestEnvelope{
 		Service:  c.service,
 		Instance: c.instance,
-		RunID:    c.runID,
+		PhaseID:  phaseID,
 		Entries:  entries,
 	})
 	if err != nil {

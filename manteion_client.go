@@ -243,12 +243,7 @@ func (c *ManteionClient) fetchRules(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("read rules body: %w", err)
 		}
-		var payload struct {
-			Version      uint64         `json:"version"`
-			Rules        []CompiledRule `json:"rules"`
-			ActiveFaults []FaultRequest `json:"active_faults"`
-			FreezeCfg    *DelayRequest  `json:"freeze_cfg"`
-		}
+		var payload RuleSync
 		if err := json.Unmarshal(body, &payload); err != nil {
 			return fmt.Errorf("decode rules: %w", err)
 		}
@@ -256,12 +251,7 @@ func (c *ManteionClient) fetchRules(ctx context.Context) error {
 		// Single application path: Apply decodes rules with the configured
 		// NetworkResolver, reconciles active faults, and installs freeze config.
 		// On error we keep stale state — manteion is alive, the issue is data.
-		applyResp := RegisterResponse{
-			Status:       "poll",
-			Rules:        payload.Rules,
-			ActiveFaults: payload.ActiveFaults,
-			FreezeCfg:    payload.FreezeCfg,
-		}
+		applyResp := RegisterResponse{Status: "poll", RuleSync: payload}
 		if err := Apply(applyResp, c.targets); err != nil {
 			c.logger.Error("apply failed, keeping stale state", "error", err)
 			return nil

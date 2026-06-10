@@ -39,8 +39,8 @@ func TestSeed_PopulatesStore(t *testing.T) {
 		if r.URL.Query().Get("service") != "cart" {
 			t.Errorf("service param = %q", r.URL.Query().Get("service"))
 		}
-		if r.URL.Query().Get("run_id") != "run-abc" {
-			t.Errorf("run_id param = %q", r.URL.Query().Get("run_id"))
+		if r.URL.Query().Get("phase_id") != "phase-abc" {
+			t.Errorf("phase_id param = %q", r.URL.Query().Get("phase_id"))
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string][]cachebox.WireEntry{
@@ -51,7 +51,7 @@ func TestSeed_PopulatesStore(t *testing.T) {
 
 	store := cachebox.NewMemStore(cachebox.MemStoreConfig{MaxEntries: 100})
 
-	n, err := atropos.Seed(context.Background(), server.URL, "cart", "run-abc", store)
+	n, err := atropos.Seed(context.Background(), server.URL, "cart", "phase-abc", store)
 	if err != nil {
 		t.Fatalf("Seed: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestSeed_EmptyResponse(t *testing.T) {
 	defer server.Close()
 
 	store := cachebox.NewMemStore(cachebox.MemStoreConfig{MaxEntries: 100})
-	n, err := atropos.Seed(context.Background(), server.URL, "cart", "run-abc", store)
+	n, err := atropos.Seed(context.Background(), server.URL, "cart", "phase-abc", store)
 	if err != nil {
 		t.Fatalf("Seed: %v", err)
 	}
@@ -99,7 +99,7 @@ func TestSeed_ServerError(t *testing.T) {
 	defer server.Close()
 
 	store := cachebox.NewMemStore(cachebox.MemStoreConfig{MaxEntries: 100})
-	_, err := atropos.Seed(context.Background(), server.URL, "cart", "run-abc", store)
+	_, err := atropos.Seed(context.Background(), server.URL, "cart", "phase-abc", store)
 	if err == nil {
 		t.Fatal("expected error for server 500")
 	}

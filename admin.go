@@ -8,8 +8,6 @@ import (
 	"sort"
 	"sync"
 	"time"
-
-	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
 )
 
 type faultSlot struct {
@@ -144,12 +142,29 @@ func (d *DemoEvaluator) Active() []*FaultRequest {
 	return out
 }
 
+// FaultRequest is the platform's single fault wire shape, shared by the
+// admin endpoint (POST /admin/fault), manteion's active_faults set, and —
+// via the CompiledFault alias — the fault carried inside a CompiledRule.
+//
+// The category determines which sibling field is populated:
+//   - "inline"   → Params holds the type-specific params; no envelope.
+//   - "network"  → Network envelope holds host/target/direction/scope;
+//     Params holds the toxic-specific params.
+//   - "resource" → Params holds the type-specific params; no envelope.
+//
+// Network is forbidden for non-network categories and required for network.
+// Params shapes are the exported faultparams.* structs (one per
+// (category, fault_type) pair); absent params decode as all-defaults.
 type FaultRequest struct {
-	ID         string          `json:"id,omitempty"`     // unique identifier (service+category:type)
-	Category   string          `json:"category"`         // "inline" (default), "network", "resource"
-	Type       string          `json:"type"`             // fault type within category
-	DurationMs int64           `json:"duration_ms"`      // 0 = infinite (whitelist enforced server-side)
-	Config     json.RawMessage `json:"config,omitempty"` // extended config for network/resource/inline
+	ID         string `json:"id,omitempty"` // slot identity (service+category:type); unused on compiled rules
+	Category   string `json:"category"`     // "inline" (default), "network", "resource"
+	FaultType  string `json:"fault_type"`   // fault type within category
+	DurationMs int64  `json:"duration_ms,omitempty"`
+	RampUpMs   int64  `json:"ramp_up_ms,omitempty"`
+	RampDownMs int64  `json:"ramp_down_ms,omitempty"`
+
+	Network *NetworkEnvelope `json:"network,omitempty"`
+	Params  json.RawMessage  `json:"params,omitempty"`
 }
 
 func (r *FaultRequest) effectiveCategory() string {
@@ -188,7 +203,8 @@ func ensureDemoEval() *DemoEvaluator {
 // Example:
 //
 //	mux.Handle("/admin/fault", atropos.FaultAdminHandler())
-//	// curl -X POST http://localhost:8080/admin/fault -d '{"type":"latency","delay":"500ms"}'
+//	// curl -X POST http://localhost:8080/admin/fault \
+//	//   -d '{"category":"inline","fault_type":"latency","params":{"delay":"500ms"}}'
 //	// curl -X DELETE http://localhost:8080/admin/fault
 //	// curl http://localhost:8080/admin/fault
 func FaultAdminHandler() http.Handler {
@@ -272,147 +288,11 @@ func handleFaultPost(w http.ResponseWriter, r *http.Request, eval *DemoEvaluator
 	json.NewEncoder(w).Encode(FaultStatus{Active: true, Faults: []*FaultRequest{&req}})
 }
 
-// buildFault dispatches fault construction by category. Shared between
-// admin.go (handleFaultPost) and register.go (applyActiveFault).
+// buildFault constructs a Fault from a FaultRequest via the single decode
+// path shared with compiled rules. Used by admin.go (handleFaultPost) and
+// register.go (applyActiveFault) — the admin endpoint therefore gets the
+// same envelope validation and ramp support as rule-attached faults.
 func buildFault(req FaultRequest, resolve NetworkResolver) (Fault, error) {
-	switch req.effectiveCategory() {
-	case "inline":
-		return buildInlineFault(req)
-	case "network":
-		return buildNetworkFault(req, resolve)
-	case "resource":
-		return buildResourceFault(req)
-	default:
-		return nil, fmt.Errorf("unknown category %q", req.Category)
-	}
-}
-
-func buildInlineFault(req FaultRequest) (Fault, error) {
-	cfg := req.Config
-	if cfg == nil {
-		cfg = json.RawMessage(`{}`)
-	}
-
-	switch req.Type {
-	case "latency":
-		var env struct {
-			Delay  string `json:"delay"`
-			Jitter string `json:"jitter"`
-		}
-		if err := json.Unmarshal(cfg, &env); err != nil {
-			return nil, fmt.Errorf("decode latency config: %w", err)
-		}
-		delay, err := time.ParseDuration(env.Delay)
-		if err != nil {
-			return nil, fmt.Errorf("invalid delay %q: %w", env.Delay, err)
-		}
-		var jitter time.Duration
-		if env.Jitter != "" {
-			jitter, err = time.ParseDuration(env.Jitter)
-			if err != nil {
-				return nil, fmt.Errorf("invalid jitter %q: %w", env.Jitter, err)
-			}
-		}
-		return NewLatencyFault(delay, jitter), nil
-	case "error":
-		var env struct {
-			StatusCode int    `json:"status_code"`
-			Message    string `json:"message"`
-		}
-		if err := json.Unmarshal(cfg, &env); err != nil {
-			return nil, fmt.Errorf("decode error config: %w", err)
-		}
-		status := env.StatusCode
-		if status == 0 {
-			status = http.StatusInternalServerError
-		}
-		msg := env.Message
-		if msg == "" {
-			msg = "injected fault"
-		}
-		return NewErrorFault(status, msg), nil
-	case "hang":
-		var env struct {
-			Duration string `json:"duration"`
-		}
-		if err := json.Unmarshal(cfg, &env); err != nil {
-			return nil, fmt.Errorf("decode hang config: %w", err)
-		}
-		dur, err := time.ParseDuration(env.Duration)
-		if err != nil {
-			return nil, fmt.Errorf("invalid hang duration %q: %w", env.Duration, err)
-		}
-		return NewHangFault(dur), nil
-	default:
-		return nil, fmt.Errorf("unknown inline fault type %q", req.Type)
-	}
-}
-
-func buildNetworkFault(req FaultRequest, resolve NetworkResolver) (Fault, error) {
-	cfg := req.Config
-	if cfg == nil {
-		cfg = json.RawMessage(`{}`)
-	}
-	// Admin wire format keeps envelope and params merged inside Config for
-	// CLI ergonomics. Split them here to match the new decodeNetworkFault
-	// envelope-based signature.
-	var merged struct {
-		Host      string  `json:"host"`
-		Target    string  `json:"target"`
-		Direction string  `json:"direction"`
-		Scope     float64 `json:"scope"`
-		Duration  string  `json:"duration"`
-	}
-	if err := json.Unmarshal(cfg, &merged); err != nil {
-		return nil, fmt.Errorf("decode network config: %w", err)
-	}
-	dur, err := time.ParseDuration(merged.Duration)
-	if err != nil {
-		return nil, fmt.Errorf("invalid network duration %q: %w", merged.Duration, err)
-	}
-	host := merged.Host
-	if host == "" {
-		host = "proxy"
-	}
-	env := &NetworkEnvelope{
-		Host:      host,
-		Target:    merged.Target,
-		Direction: merged.Direction,
-		Scope:     merged.Scope,
-	}
-	baseCfg := fault.FaultConfig{Duration: dur}
-	return decodeNetworkFault(req.Type, env, cfg, baseCfg, resolve)
-}
-
-func buildResourceFault(req FaultRequest) (Fault, error) {
-	cfg := req.Config
-	if cfg == nil {
-		cfg = json.RawMessage(`{}`)
-	}
-	var envelope struct {
-		Duration string `json:"duration"`
-		RampUp   string `json:"ramp_up"`
-		RampDown string `json:"ramp_down"`
-	}
-	if err := json.Unmarshal(cfg, &envelope); err != nil {
-		return nil, fmt.Errorf("decode resource config: %w", err)
-	}
-	dur, err := time.ParseDuration(envelope.Duration)
-	if err != nil {
-		return nil, fmt.Errorf("invalid resource duration %q: %w", envelope.Duration, err)
-	}
-	baseCfg := fault.FaultConfig{Duration: dur}
-	if envelope.RampUp != "" {
-		baseCfg.RampUp, err = time.ParseDuration(envelope.RampUp)
-		if err != nil {
-			return nil, fmt.Errorf("invalid ramp_up %q: %w", envelope.RampUp, err)
-		}
-	}
-	if envelope.RampDown != "" {
-		baseCfg.RampDown, err = time.ParseDuration(envelope.RampDown)
-		if err != nil {
-			return nil, fmt.Errorf("invalid ramp_down %q: %w", envelope.RampDown, err)
-		}
-	}
-	return decodeResourceFault(req.Type, cfg, baseCfg)
+	cfg := &decodeConfig{resolve: resolve}
+	return decodeFault(&req, cfg)
 }

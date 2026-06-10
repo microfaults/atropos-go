@@ -3,9 +3,11 @@ package atropos
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"sort"
 	"time"
 
+	"git.ucsc.edu/microfaults/atropos-go/faultparams"
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault/inline"
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault/network"
@@ -39,26 +41,11 @@ type CompiledCacheBox struct {
 	KeyStrategy string `json:"key_strategy"` // "exact" | "exact_with_host" | "exact_with_body"
 }
 
-// CompiledFault is a resolved fault spec on the wire.
-//
-// The category determines which sibling field is populated:
-//   - "inline"   → Params holds the toxic-specific params; no envelope.
-//   - "network"  → Network envelope holds host/target/direction/scope;
-//     Params holds the toxic-specific params.
-//   - "resource" → Params holds the toxic-specific params; no envelope.
-//
-// Network is forbidden for non-network categories and required for network.
-// Params shape varies per (Category, FaultType); see decode*Fault for fields.
-type CompiledFault struct {
-	Category   string `json:"category"`
-	FaultType  string `json:"fault_type"`
-	DurationMs int64  `json:"duration_ms,omitempty"`
-	RampUpMs   int64  `json:"ramp_up_ms,omitempty"`
-	RampDownMs int64  `json:"ramp_down_ms,omitempty"`
-
-	Network *NetworkEnvelope `json:"network,omitempty"`
-	Params  json.RawMessage  `json:"params,omitempty"`
-}
+// CompiledFault is a resolved fault spec on the wire. It is the same struct
+// as FaultRequest (admin.go) — the platform's single fault wire shape — with
+// ID simply unused in the compiled-rule context (manteion inlines specs, so
+// rule-attached faults need no slot identity).
+type CompiledFault = FaultRequest
 
 // NetworkEnvelope is the network-category-only envelope. It separates the
 // "where does the toxic live and to which traffic does it apply" question
@@ -228,34 +215,40 @@ func decodeFault(f *CompiledFault, cfg *decodeConfig) (Fault, error) {
 		RampDown: time.Duration(f.RampDownMs) * time.Millisecond,
 	}
 
-	// Cross-category envelope checks.
-	if f.Network != nil && f.Category != "network" {
-		return nil, fmt.Errorf("category %q must not carry a network envelope", f.Category)
+	// Absent params decode as an all-defaults empty object so types whose
+	// fields are all optional (blackhole, error) need no params on the wire.
+	params := f.Params
+	if len(params) == 0 {
+		params = json.RawMessage("{}")
 	}
 
-	switch f.Category {
+	// Cross-category envelope checks.
+	if f.Network != nil && f.effectiveCategory() != "network" {
+		return nil, fmt.Errorf("category %q must not carry a network envelope", f.effectiveCategory())
+	}
+
+	switch f.effectiveCategory() {
 	case "inline":
-		return decodeInlineFault(f.FaultType, f.Params, baseCfg)
+		return decodeInlineFault(f.FaultType, params, baseCfg)
 	case "network":
 		if f.Network == nil {
 			return nil, fmt.Errorf("network fault %q requires a network envelope", f.FaultType)
 		}
-		return decodeNetworkFault(f.FaultType, f.Network, f.Params, baseCfg, cfg.resolve)
+		return decodeNetworkFault(f.FaultType, f.Network, params, baseCfg, cfg.resolve)
 	case "resource":
-		return decodeResourceFault(f.FaultType, f.Params, baseCfg)
+		return decodeResourceFault(f.FaultType, params, baseCfg)
 	default:
 		return nil, fmt.Errorf("unknown fault category %q", f.Category)
 	}
 }
 
 // decodeInlineFault dispatches by fault_type within the "inline" category.
+// Param shapes are the exported faultparams structs — the decode contract
+// and the control-plane validation schema are the same types by construction.
 func decodeInlineFault(faultType string, params json.RawMessage, baseCfg fault.FaultConfig) (Fault, error) {
 	switch faultType {
 	case "latency":
-		var p struct {
-			Delay  string `json:"delay"`
-			Jitter string `json:"jitter"`
-		}
+		var p faultparams.InlineLatency
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, fmt.Errorf("decode latency params: %w", err)
 		}
@@ -280,15 +273,20 @@ func decodeInlineFault(faultType string, params json.RawMessage, baseCfg fault.F
 		}, nil
 
 	case "error":
-		var p struct {
-			StatusCode int    `json:"status_code"`
-			Message    string `json:"message"`
-		}
+		var p faultparams.InlineError
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, fmt.Errorf("decode error params: %w", err)
 		}
 		if baseCfg.Duration == 0 {
 			baseCfg.Duration = 1
+		}
+		// Defaults shared with the (former) admin path: a bare error fault
+		// is a 500 "injected fault".
+		if p.StatusCode == 0 {
+			p.StatusCode = http.StatusInternalServerError
+		}
+		if p.Message == "" {
+			p.Message = "injected fault"
 		}
 		return &inline.Error{
 			FaultConfig: baseCfg,
@@ -297,9 +295,7 @@ func decodeInlineFault(faultType string, params json.RawMessage, baseCfg fault.F
 		}, nil
 
 	case "hang":
-		var p struct {
-			Duration string `json:"duration"`
-		}
+		var p faultparams.InlineHang
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, fmt.Errorf("decode hang params: %w", err)
 		}
@@ -322,10 +318,7 @@ func decodeInlineFault(faultType string, params json.RawMessage, baseCfg fault.F
 func decodeResourceFault(faultType string, params json.RawMessage, baseCfg fault.FaultConfig) (Fault, error) {
 	switch faultType {
 	case "cpu":
-		var p struct {
-			TargetLoad float64 `json:"target_load"`
-			Window     string  `json:"window"`
-		}
+		var p faultparams.ResourceCPU
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, fmt.Errorf("decode cpu params: %w", err)
 		}
@@ -343,12 +336,7 @@ func decodeResourceFault(faultType string, params json.RawMessage, baseCfg fault
 		return &cpu.Stress{Config: rc}, nil
 
 	case "memory":
-		var p struct {
-			TargetLoad    float64 `json:"target_load"`
-			ChunkSize     int     `json:"chunk_size"`
-			Thrashing     bool    `json:"thrashing"`
-			ThrashWorkers int     `json:"thrash_workers"`
-		}
+		var p faultparams.ResourceMemory
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, fmt.Errorf("decode memory params: %w", err)
 		}
@@ -361,12 +349,7 @@ func decodeResourceFault(faultType string, params json.RawMessage, baseCfg fault
 		}}, nil
 
 	case "disk":
-		var p struct {
-			WriteRate    int64  `json:"write_rate"`
-			MaxDiskUsage int64  `json:"max_disk_usage"`
-			ChunkSize    int64  `json:"chunk_size"`
-			Path         string `json:"path"`
-		}
+		var p faultparams.ResourceDisk
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, fmt.Errorf("decode disk params: %w", err)
 		}
@@ -386,14 +369,7 @@ func decodeResourceFault(faultType string, params json.RawMessage, baseCfg fault
 		return &disk.Stress{Config: dc}, nil
 
 	case "io":
-		var p struct {
-			ReadRate  int64  `json:"read_rate"`
-			FileSize  int    `json:"file_size"`
-			FileCount int    `json:"file_count"`
-			Workers   int    `json:"workers"`
-			Path      string `json:"path"`
-			Mode      string `json:"mode"`
-		}
+		var p faultparams.ResourceIO
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, fmt.Errorf("decode io params: %w", err)
 		}
@@ -491,10 +467,7 @@ func decodeNetworkProxyFault(faultType string, env *NetworkEnvelope, params json
 func decodeNetworkToxic(faultType string, params json.RawMessage) (network.Toxic, error) {
 	switch faultType {
 	case "latency":
-		var p struct {
-			Delay  string `json:"delay"`
-			Jitter string `json:"jitter"`
-		}
+		var p faultparams.NetworkLatency
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, fmt.Errorf("decode network latency params: %w", err)
 		}
@@ -512,11 +485,7 @@ func decodeNetworkToxic(faultType string, params json.RawMessage) (network.Toxic
 		return &network.Latency{Delay: delay, Jitter: jitter}, nil
 
 	case "retransmit_delay":
-		var p struct {
-			Rate           float64 `json:"rate"`
-			Delay          string  `json:"delay"`
-			ResetThreshold int     `json:"reset_threshold"`
-		}
+		var p faultparams.NetworkRetransmitDelay
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, fmt.Errorf("decode network retransmit_delay params: %w", err)
 		}
@@ -534,10 +503,7 @@ func decodeNetworkToxic(faultType string, params json.RawMessage) (network.Toxic
 		return &network.Blackhole{}, nil
 
 	case "drip":
-		var p struct {
-			ChunkSize int    `json:"chunk_size"`
-			Interval  string `json:"interval"`
-		}
+		var p faultparams.NetworkDrip
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, fmt.Errorf("decode network drip params: %w", err)
 		}
@@ -552,10 +518,7 @@ func decodeNetworkToxic(faultType string, params json.RawMessage) (network.Toxic
 		return d, nil
 
 	case "rst":
-		var p struct {
-			AfterBytes    int64  `json:"after_bytes"`
-			AfterDuration string `json:"after_duration"`
-		}
+		var p faultparams.NetworkRST
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, fmt.Errorf("decode network rst params: %w", err)
 		}
@@ -570,9 +533,7 @@ func decodeNetworkToxic(faultType string, params json.RawMessage) (network.Toxic
 		return r, nil
 
 	case "throttle":
-		var p struct {
-			BytesPerSec int64 `json:"bytes_per_sec"`
-		}
+		var p faultparams.NetworkThrottle
 		if err := json.Unmarshal(params, &p); err != nil {
 			return nil, fmt.Errorf("decode network throttle params: %w", err)
 		}

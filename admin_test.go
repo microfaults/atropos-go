@@ -12,7 +12,7 @@ func TestFaultAdmin_PostCPUStress(t *testing.T) {
 	eval := &DemoEvaluator{}
 	handler := FaultAdminHandlerWith(eval, nil)
 
-	body := `{"category":"resource","type":"cpu","config":{"duration":"5s","target_load":0.7}}`
+	body := `{"category":"resource","fault_type":"cpu","duration_ms":5000,"params":{"target_load":0.7}}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -32,7 +32,7 @@ func TestFaultAdmin_PostNetworkLatency(t *testing.T) {
 	}
 	handler := FaultAdminHandlerWith(eval, resolver)
 
-	body := `{"category":"network","type":"latency","config":{"target":"redis","delay":"100ms","duration":"5s"}}`
+	body := `{"category":"network","fault_type":"latency","duration_ms":5000,"network":{"target":"redis"},"params":{"delay":"100ms"}}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -47,7 +47,7 @@ func TestFaultAdmin_PostLatency(t *testing.T) {
 	handler := FaultAdminHandlerWith(eval, nil)
 
 	// POST latency fault
-	body := `{"type":"latency","config":{"delay":"200ms","jitter":"50ms"}}`
+	body := `{"fault_type":"latency","params":{"delay":"200ms","jitter":"50ms"}}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -61,8 +61,8 @@ func TestFaultAdmin_PostLatency(t *testing.T) {
 	if !status.Active {
 		t.Fatal("expected active=true")
 	}
-	if status.Faults[0].Type != "latency" {
-		t.Fatalf("expected type=latency, got %s", status.Faults[0].Type)
+	if status.Faults[0].FaultType != "latency" {
+		t.Fatalf("expected fault_type=latency, got %s", status.Faults[0].FaultType)
 	}
 
 	// GET should show active
@@ -100,7 +100,7 @@ func TestFaultAdmin_PostError(t *testing.T) {
 	eval := &DemoEvaluator{}
 	handler := FaultAdminHandlerWith(eval, nil)
 
-	body := `{"type":"error","config":{"status_code":503,"message":"service down"}}`
+	body := `{"fault_type":"error","params":{"status_code":503,"message":"service down"}}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -111,8 +111,8 @@ func TestFaultAdmin_PostError(t *testing.T) {
 
 	var status FaultStatus
 	json.NewDecoder(rec.Body).Decode(&status)
-	if len(status.Faults) == 0 || !strings.Contains(string(status.Faults[0].Config), "503") {
-		t.Fatalf("expected status_code=503 in config, got %s", string(status.Faults[0].Config))
+	if len(status.Faults) == 0 || !strings.Contains(string(status.Faults[0].Params), "503") {
+		t.Fatalf("expected status_code=503 in params, got %s", string(status.Faults[0].Params))
 	}
 }
 
@@ -120,7 +120,7 @@ func TestFaultAdmin_PostHang(t *testing.T) {
 	eval := &DemoEvaluator{}
 	handler := FaultAdminHandlerWith(eval, nil)
 
-	body := `{"type":"hang","config":{"duration":"2s"}}`
+	body := `{"fault_type":"hang","params":{"duration":"2s"}}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -134,7 +134,7 @@ func TestFaultAdmin_InvalidType(t *testing.T) {
 	eval := &DemoEvaluator{}
 	handler := FaultAdminHandlerWith(eval, nil)
 
-	body := `{"type":"explode"}`
+	body := `{"fault_type":"explode"}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -148,7 +148,7 @@ func TestFaultAdmin_MissingDelay(t *testing.T) {
 	eval := &DemoEvaluator{}
 	handler := FaultAdminHandlerWith(eval, nil)
 
-	body := `{"type":"latency"}`
+	body := `{"fault_type":"latency"}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -189,7 +189,7 @@ func TestFaultAdmin_MultiSlotIDs(t *testing.T) {
 	handler := FaultAdminHandlerWith(eval, nil)
 
 	// POST first inline latency with ID
-	body1 := `{"id":"f1","type":"latency","config":{"delay":"100ms"}}`
+	body1 := `{"id":"f1","fault_type":"latency","params":{"delay":"100ms"}}`
 	req1 := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body1))
 	rec1 := httptest.NewRecorder()
 	handler.ServeHTTP(rec1, req1)
@@ -198,7 +198,7 @@ func TestFaultAdmin_MultiSlotIDs(t *testing.T) {
 	}
 
 	// POST second inline latency with different ID
-	body2 := `{"id":"f2","type":"latency","config":{"delay":"200ms"}}`
+	body2 := `{"id":"f2","fault_type":"latency","params":{"delay":"200ms"}}`
 	req2 := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body2))
 	rec2 := httptest.NewRecorder()
 	handler.ServeHTTP(rec2, req2)

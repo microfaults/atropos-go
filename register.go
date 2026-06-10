@@ -21,15 +21,13 @@ type RegisterRequest struct {
 	PollIntervalMs int64  `json:"poll_interval_ms,omitempty"` // SDK's poll cadence; manteion uses it for liveness detection
 }
 
-// RegisterResponse is the JSON manteion returns from /api/v1/sdk/register.
-// Rules, ActiveFault, and FreezeCfg are populated only when manteion has
-// intent tracked for the registering service — e.g. during a rolling deploy
-// while an experiment is in progress.
+// RegisterResponse is the JSON manteion returns from /api/v1/sdk/register:
+// a status string plus the same RuleSync desired-state payload the poll
+// endpoint serves, so the SDK converges before its first poll — e.g. during
+// a rolling deploy while an experiment is in progress.
 type RegisterResponse struct {
-	Status       string         `json:"status"`
-	Rules        []CompiledRule `json:"rules,omitempty"`
-	ActiveFaults []FaultRequest `json:"active_faults,omitempty"`
-	FreezeCfg    *DelayRequest  `json:"freeze_cfg,omitempty"`
+	Status string `json:"status"`
+	RuleSync
 }
 
 // registerTimeout is the default per-call deadline for Register.
