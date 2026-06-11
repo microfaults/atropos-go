@@ -18,7 +18,8 @@ import (
 var defaultInterceptor *Interceptor
 
 func init() {
-	defaultInterceptor = interceptor.New(nil, trace.NewOTelTracer())
+	defaultInterceptor = interceptor.New(nil, trace.NewOTelTracer(),
+		interceptor.WithInjectionHook(recordFaultInjection))
 }
 
 // ConfigureOption mutates the package-level interceptor configuration when
@@ -58,7 +59,7 @@ func Configure(opts ...ConfigureOption) {
 		}
 		opt(&s)
 	}
-	var interceptOpts []interceptor.Option
+	interceptOpts := []interceptor.Option{interceptor.WithInjectionHook(recordFaultInjection)}
 	if s.cacheBox != nil {
 		interceptOpts = append(interceptOpts, interceptor.WithCacheBox(s.cacheBox))
 	}

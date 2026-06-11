@@ -46,6 +46,15 @@ var (
 		Name: "atropos_cachebox_records_total",
 		Help: "Total cache-box records (passthrough responses captured).",
 	})
+
+	// faultInjectionsTotal counts every fault the interceptor actually starts,
+	// labelled by fault type and injection point. This is the observable signal
+	// that an armed fault (admin POST or manteion active_fault) is firing on
+	// live traffic — request-duration histograms only show the side effect.
+	faultInjectionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "atropos_fault_injections_total",
+		Help: "Total faults started by the interceptor, by type and injection point.",
+	}, []string{"fault_type", "injection_point"})
 )
 
 func init() {
@@ -57,7 +66,14 @@ func init() {
 		cacheBoxHitsTotal,
 		cacheBoxMissesTotal,
 		cacheBoxRecordsTotal,
+		faultInjectionsTotal,
 	)
+}
+
+// recordFaultInjection bumps the injection counter. Wired into the default
+// interceptor as its injection hook (see init.go / Configure).
+func recordFaultInjection(faultType, injectionPoint string) {
+	faultInjectionsTotal.WithLabelValues(faultType, injectionPoint).Inc()
 }
 
 // MetricsHandler returns an http.Handler that serves Prometheus metrics.

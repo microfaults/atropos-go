@@ -28,6 +28,17 @@ func WithRegistry(r *FaultRegistry) Option {
 	return func(i *Interceptor) { i.registry = r }
 }
 
+// InjectionHook is called once each time the interceptor starts a fault,
+// with the fault's Go type and the injection point ("ingress"/"egress").
+// The parent atropos package wires this to a Prometheus counter; keep it
+// cheap and non-blocking.
+type InjectionHook func(faultType, injectionPoint string)
+
+// WithInjectionHook sets the per-injection callback. A nil hook is ignored.
+func WithInjectionHook(h InjectionHook) Option {
+	return func(i *Interceptor) { i.onInject = h }
+}
+
 // Interceptor ties the evaluator, fault execution, OTel, and cache-box
 // together. It is the per-service policy dispatcher -- middleware layers
 // call into it at each injection point.
@@ -36,6 +47,7 @@ type Interceptor struct {
 	tracer   trace.Tracer
 	cacheBox *cachebox.CacheBox
 	registry *FaultRegistry
+	onInject InjectionHook
 }
 
 // noopEval never matches (tracing only, no faults).
@@ -151,6 +163,9 @@ func (i *Interceptor) startDirect(ctx context.Context, req evaluator.Request, de
 		span.EndWithError(err)
 		return CheckResult{}, fmt.Errorf("interceptor: fault start failed: %w", err)
 	}
+	if i.onInject != nil {
+		i.onInject(faultType, req.Point.String())
+	}
 	handle.SetOnResult(func(r fault.Result) {
 		span.RecordResult(r)
 	})
@@ -198,6 +213,9 @@ func (i *Interceptor) startRegistered(ctx context.Context, req evaluator.Request
 	}
 	if deduped {
 		return CheckResult{}, nil
+	}
+	if i.onInject != nil {
+		i.onInject(faultType, req.Point.String())
 	}
 
 	d := *decision
