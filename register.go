@@ -102,6 +102,11 @@ type ApplyTargets struct {
 	// NetworkResolver maps logical targets to listen/upstream pairs for network
 	// fault proxies. Required if rules or active_fault contain network-category faults.
 	NetworkResolver NetworkResolver
+	// PhaseIDSink, if set, receives resp.RecordingPhaseID on every Apply (poll
+	// and register). Services wire this to their CachePushClient.SetPhaseID so
+	// recorded cache entries are ingested into the active baseline phase.
+	// Optional — nil means this SDK does not record cache.
+	PhaseIDSink func(phaseID string)
 }
 
 // Apply installs the register response's intent state onto the supplied
@@ -116,6 +121,13 @@ type ApplyTargets struct {
 // "apply active_fault: ...", "apply freeze_cfg: ...") so log grepping
 // can filter a single bootstrap phase without ambiguity.
 func Apply(resp RegisterResponse, targets ApplyTargets) error {
+	// Deliver the active recording phase id first (independent of rules/faults):
+	// the cache-push client needs it so ingests target the right phase. Empty
+	// means "no recording phase active" — the sink clears its phase id.
+	if targets.PhaseIDSink != nil {
+		targets.PhaseIDSink(resp.RecordingPhaseID)
+	}
+
 	if len(resp.Rules) > 0 {
 		if targets.Evaluator == nil {
 			return fmt.Errorf("apply rules: no Evaluator target for %d rules", len(resp.Rules))

@@ -16,4 +16,11 @@ type RuleSync struct {
 	Rules        []CompiledRule `json:"rules"`
 	ActiveFaults []FaultRequest `json:"active_faults"`
 	FreezeCfg    *DelayRequest  `json:"freeze_cfg,omitempty"`
+	// RecordingPhaseID is the experiment phase the SDK should record cache-box
+	// entries INTO (the currently-running baseline phase with persist_cache).
+	// Empty when no recording phase is active. Apply hands it to
+	// ApplyTargets.PhaseIDSink so the cache-push client tags ingests with the
+	// right phase; a recording phase start/stop bumps the rule version so this
+	// rides the normal poll fast-path.
+	RecordingPhaseID string `json:"recording_phase_id,omitempty"`
 }
