@@ -147,7 +147,11 @@ const (
 	KeyStrategyExact         = cachebox.KeyStrategyExact
 	KeyStrategyExactWithHost = cachebox.KeyStrategyExactWithHost
 	KeyStrategyExactWithBody = cachebox.KeyStrategyExactWithBody
+	KeyStrategyCanonicalV2   = cachebox.KeyStrategyCanonicalV2
 )
+
+// CacheBoxRequestMeta is debug provenance attached to a pushed wire entry.
+type CacheBoxRequestMeta = cachebox.RequestMeta
 
 // NewCacheBox builds a CacheBox coordinator from a config. Safe defaults
 // are applied for unset fields. See cachebox.Config for details.

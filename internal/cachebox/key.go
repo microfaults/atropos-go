@@ -36,6 +36,12 @@ const (
 	// the response (e.g. POST /search with a JSON query). Forces the hot
 	// path to buffer the request body.
 	KeyStrategyExactWithBody KeyStrategy = "exact_with_body"
+
+	// KeyStrategyCanonicalV2 is the length-prefixed SHA-256 framing keyer
+	// (method + host + path + canonical query + header fingerprint + body
+	// hash; wire spec §W7). It is the authoritative default for new rules;
+	// the keying itself is implemented in ATRO-3.
+	KeyStrategyCanonicalV2 KeyStrategy = "canonical_v2"
 )
 
 // NeedsBody reports whether the strategy requires the request body for

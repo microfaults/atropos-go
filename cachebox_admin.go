@@ -52,11 +52,15 @@ func handleCacheBoxStats(w http.ResponseWriter, cb *CacheBox) {
 	json.NewEncoder(w).Encode(cb.Stats())
 }
 
-// DelayRequest is the JSON body for POST /admin/cachebox/delay.
+// DelayRequest is the JSON body for POST /admin/cachebox/delay -- the freeze
+// command manteion sends at freezeServices time. Context, when present,
+// carries the (experiment_id, phase_id, key_strategy, ...) that authorizes
+// and scopes the freeze (wire spec §W1).
 type DelayRequest struct {
-	Mu    float64 `json:"mu"`
-	Sigma float64 `json:"sigma"`
-	Seed  uint64  `json:"seed"`
+	Mu      float64          `json:"mu"`
+	Sigma   float64          `json:"sigma"`
+	Seed    uint64           `json:"seed"`
+	Context *CacheBoxContext `json:"context,omitempty"`
 }
 
 func handleCacheBoxPreload(w http.ResponseWriter, r *http.Request, cb *CacheBox) {

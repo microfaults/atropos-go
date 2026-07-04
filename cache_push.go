@@ -167,11 +167,18 @@ func (c *CachePushClient) flushLocked() {
 	go c.post(entries)
 }
 
+// ingestEnvelope is the POST body for /api/v1/cache/ingest. ExperimentID and
+// BatchSeq are fidelity-refinement additions (wire spec §W2): BatchSeq is a
+// 1-based, monotonic-per-(experiment, phase, instance) sequence number that
+// lets manteion dedupe retried batches. Populating them is ATRO-5's job;
+// today they are always sent zero-valued.
 type ingestEnvelope struct {
-	Service  string               `json:"service"`
-	Instance string               `json:"instance"`
-	PhaseID  string               `json:"phase_id"`
-	Entries  []cachebox.WireEntry `json:"entries"`
+	Service      string               `json:"service"`
+	Instance     string               `json:"instance"`
+	PhaseID      string               `json:"phase_id"`
+	ExperimentID string               `json:"experiment_id,omitempty"`
+	BatchSeq     int                  `json:"batch_seq,omitempty"`
+	Entries      []cachebox.WireEntry `json:"entries"`
 }
 
 // post sends the batch to manteion. It runs WITHOUT the lock held (it is
