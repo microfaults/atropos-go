@@ -95,7 +95,7 @@ func (i *Interceptor) handleCacheBox(r *http.Request, base http.RoundTripper, re
 	// had). Falling back to a live call would violate INV-1, so fail closed
 	// immediately rather than entering the switch below.
 	if bodyBufferErr != nil && isReplayAction(decision.CacheBox) {
-		return cacheBoxMissResponse(key, decision.CacheBox, cachebox.MissReasonBodyBufferFailed, cbCtx, span), nil
+		return cacheBoxMissResponse(cb, key, decision.CacheBox, cachebox.MissReasonBodyBufferFailed, cbCtx, span), nil
 	}
 
 	switch decision.CacheBox {
@@ -104,12 +104,14 @@ func (i *Interceptor) handleCacheBox(r *http.Request, base http.RoundTripper, re
 
 	case evaluator.CacheBoxReplay:
 		if entry, ok := cb.Lookup(key); ok {
+			recordReplayHit(cb, cbCtx, entry)
 			return cacheBoxServe(entry, key, decision.CacheBox, 0, span), nil
 		}
-		return cacheBoxMissResponse(key, decision.CacheBox, replayMissReason(cb, cbCtx), cbCtx, span), nil
+		return cacheBoxMissResponse(cb, key, decision.CacheBox, replayMissReason(cb, cbCtx), cbCtx, span), nil
 
 	case evaluator.CacheBoxReplayDelay:
 		if entry, ok := cb.Lookup(key); ok {
+			recordReplayHit(cb, cbCtx, entry)
 			delay := cb.SampleDelay(entry)
 			if delay > 0 {
 				select {
@@ -120,12 +122,23 @@ func (i *Interceptor) handleCacheBox(r *http.Request, base http.RoundTripper, re
 			}
 			return cacheBoxServe(entry, key, decision.CacheBox, delay, span), nil
 		}
-		return cacheBoxMissResponse(key, decision.CacheBox, replayMissReason(cb, cbCtx), cbCtx, span), nil
+		return cacheBoxMissResponse(cb, key, decision.CacheBox, replayMissReason(cb, cbCtx), cbCtx, span), nil
 	}
 
 	// Unknown/unrecognized action -- INV-1 requires every non-passthrough
 	// path to fail closed rather than silently reaching the live downstream.
-	return cacheBoxMissResponse(key, decision.CacheBox, cachebox.MissReasonKeyAbsent, cbCtx, span), nil
+	return cacheBoxMissResponse(cb, key, decision.CacheBox, cachebox.MissReasonKeyAbsent, cbCtx, span), nil
+}
+
+// recordReplayHit reports a replay hit's staleness to the fidelity
+// registry (ATRO-7, design doc Q6). A no-op if cbCtx is nil -- there is no
+// pair to attribute the hit to.
+func recordReplayHit(cb *cachebox.CacheBox, cbCtx *cachebox.CacheBoxContext, entry *cachebox.Entry) {
+	if cbCtx == nil {
+		return
+	}
+	pair := cachebox.PhasePair{ExperimentID: cbCtx.ExperimentID, PhaseID: cbCtx.PhaseID}
+	cb.Fidelity().RecordReplayHit(pair, entry.RecordedAt)
 }
 
 // isReplayAction reports whether action is one of the replay-family actions
@@ -154,13 +167,16 @@ func replayMissReason(cb *cachebox.CacheBox, cbCtx *cachebox.CacheBoxContext) st
 // replay miss (INV-1, design doc Q1): the request never reaches the live
 // downstream (no base.RoundTrip) and is never written to the store (no
 // cb.Record). reason is one of the cachebox.MissReason* constants; it is
-// surfaced as a span event and, temporarily (pending ATRO-7's fidelity
-// registry), as a package-local counter. cbCtx is the matched rule's
-// CacheBoxContext, if any: its MissStatus overrides the default 503, and
-// its ExperimentID/PhaseID are echoed in the response body. A nil cbCtx
-// (legacy rule, or the freeze/admin paths) uses the plain default.
-func cacheBoxMissResponse(key string, action evaluator.CacheBoxAction, reason string, cbCtx *cachebox.CacheBoxContext, span trace.Span) *http.Response {
-	cachebox.RecordMiss(reason)
+// surfaced as a span event and, in the fidelity registry (ATRO-7), scoped
+// to cbCtx's (experiment_id, phase_id) -- a nil cbCtx (legacy rule, or the
+// freeze/admin paths) has no pair to attribute the miss to, so the count
+// is skipped. cbCtx's MissStatus overrides the default 503, and its
+// ExperimentID/PhaseID are echoed in the response body when present.
+func cacheBoxMissResponse(cb *cachebox.CacheBox, key string, action evaluator.CacheBoxAction, reason string, cbCtx *cachebox.CacheBoxContext, span trace.Span) *http.Response {
+	if cbCtx != nil {
+		pair := cachebox.PhasePair{ExperimentID: cbCtx.ExperimentID, PhaseID: cbCtx.PhaseID}
+		cb.Fidelity().RecordReplayMiss(pair, reason)
+	}
 	span.AddEvent(trace.EventCacheBoxMissFailClosed,
 		attribute.String(trace.AttrCacheBoxKey, key),
 		attribute.String(trace.AttrCacheBoxMissReason, reason),

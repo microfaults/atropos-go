@@ -30,6 +30,13 @@ type CachePushConfig struct {
 	MaxWait  time.Duration // default 5s
 	Client   *http.Client  // default http.DefaultClient
 	Logger   *slog.Logger  // default slog.Default()
+
+	// Fidelity, if set, receives per-(experiment_id, phase_id)
+	// record_pushed/record_dropped/push_rejected_terminal counts (ATRO-7,
+	// design doc Q6). Pass the same registry the CacheBox this client
+	// pushes for was built with (CacheBox.Fidelity()) so both sides of the
+	// record/replay/push pipeline land in one shared per-pair view.
+	Fidelity *cachebox.FidelityRegistry
 }
 
 // CachePushStats reports push counters.
@@ -74,6 +81,7 @@ type CachePushClient struct {
 	logger   *slog.Logger
 	maxBatch int
 	maxWait  time.Duration
+	fidelity *cachebox.FidelityRegistry
 
 	mu           sync.Mutex
 	batch        []cachebox.WireEntry
@@ -122,6 +130,7 @@ func NewCachePushClient(cfg CachePushConfig) *CachePushClient {
 		logger:   cfg.Logger,
 		maxBatch: cfg.MaxBatch,
 		maxWait:  cfg.MaxWait,
+		fidelity: cfg.Fidelity,
 		batch:    make([]cachebox.WireEntry, 0, cfg.MaxBatch),
 	}
 }
@@ -263,6 +272,7 @@ type ingestEnvelope struct {
 // called via `go` from flushLocked (fire-and-forget) or directly from
 // Flush/Stop (synchronous, caller waits).
 func (c *CachePushClient) post(entries []cachebox.WireEntry, experimentID, phaseID string, batchSeq int) {
+	pair := cachebox.PhasePair{ExperimentID: experimentID, PhaseID: phaseID}
 	body, err := json.Marshal(ingestEnvelope{
 		Service:      c.service,
 		Instance:     c.instance,
@@ -274,6 +284,7 @@ func (c *CachePushClient) post(entries []cachebox.WireEntry, experimentID, phase
 	if err != nil {
 		c.logger.Warn("cache push marshal error", "error", err)
 		c.dropped.Add(int64(len(entries)))
+		c.fidelity.RecordDropped(pair, int64(len(entries)))
 		return
 	}
 
@@ -285,12 +296,15 @@ func (c *CachePushClient) post(entries []cachebox.WireEntry, experimentID, phase
 				"batch_seq", batchSeq, "experiment_id", experimentID, "phase_id", phaseID)
 			c.pushRejectedTerminal.Add(1)
 			c.dropped.Add(int64(len(entries)))
+			c.fidelity.RecordPushRejectedTerminal(pair, int64(len(entries)))
+			c.fidelity.RecordDropped(pair, int64(len(entries)))
 			return
 		}
 
 		if doErr == nil && status >= 200 && status < 300 {
 			c.pushed.Add(int64(len(entries)))
 			c.batchesSent.Add(1)
+			c.fidelity.RecordPushed(pair, int64(len(entries)))
 			return
 		}
 
@@ -307,6 +321,7 @@ func (c *CachePushClient) post(entries []cachebox.WireEntry, experimentID, phase
 	}
 
 	c.dropped.Add(int64(len(entries)))
+	c.fidelity.RecordDropped(pair, int64(len(entries)))
 }
 
 // attempt makes one POST attempt and returns (status, error). status is
@@ -363,14 +378,16 @@ func (c *CachePushClient) Stop() {
 // SendDrainReport flushes any pending batch, then builds and POSTs a W3
 // drain report for (experimentID, phaseID), retrying up to
 // maxPushAttempts times on transport errors and 5xx. cb supplies
-// entries-recorded and collision counts (design doc Q2); this client
-// supplies the push-side counts. Called when a rule-version change removes
-// the recording context for this pair (ATRO-5(c)) -- detecting that
-// transition is the caller's job (see CacheDrainTracker).
+// entries-recorded and this pair's collision counts (via its fidelity
+// registry, design doc Q2/Q6); this client supplies the push-side counts.
+// Called when a rule-version change removes the recording context for
+// this pair (ATRO-5(c)) -- detecting that transition is the caller's job
+// (see CacheDrainTracker).
 func (c *CachePushClient) SendDrainReport(experimentID, phaseID string, cb *CacheBox) DrainReportResponse {
 	c.Flush()
 
-	rb := cb.Stats().RecordBuffer
+	pair := cachebox.PhasePair{ExperimentID: experimentID, PhaseID: phaseID}
+	fc := cb.Fidelity().Snapshot(pair)
 	report := DrainReport{
 		ExperimentID:           experimentID,
 		PhaseID:                phaseID,
@@ -381,8 +398,8 @@ func (c *CachePushClient) SendDrainReport(experimentID, phaseID string, cb *Cach
 		EntriesDropped:         c.dropped.Load(),
 		BatchesSent:            c.batchesSent.Load(),
 		LastBatchSeq:           int64(c.currentBatchSeq()),
-		KeyCollisionsDivergent: rb.CollisionsDivergent,
-		KeyCollisionsIdentical: rb.CollisionsIdentical,
+		KeyCollisionsDivergent: fc.KeyCollisionsDivergent,
+		KeyCollisionsIdentical: fc.KeyCollisionsIdentical,
 	}
 	body, err := json.Marshal(report)
 	if err != nil {

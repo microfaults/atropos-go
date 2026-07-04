@@ -225,8 +225,15 @@ func TestHandleCacheBox_ReplayServesFromCache(t *testing.T) {
 }
 
 func TestHandleCacheBox_ReplayMissFailsClosed(t *testing.T) {
-	before := cachebox.MissStats()
-	i, cb := newTestInterceptor(t, cacheBoxRule("cache-miss.test", evaluator.CacheBoxReplay))
+	i, cb := newTestInterceptor(t, cacheBoxRuleWithPhase("cache-miss.test", evaluator.CacheBoxReplay, "exp-1", "phase-1"))
+	pair := cachebox.PhasePair{ExperimentID: "exp-1", PhaseID: "phase-1"}
+	// Install the RIGHT phase (so a miss here is unambiguously key_absent,
+	// not not_committed -- see TestHandleCacheBox_ReplayMissReasonDistinguishesNotCommitted
+	// for that distinction) with an entry that doesn't match the request.
+	cb.InstallReplaySet(cachebox.PhaseKey("exp-1", "phase-1"), map[string]*cachebox.Entry{
+		"unrelated-key": {Key: "unrelated-key", StatusCode: 200},
+	})
+	before := cb.Fidelity().Snapshot(pair)
 	client := &http.Client{Transport: i.EgressTransport(failRoundTripper{t: t})}
 
 	resp, err := client.Get("http://cache-miss.test/items?id=1")
@@ -257,9 +264,12 @@ func TestHandleCacheBox_ReplayMissFailsClosed(t *testing.T) {
 	if cb.Store().Len() != 0 {
 		t.Fatalf("fail-closed miss must not record; store has %d entries", cb.Store().Len())
 	}
-	after := cachebox.MissStats()
-	if after.KeyAbsent != before.KeyAbsent+1 {
-		t.Fatalf("expected KeyAbsent counter to increment by 1: before=%d after=%d", before.KeyAbsent, after.KeyAbsent)
+	after := cb.Fidelity().Snapshot(pair)
+	if after.MissKeyAbsent != before.MissKeyAbsent+1 {
+		t.Fatalf("expected MissKeyAbsent counter to increment by 1: before=%d after=%d", before.MissKeyAbsent, after.MissKeyAbsent)
+	}
+	if after.ReplayMisses != before.ReplayMisses+1 {
+		t.Fatalf("expected ReplayMisses counter to increment by 1: before=%d after=%d", before.ReplayMisses, after.ReplayMisses)
 	}
 }
 
@@ -319,15 +329,23 @@ func TestHandleCacheBox_UnknownActionFailsClosed(t *testing.T) {
 }
 
 func TestHandleCacheBox_BodyBufferErrorUnderReplayFailsClosed(t *testing.T) {
-	before := cachebox.MissStats()
 	cb := cachebox.New(cachebox.Config{
 		Store:       cachebox.NewMemStore(cachebox.MemStoreConfig{MaxEntries: 10}),
 		KeyStrategy: cachebox.KeyStrategyExactWithBody,
 	})
 	t.Cleanup(func() { cb.Stop() })
+	pair := cachebox.PhasePair{ExperimentID: "exp-1", PhaseID: "phase-1"}
+	before := cb.Fidelity().Snapshot(pair)
 
+	// The rule's context must ALSO need the body (exact_with_body) --
+	// cacheBoxRuleWithPhase defaults to exact_with_host, which wouldn't
+	// exercise the body-buffering path this test is about.
+	rule := cacheBoxRule("cache-miss.test", evaluator.CacheBoxReplay)
+	rule.Decision.CacheBoxContext = &cachebox.CacheBoxContext{
+		ExperimentID: "exp-1", PhaseID: "phase-1", KeyStrategy: "exact_with_body",
+	}
 	i := New(
-		evaluator.NewStaticEvaluator(cacheBoxRule("cache-miss.test", evaluator.CacheBoxReplay)),
+		evaluator.NewStaticEvaluator(rule),
 		trace.Noop(),
 		WithCacheBox(cb),
 	)
@@ -354,9 +372,9 @@ func TestHandleCacheBox_BodyBufferErrorUnderReplayFailsClosed(t *testing.T) {
 	if cb.Store().Len() != 0 {
 		t.Fatalf("body-buffer-error fail-closed miss must not record; store has %d entries", cb.Store().Len())
 	}
-	after := cachebox.MissStats()
-	if after.BodyBufferFailed != before.BodyBufferFailed+1 {
-		t.Fatalf("expected BodyBufferFailed counter to increment by 1: before=%d after=%d", before.BodyBufferFailed, after.BodyBufferFailed)
+	after := cb.Fidelity().Snapshot(pair)
+	if after.MissBodyBufferFailed != before.MissBodyBufferFailed+1 {
+		t.Fatalf("expected MissBodyBufferFailed counter to increment by 1: before=%d after=%d", before.MissBodyBufferFailed, after.MissBodyBufferFailed)
 	}
 }
 
@@ -636,6 +654,7 @@ func TestInterceptor_UsesRuleStrategy(t *testing.T) {
 func TestHandleCacheBox_ReplayMissReasonDistinguishesNotCommitted(t *testing.T) {
 	cb := cachebox.New(cachebox.Config{KeyStrategy: cachebox.KeyStrategyExactWithHost})
 	t.Cleanup(func() { cb.Stop() })
+	pair := cachebox.PhasePair{ExperimentID: "exp-1", PhaseID: "phase-1"}
 
 	ctxRule := func() evaluator.StaticRule {
 		r := cacheBoxRule("cache-miss.test", evaluator.CacheBoxReplay)
@@ -646,7 +665,7 @@ func TestHandleCacheBox_ReplayMissReasonDistinguishesNotCommitted(t *testing.T) 
 	}
 
 	// Nothing installed at all yet.
-	before := cachebox.MissStats()
+	before := cb.Fidelity().Snapshot(pair)
 	i := New(evaluator.NewStaticEvaluator(ctxRule()), trace.Noop(), WithCacheBox(cb))
 	client := &http.Client{Transport: i.EgressTransport(failRoundTripper{t: t})}
 	resp, err := client.Get("http://cache-miss.test/x")
@@ -654,9 +673,9 @@ func TestHandleCacheBox_ReplayMissReasonDistinguishesNotCommitted(t *testing.T) 
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	after := cachebox.MissStats()
-	if after.NotCommitted != before.NotCommitted+1 {
-		t.Fatalf("expected NotCommitted to increment with nothing installed: before=%d after=%d", before.NotCommitted, after.NotCommitted)
+	after := cb.Fidelity().Snapshot(pair)
+	if after.MissNotCommitted != before.MissNotCommitted+1 {
+		t.Fatalf("expected MissNotCommitted to increment with nothing installed: before=%d after=%d", before.MissNotCommitted, after.MissNotCommitted)
 	}
 
 	// A DIFFERENT phase's set is installed -- still not_committed for this rule.
@@ -668,9 +687,9 @@ func TestHandleCacheBox_ReplayMissReasonDistinguishesNotCommitted(t *testing.T) 
 		t.Fatal(err)
 	}
 	resp2.Body.Close()
-	after2 := cachebox.MissStats()
-	if after2.NotCommitted != after.NotCommitted+1 {
-		t.Fatalf("expected NotCommitted to increment again for a mismatched phase: before=%d after=%d", after.NotCommitted, after2.NotCommitted)
+	after2 := cb.Fidelity().Snapshot(pair)
+	if after2.MissNotCommitted != after.MissNotCommitted+1 {
+		t.Fatalf("expected MissNotCommitted to increment again for a mismatched phase: before=%d after=%d", after.MissNotCommitted, after2.MissNotCommitted)
 	}
 
 	// The RIGHT phase is installed, but the requested key isn't in it --
@@ -678,17 +697,17 @@ func TestHandleCacheBox_ReplayMissReasonDistinguishesNotCommitted(t *testing.T) 
 	cb.InstallReplaySet(cachebox.PhaseKey("exp-1", "phase-1"), map[string]*cachebox.Entry{
 		"some-other-key": {Key: "some-other-key", StatusCode: 200},
 	})
-	beforeKeyAbsent := cachebox.MissStats()
+	beforeKeyAbsent := cb.Fidelity().Snapshot(pair)
 	resp3, err := client.Get("http://cache-miss.test/x")
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp3.Body.Close()
-	afterKeyAbsent := cachebox.MissStats()
-	if afterKeyAbsent.KeyAbsent != beforeKeyAbsent.KeyAbsent+1 {
-		t.Fatalf("expected KeyAbsent to increment once the right phase is installed: before=%d after=%d", beforeKeyAbsent.KeyAbsent, afterKeyAbsent.KeyAbsent)
+	afterKeyAbsent := cb.Fidelity().Snapshot(pair)
+	if afterKeyAbsent.MissKeyAbsent != beforeKeyAbsent.MissKeyAbsent+1 {
+		t.Fatalf("expected MissKeyAbsent to increment once the right phase is installed: before=%d after=%d", beforeKeyAbsent.MissKeyAbsent, afterKeyAbsent.MissKeyAbsent)
 	}
-	if afterKeyAbsent.NotCommitted != after2.NotCommitted {
-		t.Fatalf("NotCommitted must not increment once the right phase is installed: got %d, want %d", afterKeyAbsent.NotCommitted, after2.NotCommitted)
+	if afterKeyAbsent.MissNotCommitted != after2.MissNotCommitted {
+		t.Fatalf("MissNotCommitted must not increment once the right phase is installed: got %d, want %d", afterKeyAbsent.MissNotCommitted, after2.MissNotCommitted)
 	}
 }

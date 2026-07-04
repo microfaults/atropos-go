@@ -1,6 +1,9 @@
 package cachebox
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // supportedKeyStrategies is the recognized set of key_strategy values a
 // preload begin may declare (design doc Q4: "validates strategy
@@ -84,14 +87,17 @@ func (s *preloadStaging) entriesLocked() []*Entry {
 // replay -- Commit is the only path that calls ReplaySet.Install.
 type PreloadStore struct {
 	replaySet *ReplaySet
+	fidelity  *FidelityRegistry
 
 	mu      sync.Mutex
 	staging *preloadStaging
 }
 
-// NewPreloadStore builds a PreloadStore that installs into rs on commit.
-func NewPreloadStore(rs *ReplaySet) *PreloadStore {
-	return &PreloadStore{replaySet: rs}
+// NewPreloadStore builds a PreloadStore that installs into rs on commit,
+// reporting preload state to fidelity (ATRO-7, design doc Q6) -- nil is
+// fine, all FidelityRegistry methods are nil-safe.
+func NewPreloadStore(rs *ReplaySet, fidelity *FidelityRegistry) *PreloadStore {
+	return &PreloadStore{replaySet: rs, fidelity: fidelity}
 }
 
 // Begin starts a new staged preload for (experimentID, phaseID), clearing
@@ -159,6 +165,7 @@ func (p *PreloadStore) Commit(experimentID, phaseID string, totalEntries int, ch
 	actualChecksum := SetChecksum(entries)
 	actualCount := len(entries)
 	match := actualCount == totalEntries && actualChecksum == checksum
+	committedAt := time.Now()
 
 	if match {
 		installed := make(map[string]*Entry, len(entries))
@@ -167,6 +174,8 @@ func (p *PreloadStore) Commit(experimentID, phaseID string, totalEntries int, ch
 		}
 		p.replaySet.Install(PhaseKey(experimentID, phaseID), installed)
 	}
+	pair := PhasePair{ExperimentID: experimentID, PhaseID: phaseID}
+	p.fidelity.SetPreloadState(pair, match, actualCount, actualChecksum, committedAt)
 
 	p.mu.Lock()
 	if p.staging == s {

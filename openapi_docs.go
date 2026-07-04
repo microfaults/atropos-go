@@ -123,6 +123,20 @@ func swaggerPreloadCommitPost() {}
 // @Router   /cachebox/preload/abort [post]
 func swaggerPreloadAbortPost() {}
 
+// swaggerCacheBoxFidelityGet documents GET /cachebox/fidelity.
+//
+// @Summary      Read per-(experiment, phase) cache-box fidelity counters
+// @Description  Synchronous, pull-based snapshot of everything needed to compute a phase's VALID/INVALID verdict from this instance (design doc Q6).
+// @Tags         cachebox
+// @Produce      json
+// @Param        experiment_id  query     string  true  "experiment id"
+// @Param        phase_id       query     string  true  "phase id"
+// @Success      200            {object}  FidelitySnapshot
+// @Failure      400            {object}  ErrorResponse  "missing experiment_id or phase_id"
+// @Failure      405            {object}  ErrorResponse  "method not allowed"
+// @Router       /cachebox/fidelity [get]
+func swaggerCacheBoxFidelityGet() {}
+
 // swaggerRulesAdminGet documents GET /admin/rules.
 //
 // @Summary  List runtime rules

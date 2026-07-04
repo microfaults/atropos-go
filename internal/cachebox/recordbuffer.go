@@ -18,6 +18,7 @@ import (
 // doesn't -- only ReplaySet is consulted for replay).
 type RecordBuffer struct {
 	maxEntries int
+	fidelity   *FidelityRegistry
 
 	mu      sync.Mutex
 	entries map[string]*Entry
@@ -34,12 +35,19 @@ type RecordBufferConfig struct {
 	// increments OverflowDropped; it never evicts an existing key to make
 	// room.
 	MaxEntries int
+
+	// Fidelity, if set, receives per-(experiment_id, phase_id) collision
+	// counts (ATRO-7, design doc Q6) -- attributed from each entry's own
+	// ExperimentID/PhaseID, since a single buffer instance is shared
+	// across whatever pairs are actively recording.
+	Fidelity *FidelityRegistry
 }
 
 // NewRecordBuffer builds an empty RecordBuffer.
 func NewRecordBuffer(cfg RecordBufferConfig) *RecordBuffer {
 	return &RecordBuffer{
 		maxEntries: cfg.MaxEntries,
+		fidelity:   cfg.Fidelity,
 		entries:    make(map[string]*Entry),
 	}
 }
@@ -66,18 +74,23 @@ func (b *RecordBuffer) Put(key string, entry *Entry) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	pair := PhasePair{ExperimentID: entry.ExperimentID, PhaseID: entry.PhaseID}
+
 	if existing, ok := b.entries[key]; ok {
-		if existing.StatusCode == entry.StatusCode && sha256.Sum256(existing.Body) == sha256.Sum256(entry.Body) {
-			b.collisionsIdentical.Add(1)
-		} else {
+		divergent := existing.StatusCode != entry.StatusCode || sha256.Sum256(existing.Body) != sha256.Sum256(entry.Body)
+		if divergent {
 			b.collisionsDivergent.Add(1)
+		} else {
+			b.collisionsIdentical.Add(1)
 		}
+		b.fidelity.RecordCollision(pair, divergent)
 		b.entries[key] = entry
 		return
 	}
 
 	if b.maxEntries > 0 && len(b.entries) >= b.maxEntries {
 		b.overflowDropped.Add(1)
+		b.fidelity.RecordDropped(pair, 1)
 		return
 	}
 	b.entries[key] = entry

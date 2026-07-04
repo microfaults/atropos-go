@@ -35,6 +35,7 @@ type CacheBox struct {
 	replaySet    *ReplaySet
 	preload      *PreloadStore
 	recorder     *Recorder
+	fidelity     *FidelityRegistry
 	keyFn        KeyFunc
 	strategy     KeyStrategy
 	maxBodyBytes int
@@ -89,8 +90,10 @@ type Config struct {
 // defaults. The returned *CacheBox owns its recorder's drain goroutine;
 // callers should invoke Stop when the CacheBox is no longer needed.
 func New(cfg Config) *CacheBox {
+	fidelity := NewFidelityRegistry()
+
 	if cfg.Store == nil {
-		cfg.Store = NewRecordBuffer(RecordBufferConfig{MaxEntries: 10000})
+		cfg.Store = NewRecordBuffer(RecordBufferConfig{MaxEntries: 10000, Fidelity: fidelity})
 	}
 	if cfg.KeyStrategy == "" {
 		// canonical_v2 is the authoritative default (design doc Q3); the
@@ -112,10 +115,11 @@ func New(cfg Config) *CacheBox {
 	rec := cfg.Recorder
 	if rec == nil {
 		rec = NewRecorder(RecorderConfig{
-			Store:   cfg.Store,
-			KeyFunc: keyFn,
-			Push:    cfg.Push,
-			BufSize: cfg.RecorderBuf,
+			Store:    cfg.Store,
+			KeyFunc:  keyFn,
+			Push:     cfg.Push,
+			BufSize:  cfg.RecorderBuf,
+			Fidelity: fidelity,
 		})
 	}
 
@@ -124,8 +128,9 @@ func New(cfg Config) *CacheBox {
 	return &CacheBox{
 		store:        cfg.Store,
 		replaySet:    replaySet,
-		preload:      NewPreloadStore(replaySet),
+		preload:      NewPreloadStore(replaySet, fidelity),
 		recorder:     rec,
+		fidelity:     fidelity,
 		keyFn:        keyFn,
 		strategy:     cfg.KeyStrategy,
 		maxBodyBytes: cfg.MaxBodyBytes,
@@ -183,6 +188,18 @@ func (cb *CacheBox) RecorderStats() RecorderStats {
 		return RecorderStats{}
 	}
 	return cb.recorder.Stats()
+}
+
+// Fidelity returns the CacheBox's per-(experiment_id, phase_id) counter
+// registry (ATRO-7, design doc Q6). Wire the same instance into a
+// CachePushClient (CachePushConfig.Fidelity) so push-side counts land in
+// the same registry the replay/record side reports into. Nil-safe (a nil
+// *CacheBox returns nil; FidelityRegistry's own methods are all nil-safe).
+func (cb *CacheBox) Fidelity() *FidelityRegistry {
+	if cb == nil {
+		return nil
+	}
+	return cb.fidelity
 }
 
 // InstallReplaySet atomically replaces the entries a replay-family decision

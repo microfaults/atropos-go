@@ -54,9 +54,10 @@ type PushFunc func(key string, entry *Entry)
 // observability. This is a deliberate backpressure strategy: we would
 // rather lose cache entries than add synchronous latency to live traffic.
 type Recorder struct {
-	store Store
-	keyFn KeyFunc
-	push  PushFunc
+	store    Store
+	keyFn    KeyFunc
+	push     PushFunc
+	fidelity *FidelityRegistry
 
 	ch      chan CacheRecord
 	wg      sync.WaitGroup
@@ -72,6 +73,11 @@ type RecorderConfig struct {
 	KeyFunc KeyFunc // required
 	Push    PushFunc
 	BufSize int // default 1024
+
+	// Fidelity, if set, receives per-(experiment_id, phase_id)
+	// record_enqueued/record_dropped counts (ATRO-7, design doc Q6),
+	// attributed from each record's own ExperimentID/PhaseID.
+	Fidelity *FidelityRegistry
 }
 
 // NewRecorder constructs a Recorder and starts its drain goroutine.
@@ -81,10 +87,11 @@ func NewRecorder(cfg RecorderConfig) *Recorder {
 		cfg.BufSize = 1024
 	}
 	r := &Recorder{
-		store: cfg.Store,
-		keyFn: cfg.KeyFunc,
-		push:  cfg.Push,
-		ch:    make(chan CacheRecord, cfg.BufSize),
+		store:    cfg.Store,
+		keyFn:    cfg.KeyFunc,
+		push:     cfg.Push,
+		fidelity: cfg.Fidelity,
+		ch:       make(chan CacheRecord, cfg.BufSize),
 	}
 	r.wg.Add(1)
 	go r.drain()
@@ -99,11 +106,14 @@ func (r *Recorder) Record(rec CacheRecord) bool {
 	if r.stopped.Load() {
 		return false
 	}
+	pair := PhasePair{ExperimentID: rec.ExperimentID, PhaseID: rec.PhaseID}
 	select {
 	case r.ch <- rec:
+		r.fidelity.RecordEnqueued(pair)
 		return true
 	default:
 		r.dropped.Add(1)
+		r.fidelity.RecordDropped(pair, 1)
 		return false
 	}
 }
