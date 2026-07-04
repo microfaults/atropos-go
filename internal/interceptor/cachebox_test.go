@@ -2,6 +2,8 @@ package interceptor
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +17,25 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 )
+
+// failRoundTripper fails the test immediately if RoundTrip is ever invoked.
+// Used to assert that a fail-closed miss (INV-1) never reaches the live
+// downstream.
+type failRoundTripper struct {
+	t *testing.T
+}
+
+func (f failRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	f.t.Fatalf("unexpected live RoundTrip call for %s %s -- a fail-closed miss must never reach the downstream", r.Method, r.URL)
+	return nil, errors.New("unreachable")
+}
+
+// errBodyReader always fails to read, simulating a request-body buffering
+// error under a key strategy that needs the body.
+type errBodyReader struct{}
+
+func (errBodyReader) Read([]byte) (int, error) { return 0, errors.New("simulated read error") }
+func (errBodyReader) Close() error             { return nil }
 
 // newTestInterceptor builds an interceptor with the given rules and a fresh
 // cache-box backed by an in-memory store. Returns the interceptor and the
@@ -145,33 +166,139 @@ func TestHandleCacheBox_ReplayServesFromCache(t *testing.T) {
 	}
 }
 
-func TestHandleCacheBox_ReplayMissFallsBackAndRecords(t *testing.T) {
-	var hits atomic.Int64
-	srv := httptest.NewServer(countingHandler(&hits, "fresh-body", 0))
-	defer srv.Close()
+func TestHandleCacheBox_ReplayMissFailsClosed(t *testing.T) {
+	before := cachebox.MissStats()
+	i, cb := newTestInterceptor(t, cacheBoxRule("cache-miss.test", evaluator.CacheBoxReplay))
+	client := &http.Client{Transport: i.EgressTransport(failRoundTripper{t: t})}
 
-	u, _ := url.Parse(srv.URL)
-	i, cb := newTestInterceptor(t, cacheBoxRule(u.Host, evaluator.CacheBoxReplay))
-	client := &http.Client{Transport: i.EgressTransport(http.DefaultTransport)}
-
-	// Cache is empty; replay should fall through to the real server.
-	resp, err := client.Get(srv.URL + "/missing")
+	resp, err := client.Get("http://cache-miss.test/items?id=1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if string(body) != "fresh-body" {
-		t.Fatalf("fallback body mismatch: %q", body)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
 	}
-	if hits.Load() != 1 {
-		t.Fatalf("expected server hit on cache miss, got %d", hits.Load())
+	if resp.Header.Get("X-Atropos-Cache-Miss") != "1" {
+		t.Fatal("expected X-Atropos-Cache-Miss: 1 header")
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/problem+json" {
+		t.Fatalf("content-type = %q, want application/problem+json", ct)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	var decoded map[string]any
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("miss body is not JSON: %v (%s)", err, body)
+	}
+	if decoded["error"] != "cachebox_miss" {
+		t.Fatalf("unexpected error body: %s", body)
 	}
 
-	// The miss should have been recorded for next time.
 	cb.Stop()
-	if cb.Store().Len() != 1 {
-		t.Fatalf("expected miss fallback to record an entry, store has %d", cb.Store().Len())
+	if cb.Store().Len() != 0 {
+		t.Fatalf("fail-closed miss must not record; store has %d entries", cb.Store().Len())
+	}
+	after := cachebox.MissStats()
+	if after.KeyAbsent != before.KeyAbsent+1 {
+		t.Fatalf("expected KeyAbsent counter to increment by 1: before=%d after=%d", before.KeyAbsent, after.KeyAbsent)
+	}
+}
+
+func TestHandleCacheBox_ReplayDelayMissFailsClosed(t *testing.T) {
+	i, cb := newTestInterceptor(t, cacheBoxRule("cache-miss.test", evaluator.CacheBoxReplayDelay))
+	client := &http.Client{Transport: i.EgressTransport(failRoundTripper{t: t})}
+
+	start := time.Now()
+	resp, err := client.Get("http://cache-miss.test/items?id=2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	elapsed := time.Since(start)
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	if resp.Header.Get("X-Atropos-Cache-Miss") != "1" {
+		t.Fatal("expected X-Atropos-Cache-Miss: 1 header")
+	}
+	if got := resp.Header.Get("X-Atropos-Cache-Mode"); got != "replay_with_delay" {
+		t.Fatalf("mode header = %q, want replay_with_delay", got)
+	}
+	// A miss must never sleep -- there is no recorded latency to replay.
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("miss took too long, looks like it slept: %s", elapsed)
+	}
+
+	cb.Stop()
+	if cb.Store().Len() != 0 {
+		t.Fatalf("fail-closed miss must not record; store has %d entries", cb.Store().Len())
+	}
+}
+
+func TestHandleCacheBox_UnknownActionFailsClosed(t *testing.T) {
+	i, cb := newTestInterceptor(t, cacheBoxRule("cache-miss.test", evaluator.CacheBoxAction(99)))
+	client := &http.Client{Transport: i.EgressTransport(failRoundTripper{t: t})}
+
+	resp, err := client.Get("http://cache-miss.test/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	if resp.Header.Get("X-Atropos-Cache-Miss") != "1" {
+		t.Fatal("expected X-Atropos-Cache-Miss: 1 header for an unrecognized action")
+	}
+
+	cb.Stop()
+	if cb.Store().Len() != 0 {
+		t.Fatalf("unknown-action fail-closed miss must not record; store has %d entries", cb.Store().Len())
+	}
+}
+
+func TestHandleCacheBox_BodyBufferErrorUnderReplayFailsClosed(t *testing.T) {
+	before := cachebox.MissStats()
+	cb := cachebox.New(cachebox.Config{
+		Store:       cachebox.NewMemStore(cachebox.MemStoreConfig{MaxEntries: 10}),
+		KeyStrategy: cachebox.KeyStrategyExactWithBody,
+	})
+	t.Cleanup(func() { cb.Stop() })
+
+	i := New(
+		evaluator.NewStaticEvaluator(cacheBoxRule("cache-miss.test", evaluator.CacheBoxReplay)),
+		trace.Noop(),
+		WithCacheBox(cb),
+	)
+	client := &http.Client{Transport: i.EgressTransport(failRoundTripper{t: t})}
+
+	req, err := http.NewRequest(http.MethodPost, "http://cache-miss.test/search", errBodyReader{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	if resp.Header.Get("X-Atropos-Cache-Miss") != "1" {
+		t.Fatal("expected X-Atropos-Cache-Miss: 1 header")
+	}
+
+	cb.Stop()
+	if cb.Store().Len() != 0 {
+		t.Fatalf("body-buffer-error fail-closed miss must not record; store has %d entries", cb.Store().Len())
+	}
+	after := cachebox.MissStats()
+	if after.BodyBufferFailed != before.BodyBufferFailed+1 {
+		t.Fatalf("expected BodyBufferFailed counter to increment by 1: before=%d after=%d", before.BodyBufferFailed, after.BodyBufferFailed)
 	}
 }
 
