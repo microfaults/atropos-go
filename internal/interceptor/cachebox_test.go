@@ -118,51 +118,46 @@ func TestHandleCacheBox_PassthroughRecords(t *testing.T) {
 	}
 }
 
+// TestHandleCacheBox_ReplayServesFromCache pins the post-ATRO-4 contract:
+// replay serves only from an installed ReplaySet, never from whatever a
+// passthrough happened to record locally (that would be the "cache"
+// behavior this refactor deliberately removes -- see design doc §5
+// critique). failRoundTripper proves the live downstream is never touched.
 func TestHandleCacheBox_ReplayServesFromCache(t *testing.T) {
-	var hits atomic.Int64
-	srv := httptest.NewServer(countingHandler(&hits, "server-body", 0))
-	defer srv.Close()
+	cb := cachebox.New(cachebox.Config{KeyStrategy: cachebox.KeyStrategyExactWithHost})
+	t.Cleanup(func() { cb.Stop() })
 
-	u, _ := url.Parse(srv.URL)
+	req, _ := http.NewRequest(http.MethodGet, "http://cache-hit.test/items?id=42", nil)
+	key := cb.DeriveKey(req, nil)
+	cb.InstallReplaySet("exp-1:phase-1", map[string]*cachebox.Entry{
+		key: {
+			Key:             key,
+			StatusCode:      200,
+			Header:          http.Header{},
+			Body:            []byte("server-body"),
+			ObservedLatency: 5 * time.Millisecond,
+			RecordedAt:      time.Now(),
+		},
+	})
 
-	// First interceptor: record with passthrough.
-	iRec, cb := newTestInterceptor(t, cacheBoxRule(u.Host, evaluator.CacheBoxPassthrough))
-	clientRec := &http.Client{Transport: iRec.EgressTransport(http.DefaultTransport)}
-	resp, err := clientRec.Get(srv.URL + "/items?id=42")
-	if err != nil {
-		t.Fatal(err)
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-
-	// Drain recorder so the entry is in the store.
-	cb.Stop()
-
-	// Now build a replay interceptor around the SAME cache-box so we can hit
-	// the cached entry. We use a new interceptor so we can swap rules without
-	// racing the old one.
-	iReplay := New(
-		evaluator.NewStaticEvaluator(cacheBoxRule(u.Host, evaluator.CacheBoxReplay)),
+	i := New(
+		evaluator.NewStaticEvaluator(cacheBoxRule("cache-hit.test", evaluator.CacheBoxReplay)),
 		trace.Noop(),
 		WithCacheBox(cb),
 	)
-	clientReplay := &http.Client{Transport: iReplay.EgressTransport(http.DefaultTransport)}
+	client := &http.Client{Transport: i.EgressTransport(failRoundTripper{t: t})}
 
-	hitsBefore := hits.Load()
-	resp2, err := clientReplay.Get(srv.URL + "/items?id=42")
+	resp, err := client.Get("http://cache-hit.test/items?id=42")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp2.Body.Close()
-	body, _ := io.ReadAll(resp2.Body)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
 	if string(body) != "server-body" {
 		t.Fatalf("replay body mismatch: %q", body)
 	}
-	if hits.Load() != hitsBefore {
-		t.Fatalf("server saw %d new hits during replay (expected 0)", hits.Load()-hitsBefore)
-	}
-	if resp2.Header.Get("X-Atropos-Cache-Mode") != "replay" {
-		t.Fatalf("missing replay mode header: %v", resp2.Header)
+	if resp.Header.Get("X-Atropos-Cache-Mode") != "replay" {
+		t.Fatalf("missing replay mode header: %v", resp.Header)
 	}
 }
 
@@ -302,48 +297,49 @@ func TestHandleCacheBox_BodyBufferErrorUnderReplayFailsClosed(t *testing.T) {
 	}
 }
 
+// TestHandleCacheBox_ReplayDelaySleepsAtLeastObservedLatency pins the
+// replay_with_delay contract: the sleep duration comes from the installed
+// entry's ObservedLatency. Populating that field realistically (via a real
+// passthrough call) is orthogonal to what this test exercises, so the entry
+// is installed directly with a known latency -- see
+// TestHandleCacheBox_ReplayServesFromCache for why passthrough no longer
+// feeds replay.
 func TestHandleCacheBox_ReplayDelaySleepsAtLeastObservedLatency(t *testing.T) {
 	const observed = 80 * time.Millisecond
-	var hits atomic.Int64
-	srv := httptest.NewServer(countingHandler(&hits, "slow", observed))
-	defer srv.Close()
 
-	u, _ := url.Parse(srv.URL)
+	cb := cachebox.New(cachebox.Config{KeyStrategy: cachebox.KeyStrategyExactWithHost})
+	t.Cleanup(func() { cb.Stop() })
 
-	// Record phase: passthrough so we capture a real observed latency.
-	iRec, cb := newTestInterceptor(t, cacheBoxRule(u.Host, evaluator.CacheBoxPassthrough))
-	clientRec := &http.Client{Transport: iRec.EgressTransport(http.DefaultTransport)}
-	resp, err := clientRec.Get(srv.URL + "/slow")
-	if err != nil {
-		t.Fatal(err)
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	cb.Stop()
+	req, _ := http.NewRequest(http.MethodGet, "http://cache-hit.test/slow", nil)
+	key := cb.DeriveKey(req, nil)
+	cb.InstallReplaySet("exp-1:phase-1", map[string]*cachebox.Entry{
+		key: {
+			Key:             key,
+			StatusCode:      200,
+			Header:          http.Header{},
+			Body:            []byte("slow"),
+			ObservedLatency: observed,
+			RecordedAt:      time.Now(),
+		},
+	})
 
-	// Replay phase: replay with delay. We time the call and expect it to be
-	// close to the observed latency.
-	iReplay := New(
-		evaluator.NewStaticEvaluator(cacheBoxRule(u.Host, evaluator.CacheBoxReplayDelay)),
+	i := New(
+		evaluator.NewStaticEvaluator(cacheBoxRule("cache-hit.test", evaluator.CacheBoxReplayDelay)),
 		trace.Noop(),
 		WithCacheBox(cb),
 	)
-	clientReplay := &http.Client{Transport: iReplay.EgressTransport(http.DefaultTransport)}
+	client := &http.Client{Transport: i.EgressTransport(failRoundTripper{t: t})}
 
-	hitsBefore := hits.Load()
 	start := time.Now()
-	resp2, err := clientReplay.Get(srv.URL + "/slow")
+	resp, err := client.Get("http://cache-hit.test/slow")
 	if err != nil {
 		t.Fatal(err)
 	}
 	elapsed := time.Since(start)
-	body, _ := io.ReadAll(resp2.Body)
-	resp2.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
 	if string(body) != "slow" {
 		t.Fatalf("replay_with_delay body: %q", body)
-	}
-	if hits.Load() != hitsBefore {
-		t.Fatalf("replay_with_delay should not hit server")
 	}
 	// Allow a wide lower bound -- we want to see the sleep, not exact timing.
 	if elapsed < observed*3/4 {
@@ -394,19 +390,21 @@ func TestHandleCacheBox_ReplayDelayCancellable(t *testing.T) {
 	})
 	t.Cleanup(func() { cb.Stop() })
 
-	// Pre-populate an entry with a huge latency. The key must match what
-	// DeriveKey will produce for the replay request.
+	// Install an entry with a huge latency into the replay set. The key must
+	// match what DeriveKey will produce for the replay request.
 	req, _ := http.NewRequest("GET", srv.URL+"/x", nil)
 	req.Host = u.Host
 	req.URL.Host = u.Host
 	key := cb.DeriveKey(req, nil)
-	cb.Store().Put(key, &cachebox.Entry{
-		Key:             key,
-		StatusCode:      200,
-		Header:          http.Header{},
-		Body:            []byte("cached"),
-		ObservedLatency: 5 * time.Second,
-		RecordedAt:      time.Now(),
+	cb.InstallReplaySet("exp-1:phase-1", map[string]*cachebox.Entry{
+		key: {
+			Key:             key,
+			StatusCode:      200,
+			Header:          http.Header{},
+			Body:            []byte("cached"),
+			ObservedLatency: 5 * time.Second,
+			RecordedAt:      time.Now(),
+		},
 	})
 
 	i := New(

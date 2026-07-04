@@ -20,14 +20,19 @@ import (
 const DefaultMaxBodyBytes = 1 << 20 // 1 MiB
 
 // CacheBox is the runtime coordinator for cache-box operations. It owns
-// the store, recorder, delay source, and key function used by the
-// interceptor to serve cache-box decisions.
+// the record/replay split (design doc Q4, INV-4/INV-7): store is the record
+// side (feeds the recorder/pusher, never consulted by Lookup) and
+// replaySet is the replay side (populated only by InstallReplaySet -- the
+// preload-commit path, ATRO-6 -- and the only thing Lookup consults). It
+// also owns the delay source and key function used by the interceptor to
+// serve cache-box decisions.
 //
 // A nil *CacheBox is safe for Lookup and Record (both become no-ops)
 // but not for SampleDelay or NeedsRequestBody -- the interceptor must
 // check for nil before dispatching to handleCacheBox.
 type CacheBox struct {
 	store        Store
+	replaySet    *ReplaySet
 	recorder     *Recorder
 	keyFn        KeyFunc
 	strategy     KeyStrategy
@@ -40,7 +45,11 @@ type CacheBox struct {
 
 // Config builds a CacheBox.
 type Config struct {
-	// Store is the persistence backend. If nil, a 10k-entry MemStore is used.
+	// Store is the record-side persistence backend the recorder drains
+	// into -- never consulted by Lookup (see ReplaySet). If nil, a
+	// 10000-entry RecordBuffer is used (bounded with an overflow counter
+	// instead of LRU eviction). Supplying a custom Store (e.g. MemStore)
+	// here only affects the record side.
 	Store Store
 
 	// KeyStrategy selects one of the built-in key functions. Ignored if
@@ -80,7 +89,7 @@ type Config struct {
 // callers should invoke Stop when the CacheBox is no longer needed.
 func New(cfg Config) *CacheBox {
 	if cfg.Store == nil {
-		cfg.Store = NewMemStore(MemStoreConfig{MaxEntries: 10000})
+		cfg.Store = NewRecordBuffer(RecordBufferConfig{MaxEntries: 10000})
 	}
 	if cfg.KeyStrategy == "" {
 		cfg.KeyStrategy = KeyStrategyExact
@@ -109,6 +118,7 @@ func New(cfg Config) *CacheBox {
 
 	return &CacheBox{
 		store:        cfg.Store,
+		replaySet:    NewReplaySet(),
 		recorder:     rec,
 		keyFn:        keyFn,
 		strategy:     cfg.KeyStrategy,
@@ -127,20 +137,63 @@ func (cb *CacheBox) DeriveKey(r *http.Request, body []byte) string {
 	return cb.keyFn(r, body)
 }
 
-// Lookup returns a cached entry for the key, if one exists. Nil-safe.
+// Lookup returns an entry from the installed replay set for the key, if one
+// exists. Nil-safe. Lookup consults only the ReplaySet -- never the record
+// side -- so a Record can never make an entry visible to a replay decision
+// (INV-4): the only way an entry becomes replayable is InstallReplaySet.
 func (cb *CacheBox) Lookup(key string) (*Entry, bool) {
 	if cb == nil {
 		return nil, false
 	}
-	return cb.store.Get(key)
+	return cb.replaySet.Get(key)
 }
 
-// Record enqueues a new entry for async insertion. Nil-safe.
+// Record enqueues a new entry for async insertion into the record-side
+// buffer. Nil-safe. Record never makes the entry visible to Lookup -- see
+// InstallReplaySet.
 func (cb *CacheBox) Record(rec CacheRecord) {
 	if cb == nil || cb.recorder == nil {
 		return
 	}
 	cb.recorder.Record(rec)
+}
+
+// InstallReplaySet atomically replaces the entries a replay-family decision
+// may serve, tagged with phaseKey (the owning (experiment_id, phase_id)
+// pair, for diagnostics). It is the only way entries become visible to
+// Lookup (INV-4) -- called by the preload-commit handler (ATRO-6) after
+// checksum verification. Nil-safe.
+func (cb *CacheBox) InstallReplaySet(phaseKey string, entries map[string]*Entry) {
+	if cb == nil {
+		return
+	}
+	cb.replaySet.Install(phaseKey, entries)
+}
+
+// ClearReplaySet drops the installed replay set entirely (e.g.
+// freeze-clear/thaw hygiene, ATRO-6). Nil-safe.
+func (cb *CacheBox) ClearReplaySet() {
+	if cb == nil {
+		return
+	}
+	cb.replaySet.Clear()
+}
+
+// ReplaySetLen reports how many entries are currently installed.
+func (cb *CacheBox) ReplaySetLen() int {
+	if cb == nil {
+		return 0
+	}
+	return cb.replaySet.Len()
+}
+
+// ReplaySetPhaseKey reports the diagnostic key of the currently-installed
+// replay set, or "" if none is installed.
+func (cb *CacheBox) ReplaySetPhaseKey() string {
+	if cb == nil {
+		return ""
+	}
+	return cb.replaySet.PhaseKey()
 }
 
 // SampleDelay asks the delay source how long replay_with_delay should sleep
@@ -197,18 +250,25 @@ func (cb *CacheBox) Stop() {
 	cb.recorder.Stop()
 }
 
-// Stats returns combined store and recorder stats.
+// Stats returns combined store and recorder stats. RecordBuffer is only
+// populated when the record-side Store happens to be a *RecordBuffer
+// (true by default; a caller-supplied custom Store leaves it zero-valued).
 type Stats struct {
-	Store    StoreStats
-	Recorder RecorderStats
+	Store        StoreStats
+	Recorder     RecorderStats
+	RecordBuffer RecordBufferStats
 }
 
 // Stats returns a snapshot of cache-box observability counters.
 func (cb *CacheBox) Stats() Stats {
-	return Stats{
+	s := Stats{
 		Store:    cb.store.Stats(),
 		Recorder: cb.recorder.Stats(),
 	}
+	if rb, ok := cb.store.(*RecordBuffer); ok {
+		s.RecordBuffer = rb.BufferStats()
+	}
+	return s
 }
 
 // BufferRequestBody reads up to (cap + 1) bytes of r.Body, restores the
