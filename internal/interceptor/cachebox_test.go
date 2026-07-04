@@ -67,6 +67,20 @@ func cacheBoxRule(host string, action evaluator.CacheBoxAction) evaluator.Static
 	}
 }
 
+// cacheBoxRuleWithPhase is cacheBoxRule plus a CacheBoxContext for
+// (experimentID, phaseID) -- needed for a passthrough rule to actually
+// record (ATRO-5/INV-5: recording requires a matched rule's context to
+// carry a non-empty experiment/phase pair).
+func cacheBoxRuleWithPhase(host string, action evaluator.CacheBoxAction, experimentID, phaseID string) evaluator.StaticRule {
+	r := cacheBoxRule(host, action)
+	r.Decision.CacheBoxContext = &cachebox.CacheBoxContext{
+		ExperimentID: experimentID,
+		PhaseID:      phaseID,
+		KeyStrategy:  "exact_with_host",
+	}
+	return r
+}
+
 // countingHandler returns an http.HandlerFunc that increments a counter on
 // each request and returns a fixed body + latency.
 func countingHandler(counter *atomic.Int64, body string, latency time.Duration) http.HandlerFunc {
@@ -88,7 +102,7 @@ func TestHandleCacheBox_PassthroughRecords(t *testing.T) {
 	u, _ := url.Parse(srv.URL)
 	host := u.Host
 	_ = host
-	i, cb := newTestInterceptor(t, cacheBoxRule(u.Host, evaluator.CacheBoxPassthrough))
+	i, cb := newTestInterceptor(t, cacheBoxRuleWithPhase(u.Host, evaluator.CacheBoxPassthrough, "exp-1", "phase-1"))
 	client := &http.Client{Transport: i.EgressTransport(http.DefaultTransport)}
 
 	resp, err := client.Get(srv.URL + "/items?id=1")
@@ -115,6 +129,55 @@ func TestHandleCacheBox_PassthroughRecords(t *testing.T) {
 	cb.Stop()
 	if cb.Store().Len() != 1 {
 		t.Fatalf("expected 1 entry in store, got %d", cb.Store().Len())
+	}
+}
+
+// TestRecord_NoContextNoRecord pins ATRO-5/INV-5: a passthrough rule with
+// no CacheBoxContext (or an empty experiment/phase id) forwards the
+// request normally but never enqueues a record -- there is no ambient
+// fallback for a missing phase pair.
+func TestRecord_NoContextNoRecord(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(countingHandler(&hits, "server-body", 0))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+
+	// Plain cacheBoxRule carries no CacheBoxContext at all.
+	i, cb := newTestInterceptor(t, cacheBoxRule(u.Host, evaluator.CacheBoxPassthrough))
+	client := &http.Client{Transport: i.EgressTransport(http.DefaultTransport)}
+
+	resp, err := client.Get(srv.URL + "/items?id=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if hits.Load() != 1 {
+		t.Fatalf("passthrough should still forward the request, got %d hits", hits.Load())
+	}
+
+	cb.Stop()
+	if got := cb.Store().Len(); got != 0 {
+		t.Fatalf("expected nothing enqueued without a rule context, store has %d entries", got)
+	}
+
+	// A context with an empty phase_id is equally "no recording", not a
+	// fallback to some ambient state.
+	ruleEmptyPhase := cacheBoxRule(u.Host, evaluator.CacheBoxPassthrough)
+	ruleEmptyPhase.Decision.CacheBoxContext = &cachebox.CacheBoxContext{ExperimentID: "exp-1", PhaseID: ""}
+	i2, cb2 := newTestInterceptor(t, ruleEmptyPhase)
+	client2 := &http.Client{Transport: i2.EgressTransport(http.DefaultTransport)}
+
+	resp2, err := client2.Get(srv.URL + "/items?id=2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp2.Body)
+	resp2.Body.Close()
+
+	cb2.Stop()
+	if got := cb2.Store().Len(); got != 0 {
+		t.Fatalf("expected nothing enqueued with an empty phase_id, store has %d entries", got)
 	}
 }
 
@@ -357,7 +420,7 @@ func TestHandleCacheBox_QueryParamVariance(t *testing.T) {
 	defer srv.Close()
 
 	u, _ := url.Parse(srv.URL)
-	i, cb := newTestInterceptor(t, cacheBoxRule(u.Host, evaluator.CacheBoxPassthrough))
+	i, cb := newTestInterceptor(t, cacheBoxRuleWithPhase(u.Host, evaluator.CacheBoxPassthrough, "exp-1", "phase-1"))
 	client := &http.Client{Transport: i.EgressTransport(http.DefaultTransport)}
 
 	for _, q := range []string{"id=1", "id=2", "id=3"} {
@@ -444,7 +507,7 @@ func TestHandleCacheBox_OversizeNotCached(t *testing.T) {
 	})
 	t.Cleanup(func() { cb.Stop() })
 	i := New(
-		evaluator.NewStaticEvaluator(cacheBoxRule(u.Host, evaluator.CacheBoxPassthrough)),
+		evaluator.NewStaticEvaluator(cacheBoxRuleWithPhase(u.Host, evaluator.CacheBoxPassthrough, "exp-1", "phase-1")),
 		trace.Noop(),
 		WithCacheBox(cb),
 	)

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -18,7 +19,13 @@ type CachePushConfig struct {
 	BaseURL  string
 	Service  string
 	Instance string
-	PhaseID  string        // experiment phase this push belongs to
+	// PhaseID is a legacy fallback only. Since ATRO-5, each pushed entry
+	// carries its own ExperimentID/PhaseID (stamped from the matched rule's
+	// CacheBoxContext at record time -- see cacheBoxPassthrough); the
+	// envelope is built from the entries actually in the batch, not this
+	// field. Left in place only for source compatibility with existing
+	// SetPhaseID/SetRunID callers.
+	PhaseID  string
 	MaxBatch int           // default 100
 	MaxWait  time.Duration // default 5s
 	Client   *http.Client  // default http.DefaultClient
@@ -29,6 +36,11 @@ type CachePushConfig struct {
 type CachePushStats struct {
 	Pushed  int64
 	Dropped int64
+	// PushRejectedTerminal counts batches manteion rejected with
+	// 409 phase_not_recording -- a terminal outcome (no retry), distinct
+	// from a retried-then-exhausted transport/5xx failure.
+	PushRejectedTerminal int64
+	BatchesSent          int64
 }
 
 // CachePushClient batches cache entries and POSTs them to manteion's
@@ -36,36 +48,54 @@ type CachePushStats struct {
 // signature so it can be wired into CacheBox.Config.Push.
 //
 // Batching strategy: flush when the batch reaches MaxBatch entries OR when
-// MaxWait time elapses since the first entry was added, whichever comes first.
+// MaxWait time elapses since the first entry was added, whichever comes
+// first, OR when an entry's (ExperimentID, PhaseID) differs from the
+// current batch's -- an envelope must never mix entries from two phases
+// (wire spec §W2), so a phase transition forces an early flush.
 //
-// Failure policy: POST failure -> log + increment dropped counter -> drop
-// batch. No retry.
+// batch_seq is monotonic per (experiment, phase) pair (design doc Q2) and
+// restarts whenever the tracked pair changes.
+//
+// Failure policy (design doc Q2): up to 3 attempts with exponential
+// backoff (base 250ms + jitter) on transport errors and 5xx. A
+// 409 phase_not_recording response stops retrying immediately
+// (PushRejectedTerminal). Any other terminal outcome (retries exhausted,
+// or a non-2xx/non-409 status) counts Dropped.
 //
 // Lifecycle: Stop() flushes the pending batch synchronously with a 5s
-// timeout, then prevents further adds.
+// timeout, then prevents further adds. Flush() does the same without
+// stopping -- used at recording-phase end (ATRO-5) before a drain report.
 type CachePushClient struct {
 	baseURL  string
 	service  string
 	instance string
-	phaseID  string
+	phaseID  string // legacy fallback; see CachePushConfig.PhaseID
 	client   *http.Client
 	logger   *slog.Logger
 	maxBatch int
 	maxWait  time.Duration
 
-	mu      sync.Mutex
-	batch   []cachebox.WireEntry
-	timer   *time.Timer
-	stopped bool
+	mu           sync.Mutex
+	batch        []cachebox.WireEntry
+	batchExpID   string
+	batchPhaseID string
+	batchSeq     int
+	timer        *time.Timer
+	stopped      bool
 
-	pushed  atomic.Int64
-	dropped atomic.Int64
+	pushed               atomic.Int64
+	dropped              atomic.Int64
+	pushRejectedTerminal atomic.Int64
+	batchesSent          atomic.Int64
 }
 
 const (
 	defaultMaxBatch = 100
 	defaultMaxWait  = 5 * time.Second
 	flushTimeout    = 5 * time.Second
+
+	maxPushAttempts = 3
+	pushBackoffBase = 250 * time.Millisecond
 )
 
 // NewCachePushClient constructs a CachePushClient from the given config.
@@ -96,9 +126,12 @@ func NewCachePushClient(cfg CachePushConfig) *CachePushClient {
 	}
 }
 
-// SetPhaseID updates the phase ID after construction. Safe for concurrent
-// use. Entries pushed before SetPhaseID is called use whatever PhaseID was
-// set at construction time (possibly empty — manteion rejects those with 400).
+// SetPhaseID updates the legacy fallback phase ID.
+//
+// Deprecated: since ATRO-5, each entry carries its own (experiment_id,
+// phase_id) stamped from the matched rule's CacheBoxContext at record
+// time; this ambient value is no longer consulted by add/post. Kept only
+// for source compatibility with existing callers.
 func (c *CachePushClient) SetPhaseID(phaseID string) {
 	c.mu.Lock()
 	c.phaseID = phaseID
@@ -108,7 +141,8 @@ func (c *CachePushClient) SetPhaseID(phaseID string) {
 // SetRunID updates the phase ID after construction.
 //
 // Deprecated: runs were renamed to phases when manteion moved to the
-// phase-first experiment model; use SetPhaseID.
+// phase-first experiment model; use SetPhaseID (itself deprecated -- see
+// its doc).
 func (c *CachePushClient) SetRunID(id string) { c.SetPhaseID(id) }
 
 // PushFunc returns a cachebox.PushFunc that feeds entries into this client.
@@ -121,8 +155,10 @@ func (c *CachePushClient) PushFunc() cachebox.PushFunc {
 // Stats returns a snapshot of push counters.
 func (c *CachePushClient) Stats() CachePushStats {
 	return CachePushStats{
-		Pushed:  c.pushed.Load(),
-		Dropped: c.dropped.Load(),
+		Pushed:               c.pushed.Load(),
+		Dropped:              c.dropped.Load(),
+		PushRejectedTerminal: c.pushRejectedTerminal.Load(),
+		BatchesSent:          c.batchesSent.Load(),
 	}
 }
 
@@ -132,6 +168,18 @@ func (c *CachePushClient) add(entry *cachebox.Entry) {
 	if c.stopped {
 		return
 	}
+
+	// A phase transition means we flush whatever's pending under the OLD
+	// tag before starting a new batch under the new one -- an envelope
+	// must never mix entries from two phases (wire spec §W2).
+	if len(c.batch) > 0 && (entry.ExperimentID != c.batchExpID || entry.PhaseID != c.batchPhaseID) {
+		c.flushLocked()
+	}
+	if len(c.batch) == 0 && (entry.ExperimentID != c.batchExpID || entry.PhaseID != c.batchPhaseID) {
+		c.batchSeq = 0 // new pair -- batch_seq restarts (design doc Q2)
+	}
+	c.batchExpID = entry.ExperimentID
+	c.batchPhaseID = entry.PhaseID
 
 	c.batch = append(c.batch, cachebox.EntryToWire(entry))
 
@@ -163,15 +211,41 @@ func (c *CachePushClient) flushLocked() {
 		c.timer = nil
 	}
 	entries := c.batch
+	expID, phaseID := c.batchExpID, c.batchPhaseID
+	c.batchSeq++
+	seq := c.batchSeq
 	c.batch = make([]cachebox.WireEntry, 0, c.maxBatch)
-	go c.post(entries)
+	go c.post(entries, expID, phaseID, seq)
 }
 
-// ingestEnvelope is the POST body for /api/v1/cache/ingest. ExperimentID and
-// BatchSeq are fidelity-refinement additions (wire spec §W2): BatchSeq is a
-// 1-based, monotonic-per-(experiment, phase, instance) sequence number that
-// lets manteion dedupe retried batches. Populating them is ATRO-5's job;
-// today they are always sent zero-valued.
+// Flush immediately sends whatever is currently batched, without waiting
+// for MaxBatch or MaxWait, and blocks until that push attempt (including
+// retries) completes. Unlike Stop, it does not prevent further adds. Used
+// at recording-phase end (ATRO-5, design doc Q2) so a drain report can be
+// built only after every batched entry has been attempted.
+func (c *CachePushClient) Flush() {
+	c.mu.Lock()
+	if c.stopped || len(c.batch) == 0 {
+		c.mu.Unlock()
+		return
+	}
+	if c.timer != nil {
+		c.timer.Stop()
+		c.timer = nil
+	}
+	entries := c.batch
+	expID, phaseID := c.batchExpID, c.batchPhaseID
+	c.batchSeq++
+	seq := c.batchSeq
+	c.batch = make([]cachebox.WireEntry, 0, c.maxBatch)
+	c.mu.Unlock()
+
+	c.post(entries, expID, phaseID, seq) // synchronous, not `go` -- caller waits
+}
+
+// ingestEnvelope is the POST body for /api/v1/cache/ingest (wire spec §W2).
+// BatchSeq is 1-based and monotonic per (experiment_id, phase_id, instance)
+// so manteion can dedupe retried batches.
 type ingestEnvelope struct {
 	Service      string               `json:"service"`
 	Instance     string               `json:"instance"`
@@ -181,17 +255,21 @@ type ingestEnvelope struct {
 	Entries      []cachebox.WireEntry `json:"entries"`
 }
 
-// post sends the batch to manteion. It runs WITHOUT the lock held (it is
-// I/O-bound and must not block adds).
-func (c *CachePushClient) post(entries []cachebox.WireEntry) {
-	c.mu.Lock()
-	phaseID := c.phaseID
-	c.mu.Unlock()
+// post sends the batch to manteion, retrying transport errors and 5xx up
+// to maxPushAttempts times with exponential backoff + jitter. A
+// 409 phase_not_recording response is terminal: it stops retrying and
+// counts PushRejectedTerminal (in addition to Dropped, since the entries
+// are lost either way). It runs WITHOUT the lock held (I/O-bound) --
+// called via `go` from flushLocked (fire-and-forget) or directly from
+// Flush/Stop (synchronous, caller waits).
+func (c *CachePushClient) post(entries []cachebox.WireEntry, experimentID, phaseID string, batchSeq int) {
 	body, err := json.Marshal(ingestEnvelope{
-		Service:  c.service,
-		Instance: c.instance,
-		PhaseID:  phaseID,
-		Entries:  entries,
+		Service:      c.service,
+		Instance:     c.instance,
+		PhaseID:      phaseID,
+		ExperimentID: experimentID,
+		BatchSeq:     batchSeq,
+		Entries:      entries,
 	})
 	if err != nil {
 		c.logger.Warn("cache push marshal error", "error", err)
@@ -199,32 +277,64 @@ func (c *CachePushClient) post(entries []cachebox.WireEntry) {
 		return
 	}
 
+	for attempt := 1; attempt <= maxPushAttempts; attempt++ {
+		status, doErr := c.attempt(body)
+
+		if doErr == nil && status == http.StatusConflict {
+			c.logger.Warn("cache push rejected: phase not recording",
+				"batch_seq", batchSeq, "experiment_id", experimentID, "phase_id", phaseID)
+			c.pushRejectedTerminal.Add(1)
+			c.dropped.Add(int64(len(entries)))
+			return
+		}
+
+		if doErr == nil && status >= 200 && status < 300 {
+			c.pushed.Add(int64(len(entries)))
+			c.batchesSent.Add(1)
+			return
+		}
+
+		retryable := doErr != nil || status >= 500
+		if doErr != nil {
+			c.logger.Warn("cache push failed", "error", doErr, "attempt", attempt)
+		} else {
+			c.logger.Warn("cache push rejected", "status", status, "attempt", attempt)
+		}
+		if !retryable || attempt == maxPushAttempts {
+			break
+		}
+		time.Sleep(pushBackoff(attempt))
+	}
+
+	c.dropped.Add(int64(len(entries)))
+}
+
+// attempt makes one POST attempt and returns (status, error). status is
+// only meaningful when error is nil.
+func (c *CachePushClient) attempt(body []byte) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), flushTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.baseURL+"/api/v1/cache/ingest", bytes.NewReader(body))
 	if err != nil {
-		c.dropped.Add(int64(len(entries)))
-		return
+		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		c.logger.Warn("cache push failed", "error", err)
-		c.dropped.Add(int64(len(entries)))
-		return
+		return 0, err
 	}
 	defer resp.Body.Close()
+	return resp.StatusCode, nil
+}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		c.logger.Warn("cache push rejected", "status", resp.StatusCode)
-		c.dropped.Add(int64(len(entries)))
-		return
-	}
-
-	c.pushed.Add(int64(len(entries)))
+// pushBackoff returns the exponential backoff (base pushBackoffBase) plus
+// full jitter for the given 1-based attempt number.
+func pushBackoff(attempt int) time.Duration {
+	backoff := pushBackoffBase * time.Duration(uint64(1)<<uint(attempt-1))
+	return backoff + rand.N(backoff)
 }
 
 // Stop flushes the pending batch synchronously and prevents further adds.
@@ -241,10 +351,88 @@ func (c *CachePushClient) Stop() {
 		c.timer = nil
 	}
 	entries := c.batch
+	expID, phaseID, seq := c.batchExpID, c.batchPhaseID, c.batchSeq+1
 	c.batch = nil
 	c.mu.Unlock()
 
 	if len(entries) > 0 {
-		c.post(entries) // synchronous — blocks until POST completes or times out
+		c.post(entries, expID, phaseID, seq) // synchronous — blocks until POST completes or times out
 	}
+}
+
+// SendDrainReport flushes any pending batch, then builds and POSTs a W3
+// drain report for (experimentID, phaseID), retrying up to
+// maxPushAttempts times on transport errors and 5xx. cb supplies
+// entries-recorded and collision counts (design doc Q2); this client
+// supplies the push-side counts. Called when a rule-version change removes
+// the recording context for this pair (ATRO-5(c)) -- detecting that
+// transition is the caller's job (see CacheDrainTracker).
+func (c *CachePushClient) SendDrainReport(experimentID, phaseID string, cb *CacheBox) DrainReportResponse {
+	c.Flush()
+
+	rb := cb.Stats().RecordBuffer
+	report := DrainReport{
+		ExperimentID:           experimentID,
+		PhaseID:                phaseID,
+		Service:                c.service,
+		InstanceID:             c.instance,
+		EntriesRecorded:        cb.RecorderStats().Recorded,
+		EntriesPushed:          c.pushed.Load(),
+		EntriesDropped:         c.dropped.Load(),
+		BatchesSent:            c.batchesSent.Load(),
+		LastBatchSeq:           int64(c.currentBatchSeq()),
+		KeyCollisionsDivergent: rb.CollisionsDivergent,
+		KeyCollisionsIdentical: rb.CollisionsIdentical,
+	}
+	body, err := json.Marshal(report)
+	if err != nil {
+		c.logger.Warn("drain report marshal error", "error", err)
+		return DrainReportResponse{Accepted: false}
+	}
+
+	for attempt := 1; attempt <= maxPushAttempts; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), flushTimeout)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			c.baseURL+"/api/v1/sdk/cachebox/drain", bytes.NewReader(body))
+		if err != nil {
+			cancel()
+			c.logger.Warn("drain report request build error", "error", err)
+			return DrainReportResponse{Accepted: false}
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, doErr := c.client.Do(req)
+		cancel()
+		if doErr != nil {
+			c.logger.Warn("drain report post failed", "error", doErr, "attempt", attempt)
+			if attempt < maxPushAttempts {
+				time.Sleep(pushBackoff(attempt))
+			}
+			continue
+		}
+
+		var decoded DrainReportResponse
+		_ = json.NewDecoder(resp.Body).Decode(&decoded)
+		resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return decoded
+		}
+		c.logger.Warn("drain report rejected", "status", resp.StatusCode, "attempt", attempt)
+		if resp.StatusCode < 500 {
+			break // non-5xx rejection -- not retryable
+		}
+		if attempt < maxPushAttempts {
+			time.Sleep(pushBackoff(attempt))
+		}
+	}
+	return DrainReportResponse{Accepted: false}
+}
+
+// currentBatchSeq returns the last batch_seq assigned, for the drain
+// report's LastBatchSeq field.
+func (c *CachePushClient) currentBatchSeq() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.batchSeq
 }

@@ -160,6 +160,27 @@ func (cb *CacheBox) Record(rec CacheRecord) {
 	cb.recorder.Record(rec)
 }
 
+// FlushRecording blocks until every record enqueued before this call has
+// been processed and (if a push hook is configured) handed to it. Used at
+// recording-phase end, before building a drain report (design doc Q2),
+// so the report's counts reflect everything recorded up to that point.
+// Nil-safe.
+func (cb *CacheBox) FlushRecording() {
+	if cb == nil || cb.recorder == nil {
+		return
+	}
+	cb.recorder.Flush()
+}
+
+// RecorderStats returns a snapshot of the recorder's counters (entries
+// recorded/dropped/pending). Nil-safe.
+func (cb *CacheBox) RecorderStats() RecorderStats {
+	if cb == nil || cb.recorder == nil {
+		return RecorderStats{}
+	}
+	return cb.recorder.Stats()
+}
+
 // InstallReplaySet atomically replaces the entries a replay-family decision
 // may serve, tagged with phaseKey (the owning (experiment_id, phase_id)
 // pair, for diagnostics). It is the only way entries become visible to

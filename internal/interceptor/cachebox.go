@@ -100,7 +100,7 @@ func (i *Interceptor) handleCacheBox(r *http.Request, base http.RoundTripper, re
 
 	switch decision.CacheBox {
 	case evaluator.CacheBoxPassthrough:
-		return i.cacheBoxPassthrough(ctx, r, base, cb, key, reqBody, span)
+		return i.cacheBoxPassthrough(ctx, r, base, cb, key, reqBody, cbCtx, span)
 
 	case evaluator.CacheBoxReplay:
 		if entry, ok := cb.Lookup(key); ok {
@@ -190,14 +190,18 @@ type cacheBoxMissBody struct {
 }
 
 // cacheBoxPassthrough forwards the request to the real downstream service,
-// buffers the response body for caching, and enqueues an async record.
+// buffers the response body for caching, and enqueues an async record --
+// but only when cbCtx carries a non-empty (experiment_id, phase_id): a
+// passthrough rule with no context (legacy rule, or none at all) forwards
+// the request without ever calling cb.Record (design doc Q5/INV-5, ATRO-5).
+// There is no ambient/registration-time fallback for a missing pair.
 //
 // Body handling is split into two cases based on total size:
 //   - Within cap: fully buffer, cache, and return a replayable NopCloser.
 //   - Over cap: do NOT cache; rebuild resp.Body as a MultiReader over what
 //     we already peeked plus the remainder of the original body, so the
 //     caller still streams the full response without truncation.
-func (i *Interceptor) cacheBoxPassthrough(ctx context.Context, r *http.Request, base http.RoundTripper, cb *cachebox.CacheBox, key string, reqBody []byte, span trace.Span) (*http.Response, error) {
+func (i *Interceptor) cacheBoxPassthrough(ctx context.Context, r *http.Request, base http.RoundTripper, cb *cachebox.CacheBox, key string, reqBody []byte, cbCtx *cachebox.CacheBoxContext, span trace.Span) (*http.Response, error) {
 	_ = ctx
 	start := time.Now()
 	resp, err := base.RoundTrip(r)
@@ -240,24 +244,31 @@ func (i *Interceptor) cacheBoxPassthrough(ctx context.Context, r *http.Request, 
 	body := buf.Bytes()
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 
-	// Enqueue the record. We clone the header on the hot path so the drain
-	// goroutine has its own snapshot and the caller can freely mutate
-	// resp.Header (e.g. to add the X-Atropos-Cache-* headers below) without
-	// racing the recorder.
-	cb.Record(cachebox.CacheRecord{
-		Request:         r,
-		RequestBody:     reqBody,
-		StatusCode:      resp.StatusCode,
-		ResponseHeader:  resp.Header.Clone(),
-		ResponseBody:    body,
-		ObservedLatency: observed,
-		Timestamp:       time.Now(),
-	})
+	// Record only when the matched rule authorizes it with a phase pair --
+	// no ctx, or an empty experiment/phase id, means "don't record" rather
+	// than falling back to any ambient state (design doc Q5/INV-5).
+	if cbCtx != nil && cbCtx.ExperimentID != "" && cbCtx.PhaseID != "" {
+		// Enqueue the record. We clone the header on the hot path so the
+		// drain goroutine has its own snapshot and the caller can freely
+		// mutate resp.Header (e.g. to add the X-Atropos-Cache-* headers
+		// below) without racing the recorder.
+		cb.Record(cachebox.CacheRecord{
+			Request:         r,
+			RequestBody:     reqBody,
+			StatusCode:      resp.StatusCode,
+			ResponseHeader:  resp.Header.Clone(),
+			ResponseBody:    body,
+			ObservedLatency: observed,
+			Timestamp:       time.Now(),
+			ExperimentID:    cbCtx.ExperimentID,
+			PhaseID:         cbCtx.PhaseID,
+		})
 
-	span.AddEvent(trace.EventCacheBoxRecord,
-		attribute.Int64(trace.AttrCacheBoxLatencyUs, observed.Microseconds()),
-		attribute.Int(trace.AttrCacheBoxResponseSize, len(body)),
-	)
+		span.AddEvent(trace.EventCacheBoxRecord,
+			attribute.Int64(trace.AttrCacheBoxLatencyUs, observed.Microseconds()),
+			attribute.Int(trace.AttrCacheBoxResponseSize, len(body)),
+		)
+	}
 
 	// Tag the response so callers can see which key was assigned.
 	resp.Header.Set(headerCacheKey, key)

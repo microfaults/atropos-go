@@ -103,10 +103,22 @@ type ApplyTargets struct {
 	// fault proxies. Required if rules or active_fault contain network-category faults.
 	NetworkResolver NetworkResolver
 	// PhaseIDSink, if set, receives resp.RecordingPhaseID on every Apply (poll
-	// and register). Services wire this to their CachePushClient.SetPhaseID so
-	// recorded cache entries are ingested into the active baseline phase.
-	// Optional — nil means this SDK does not record cache.
+	// and register).
+	//
+	// Deprecated: since ATRO-5, recording provenance rides on each matched
+	// rule's CacheBoxContext (design doc Q5/INV-5) rather than this ambient,
+	// registration-time signal. Kept only for source compatibility with
+	// existing callers; new code should use CacheDrain instead for
+	// phase-end detection. Optional — nil means this SDK does not record
+	// cache, or has migrated to CacheDrain.
 	PhaseIDSink func(phaseID string)
+	// CacheDrain, if set, is notified with the applied rule set on every
+	// Apply that carries a non-empty rules list. It diffs against the
+	// previously-seen active recording phases and fires a flush + W3 drain
+	// report for any that just ended (design doc Q2). Optional — nil means
+	// this SDK doesn't need automatic drain-report generation (e.g. it
+	// never records, or triggers draining some other way).
+	CacheDrain *CacheDrainTracker
 }
 
 // Apply installs the register response's intent state onto the supplied
@@ -141,6 +153,13 @@ func Apply(resp RegisterResponse, targets ApplyTargets) error {
 			return fmt.Errorf("apply rules: %w", err)
 		}
 		targets.Evaluator.SetRules(rules)
+
+		// Gated on the same "non-empty rules" condition as SetRules above:
+		// an empty rules list means "no change" (see the doc comment on
+		// RuleSync), not "every recording phase just ended" -- observing it
+		// unconditionally would misfire a drain report on every poll that
+		// simply didn't carry a rule update.
+		targets.CacheDrain.Observe(resp.Rules)
 	}
 
 	if len(resp.ActiveFaults) > 0 {

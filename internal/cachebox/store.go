@@ -23,6 +23,12 @@ import (
 // it was recorded. Entries are immutable after Put and may be shared by
 // concurrent Get callers; callers MUST NOT mutate Header or Body directly.
 // Use Header.Clone() if you need a mutable copy.
+//
+// ExperimentID/PhaseID are the provenance of a recorded entry (design doc
+// Q5/INV-5): stamped from the matched rule's CacheBoxContext at record
+// time, never from ambient/registration-time state. Entries installed via
+// InstallReplaySet (the preload path) don't need them populated -- the
+// owning phase is tracked at the ReplaySet level instead (PhaseKey).
 type Entry struct {
 	Key             string
 	StatusCode      int
@@ -31,6 +37,8 @@ type Entry struct {
 	ObservedLatency time.Duration
 	RecordedAt      time.Time
 	HitCount        atomic.Int64
+	ExperimentID    string
+	PhaseID         string
 }
 
 // Size returns an approximate byte count for the entry, used by the store

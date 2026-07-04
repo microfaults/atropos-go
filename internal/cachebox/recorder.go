@@ -15,6 +15,11 @@ import (
 // RequestBody is only set when the key strategy needs it (exact_with_body).
 // Neither the Request nor the Body is cloned by the recorder; callers must
 // ensure the values are safe to read from the drain goroutine.
+//
+// ExperimentID/PhaseID are the matched rule's CacheBoxContext provenance
+// (design doc Q5/INV-5). The interceptor only builds a CacheRecord when
+// both are non-empty (see cacheBoxPassthrough) -- there is no ambient
+// fallback for a missing pair.
 type CacheRecord struct {
 	Request         *http.Request
 	RequestBody     []byte
@@ -23,6 +28,13 @@ type CacheRecord struct {
 	ResponseBody    []byte
 	ObservedLatency time.Duration
 	Timestamp       time.Time
+	ExperimentID    string
+	PhaseID         string
+
+	// flushBarrier, when set, marks this as a control record rather than a
+	// real one: drain() closes it and moves on instead of processing a
+	// record. Only Flush uses this; it is not part of the public API.
+	flushBarrier chan struct{}
 }
 
 // PushFunc is an optional hook for forwarding each newly-recorded entry
@@ -101,6 +113,10 @@ func (r *Recorder) Record(rec CacheRecord) bool {
 func (r *Recorder) drain() {
 	defer r.wg.Done()
 	for rec := range r.ch {
+		if rec.flushBarrier != nil {
+			close(rec.flushBarrier)
+			continue
+		}
 		key := r.keyFn(rec.Request, rec.RequestBody)
 		var header http.Header
 		if rec.ResponseHeader != nil {
@@ -113,6 +129,8 @@ func (r *Recorder) drain() {
 			Body:            rec.ResponseBody,
 			ObservedLatency: rec.ObservedLatency,
 			RecordedAt:      rec.Timestamp,
+			ExperimentID:    rec.ExperimentID,
+			PhaseID:         rec.PhaseID,
 		}
 		r.store.Put(key, entry)
 		r.recorded.Add(1)
@@ -120,6 +138,26 @@ func (r *Recorder) drain() {
 			r.push(key, entry)
 		}
 	}
+}
+
+// Flush blocks until every CacheRecord enqueued before this call has been
+// processed by the drain goroutine (and, if a push hook is set, handed to
+// it). Unlike Stop, it does not terminate the recorder -- Record calls
+// after Flush returns work normally. Used at recording-phase end (design
+// doc Q2) so a drain report can be built only after every record up to
+// that point is accounted for. A no-op after Stop.
+//
+// Flush sends a barrier directly on the channel (a blocking send, unlike
+// Record's drop-on-full) so it can never be silently discarded by the same
+// backpressure policy that protects the hot path -- a dropped barrier
+// would hang this call forever.
+func (r *Recorder) Flush() {
+	if r.stopped.Load() {
+		return
+	}
+	done := make(chan struct{})
+	r.ch <- CacheRecord{flushBarrier: done}
+	<-done
 }
 
 // Stop signals the recorder to finish draining pending records and
