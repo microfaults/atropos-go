@@ -7,6 +7,13 @@ import "sync/atomic"
 const (
 	MissReasonKeyAbsent        = "key_absent"
 	MissReasonBodyBufferFailed = "body_buffer_failed"
+	// MissReasonNotCommitted is reported when the installed ReplaySet
+	// doesn't belong to the matched rule's (experiment_id, phase_id) at
+	// all (nothing installed yet, or a different phase's set is live) --
+	// distinct from MissReasonKeyAbsent, which means the right phase IS
+	// installed but this particular key isn't in it. Defense in depth
+	// (ATRO-6): correct preload ordering should prevent this in practice.
+	MissReasonNotCommitted = "not_committed"
 )
 
 // missCounters is a temporary package-level tally of fail-closed replay
@@ -15,6 +22,7 @@ const (
 var missCounters struct {
 	keyAbsent        atomic.Int64
 	bodyBufferFailed atomic.Int64
+	notCommitted     atomic.Int64
 }
 
 // RecordMiss increments the counter for reason. Unrecognized reasons are
@@ -25,6 +33,8 @@ func RecordMiss(reason string) {
 		missCounters.keyAbsent.Add(1)
 	case MissReasonBodyBufferFailed:
 		missCounters.bodyBufferFailed.Add(1)
+	case MissReasonNotCommitted:
+		missCounters.notCommitted.Add(1)
 	}
 }
 
@@ -32,6 +42,7 @@ func RecordMiss(reason string) {
 type MissCounts struct {
 	KeyAbsent        int64
 	BodyBufferFailed int64
+	NotCommitted     int64
 }
 
 // MissStats returns a snapshot of the current miss counts.
@@ -39,5 +50,6 @@ func MissStats() MissCounts {
 	return MissCounts{
 		KeyAbsent:        missCounters.keyAbsent.Load(),
 		BodyBufferFailed: missCounters.bodyBufferFailed.Load(),
+		NotCommitted:     missCounters.notCommitted.Load(),
 	}
 }

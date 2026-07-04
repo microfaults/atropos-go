@@ -2,6 +2,15 @@ package cachebox
 
 import "sync/atomic"
 
+// PhaseKey builds the canonical diagnostic key for a (experiment_id,
+// phase_id) pair, used as ReplaySet's Install/PhaseKey argument. A NUL
+// separator (rather than e.g. ":") keeps two different (exp, phase) pairs
+// from ever colliding into the same key regardless of what characters the
+// ids themselves contain.
+func PhaseKey(experimentID, phaseID string) string {
+	return experimentID + "\x00" + phaseID
+}
+
 // ReplaySet is the immutable set of entries a frozen service replays from.
 // It is populated only by Install -- the preload-commit path (ATRO-6) -- and
 // consulted only by CacheBox.Lookup under a replay-family decision. There is

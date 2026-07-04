@@ -33,6 +33,7 @@ const DefaultMaxBodyBytes = 1 << 20 // 1 MiB
 type CacheBox struct {
 	store        Store
 	replaySet    *ReplaySet
+	preload      *PreloadStore
 	recorder     *Recorder
 	keyFn        KeyFunc
 	strategy     KeyStrategy
@@ -118,9 +119,12 @@ func New(cfg Config) *CacheBox {
 		})
 	}
 
+	replaySet := NewReplaySet()
+
 	return &CacheBox{
 		store:        cfg.Store,
-		replaySet:    NewReplaySet(),
+		replaySet:    replaySet,
+		preload:      NewPreloadStore(replaySet),
 		recorder:     rec,
 		keyFn:        keyFn,
 		strategy:     cfg.KeyStrategy,
@@ -217,6 +221,38 @@ func (cb *CacheBox) ReplaySetPhaseKey() string {
 		return ""
 	}
 	return cb.replaySet.PhaseKey()
+}
+
+// PreloadBegin starts a new staged preload (ATRO-6, wire spec §W4).
+func (cb *CacheBox) PreloadBegin(experimentID, phaseID, keyStrategy string, maxBytes int64) BeginResult {
+	if cb == nil {
+		return BeginResult{}
+	}
+	return cb.preload.Begin(experimentID, phaseID, keyStrategy, maxBytes)
+}
+
+// PreloadChunk appends a chunk to the active staged preload.
+func (cb *CacheBox) PreloadChunk(experimentID, phaseID string, chunkSeq int, entries []*Entry) ChunkResult {
+	if cb == nil {
+		return ChunkResult{}
+	}
+	return cb.preload.Chunk(experimentID, phaseID, chunkSeq, entries)
+}
+
+// PreloadCommit verifies and (on match) installs the staged preload.
+func (cb *CacheBox) PreloadCommit(experimentID, phaseID string, totalEntries int, checksum string) CommitResult {
+	if cb == nil {
+		return CommitResult{}
+	}
+	return cb.preload.Commit(experimentID, phaseID, totalEntries, checksum)
+}
+
+// PreloadAbort drops the active staged preload, if any.
+func (cb *CacheBox) PreloadAbort(experimentID, phaseID string) {
+	if cb == nil {
+		return
+	}
+	cb.preload.Abort(experimentID, phaseID)
 }
 
 // SampleDelay asks the delay source how long replay_with_delay should sleep

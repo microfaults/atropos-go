@@ -626,3 +626,69 @@ func TestInterceptor_UsesRuleStrategy(t *testing.T) {
 		t.Fatalf("expected exact-shaped key from rule context despite a canonical_v2 CacheBox default, got %q", key)
 	}
 }
+
+// TestHandleCacheBox_ReplayMissReasonDistinguishesNotCommitted pins the
+// ATRO-6 defense-in-depth miss reason: a replay-family miss when the
+// installed ReplaySet doesn't even belong to the matched rule's phase
+// (nothing preloaded, or a different phase's set is live) reports
+// not_committed, distinct from key_absent (right phase installed, wrong
+// key).
+func TestHandleCacheBox_ReplayMissReasonDistinguishesNotCommitted(t *testing.T) {
+	cb := cachebox.New(cachebox.Config{KeyStrategy: cachebox.KeyStrategyExactWithHost})
+	t.Cleanup(func() { cb.Stop() })
+
+	ctxRule := func() evaluator.StaticRule {
+		r := cacheBoxRule("cache-miss.test", evaluator.CacheBoxReplay)
+		r.Decision.CacheBoxContext = &cachebox.CacheBoxContext{
+			ExperimentID: "exp-1", PhaseID: "phase-1", KeyStrategy: "exact_with_host",
+		}
+		return r
+	}
+
+	// Nothing installed at all yet.
+	before := cachebox.MissStats()
+	i := New(evaluator.NewStaticEvaluator(ctxRule()), trace.Noop(), WithCacheBox(cb))
+	client := &http.Client{Transport: i.EgressTransport(failRoundTripper{t: t})}
+	resp, err := client.Get("http://cache-miss.test/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	after := cachebox.MissStats()
+	if after.NotCommitted != before.NotCommitted+1 {
+		t.Fatalf("expected NotCommitted to increment with nothing installed: before=%d after=%d", before.NotCommitted, after.NotCommitted)
+	}
+
+	// A DIFFERENT phase's set is installed -- still not_committed for this rule.
+	cb.InstallReplaySet(cachebox.PhaseKey("exp-9", "phase-9"), map[string]*cachebox.Entry{
+		"other-key": {Key: "other-key", StatusCode: 200},
+	})
+	resp2, err := client.Get("http://cache-miss.test/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	after2 := cachebox.MissStats()
+	if after2.NotCommitted != after.NotCommitted+1 {
+		t.Fatalf("expected NotCommitted to increment again for a mismatched phase: before=%d after=%d", after.NotCommitted, after2.NotCommitted)
+	}
+
+	// The RIGHT phase is installed, but the requested key isn't in it --
+	// now it's a plain key_absent, not not_committed.
+	cb.InstallReplaySet(cachebox.PhaseKey("exp-1", "phase-1"), map[string]*cachebox.Entry{
+		"some-other-key": {Key: "some-other-key", StatusCode: 200},
+	})
+	beforeKeyAbsent := cachebox.MissStats()
+	resp3, err := client.Get("http://cache-miss.test/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp3.Body.Close()
+	afterKeyAbsent := cachebox.MissStats()
+	if afterKeyAbsent.KeyAbsent != beforeKeyAbsent.KeyAbsent+1 {
+		t.Fatalf("expected KeyAbsent to increment once the right phase is installed: before=%d after=%d", beforeKeyAbsent.KeyAbsent, afterKeyAbsent.KeyAbsent)
+	}
+	if afterKeyAbsent.NotCommitted != after2.NotCommitted {
+		t.Fatalf("NotCommitted must not increment once the right phase is installed: got %d, want %d", afterKeyAbsent.NotCommitted, after2.NotCommitted)
+	}
+}

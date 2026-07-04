@@ -106,7 +106,7 @@ func (i *Interceptor) handleCacheBox(r *http.Request, base http.RoundTripper, re
 		if entry, ok := cb.Lookup(key); ok {
 			return cacheBoxServe(entry, key, decision.CacheBox, 0, span), nil
 		}
-		return cacheBoxMissResponse(key, decision.CacheBox, cachebox.MissReasonKeyAbsent, cbCtx, span), nil
+		return cacheBoxMissResponse(key, decision.CacheBox, replayMissReason(cb, cbCtx), cbCtx, span), nil
 
 	case evaluator.CacheBoxReplayDelay:
 		if entry, ok := cb.Lookup(key); ok {
@@ -120,7 +120,7 @@ func (i *Interceptor) handleCacheBox(r *http.Request, base http.RoundTripper, re
 			}
 			return cacheBoxServe(entry, key, decision.CacheBox, delay, span), nil
 		}
-		return cacheBoxMissResponse(key, decision.CacheBox, cachebox.MissReasonKeyAbsent, cbCtx, span), nil
+		return cacheBoxMissResponse(key, decision.CacheBox, replayMissReason(cb, cbCtx), cbCtx, span), nil
 	}
 
 	// Unknown/unrecognized action -- INV-1 requires every non-passthrough
@@ -132,6 +132,22 @@ func (i *Interceptor) handleCacheBox(r *http.Request, base http.RoundTripper, re
 // that must never reach the live downstream on a miss (INV-1).
 func isReplayAction(a evaluator.CacheBoxAction) bool {
 	return a == evaluator.CacheBoxReplay || a == evaluator.CacheBoxReplayDelay
+}
+
+// replayMissReason distinguishes a lookup miss within the correctly
+// installed phase (key_absent) from a miss because the installed
+// ReplaySet doesn't even belong to the matched rule's (experiment_id,
+// phase_id) -- nothing preloaded yet, or a different phase's set is still
+// live (not_committed, ATRO-6 defense in depth: correct preload ordering
+// on the control-plane side should prevent this in practice).
+func replayMissReason(cb *cachebox.CacheBox, cbCtx *cachebox.CacheBoxContext) string {
+	if cbCtx != nil {
+		expected := cachebox.PhaseKey(cbCtx.ExperimentID, cbCtx.PhaseID)
+		if cb.ReplaySetPhaseKey() != expected {
+			return cachebox.MissReasonNotCommitted
+		}
+	}
+	return cachebox.MissReasonKeyAbsent
 }
 
 // cacheBoxMissResponse builds the synthetic response for a fail-closed
