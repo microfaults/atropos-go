@@ -92,7 +92,9 @@ func New(cfg Config) *CacheBox {
 		cfg.Store = NewRecordBuffer(RecordBufferConfig{MaxEntries: 10000})
 	}
 	if cfg.KeyStrategy == "" {
-		cfg.KeyStrategy = KeyStrategyExact
+		// canonical_v2 is the authoritative default (design doc Q3); the
+		// legacy strategies remain available for explicit opt-in/compat.
+		cfg.KeyStrategy = KeyStrategyCanonicalV2
 	}
 	if cfg.Delay == nil {
 		cfg.Delay = ObservedDelaySource{}

@@ -1,6 +1,9 @@
 package cachebox
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"hash/fnv"
 	"net/http"
 	"strconv"
@@ -48,11 +51,15 @@ const (
 // key derivation. The coordinator uses this to decide whether to buffer
 // the body on the hot path.
 func (k KeyStrategy) NeedsBody() bool {
-	return k == KeyStrategyExactWithBody
+	return k == KeyStrategyExactWithBody || k == KeyStrategyCanonicalV2
 }
 
 // KeyFuncFor returns the built-in KeyFunc for the named strategy. Unknown
-// strategies fall back to KeyStrategyExact.
+// strategies fall back to KeyStrategyExact. This is the construction-time
+// path (CacheBox.Config.KeyStrategy) -- it has no per-rule key_headers to
+// work with, so its canonical_v2 keyer uses the default header allowlist
+// only. Derive is the per-request path used once a rule's CacheBoxContext
+// (and its key_headers) is available.
 func KeyFuncFor(s KeyStrategy) KeyFunc {
 	switch s {
 	case KeyStrategyExact:
@@ -61,9 +68,27 @@ func KeyFuncFor(s KeyStrategy) KeyFunc {
 		return exactWithHostKey
 	case KeyStrategyExactWithBody:
 		return exactWithBodyKey
+	case KeyStrategyCanonicalV2:
+		return func(r *http.Request, body []byte) string {
+			return canonicalV2Key(r, body, nil)
+		}
 	default:
 		return exactKey
 	}
+}
+
+// Derive resolves a KeyFunc for strategy -- honoring keyHeaders for
+// canonical_v2 -- and applies it to the request. This is the per-request
+// path used once a rule's CacheBoxContext is available (design doc Q3):
+// the matched rule's context is authoritative end-to-end, so its
+// KeyStrategy/KeyHeaders take precedence over the CacheBox's
+// construction-time default (KeyFuncFor), which remains only as the
+// fallback for when no context is present.
+func Derive(strategy KeyStrategy, keyHeaders []string, r *http.Request, body []byte) string {
+	if strategy == KeyStrategyCanonicalV2 {
+		return canonicalV2Key(r, body, keyHeaders)
+	}
+	return KeyFuncFor(strategy)(r, body)
 }
 
 func exactKey(r *http.Request, _ []byte) string {
@@ -112,6 +137,87 @@ func exactWithBodyKey(r *http.Request, body []byte) string {
 	b.WriteByte('|')
 	b.WriteString(hash)
 	return b.String()
+}
+
+// defaultKeyHeaderAllowlist is the base set of headers canonical_v2 folds
+// into the key fingerprint, before any per-rule key_headers additions
+// (design doc Q3). Everything else (Date, Authorization, Cookie,
+// User-Agent, traceparent, X-Request-Id, Content-Length, ...) is excluded
+// by construction: it is simply never in this set.
+var defaultKeyHeaderAllowlist = []string{"accept", "content-type", "accept-encoding", "accept-language"}
+
+// canonicalV2Key implements wire spec §W7: key = "v2:" + hex(SHA-256(frame)),
+// frame = length-prefixed concatenation of (in order) "v2", uppercased
+// method, lowercased URL host, raw URL path, canonical query, header
+// fingerprint (§Q3, extra headers from keyHeaders), and SHA-256(body) (an
+// empty component when body is empty).
+func canonicalV2Key(r *http.Request, body []byte, keyHeaders []string) string {
+	var bodyComponent []byte
+	if len(body) > 0 {
+		sum := sha256.Sum256(body)
+		bodyComponent = sum[:]
+	}
+
+	frame := canonicalV2Frame(
+		[]byte("v2"),
+		[]byte(strings.ToUpper(r.Method)),
+		[]byte(strings.ToLower(r.URL.Host)),
+		[]byte(r.URL.Path),
+		[]byte(normalizeQuery(r.URL.RawQuery)),
+		[]byte(headerFingerprint(r.Header, keyHeaders)),
+		bodyComponent,
+	)
+	digest := sha256.Sum256(frame)
+	return "v2:" + hex.EncodeToString(digest[:])
+}
+
+// canonicalV2Frame builds the length-prefixed frame from ordered
+// components: uvarint(len(c)) || c for each c, concatenated. Length-
+// prefixing (rather than a joining delimiter) is what makes ("ab","c") and
+// ("a","bc") produce different frames -- a delimiter can't distinguish a
+// component containing it from a component boundary.
+func canonicalV2Frame(components ...[]byte) []byte {
+	var buf []byte
+	for _, c := range components {
+		buf = binary.AppendUvarint(buf, uint64(len(c)))
+		buf = append(buf, c...)
+	}
+	return buf
+}
+
+// headerFingerprint builds the §Q3 header-fingerprint component: for each
+// *present* header in (defaultKeyHeaderAllowlist ∪ extra), in sorted
+// lowercase-name order, the line "name:" + values joined by ",", lines
+// joined by "\n". Absent headers contribute nothing -- absence is not the
+// same as an empty value, so there is no placeholder line for them.
+func headerFingerprint(h http.Header, extra []string) string {
+	seen := make(map[string]bool, len(defaultKeyHeaderAllowlist)+len(extra))
+	names := make([]string, 0, len(defaultKeyHeaderAllowlist)+len(extra))
+	for _, n := range defaultKeyHeaderAllowlist {
+		n = strings.ToLower(n)
+		if !seen[n] {
+			seen[n] = true
+			names = append(names, n)
+		}
+	}
+	for _, n := range extra {
+		n = strings.ToLower(n)
+		if !seen[n] {
+			seen[n] = true
+			names = append(names, n)
+		}
+	}
+	sortStrings(names)
+
+	var lines []string
+	for _, name := range names {
+		vals := h.Values(name)
+		if len(vals) == 0 {
+			continue
+		}
+		lines = append(lines, name+":"+strings.Join(vals, ","))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // writeQueryPart appends "?normalized" to b if raw is non-empty.

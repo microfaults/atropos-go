@@ -13,18 +13,9 @@ import (
 //   - the freeze command body (DelayRequest.Context)
 //   - a preload begin request (PreloadBeginRequest, flattened)
 //
-// ExperimentID, PhaseID, KeyStrategy, and StrategyVersion are always
-// present when Context itself is present -- an empty value in a populated
-// Context is a control-plane bug, not an omitted field. KeyHeaders and
-// MissStatus are true optionals (zero value = "use defaults").
-type CacheBoxContext struct {
-	ExperimentID    string   `json:"experiment_id"`
-	PhaseID         string   `json:"phase_id"`
-	KeyStrategy     string   `json:"key_strategy"`
-	StrategyVersion int      `json:"strategy_version"`
-	KeyHeaders      []string `json:"key_headers,omitempty"`
-	MissStatus      int      `json:"miss_status,omitempty"`
-}
+// The type itself lives in internal/cachebox (see that package for why);
+// this is a transparent alias so the wire shape here is unchanged.
+type CacheBoxContext = cachebox.CacheBoxContext
 
 // DrainReport (wire spec §W3) is the SDK's POST body to
 // /api/v1/sdk/cachebox/drain at recording-phase end, confirming every

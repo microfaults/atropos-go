@@ -490,3 +490,76 @@ func TestHandleCacheBox_FallsThroughWithoutRule(t *testing.T) {
 	}
 	_ = u
 }
+
+// TestInterceptor_UsesRuleStrategy pins the ATRO-3 done-criteria: the
+// matched rule's CacheBoxContext.KeyStrategy is authoritative end-to-end,
+// overriding the CacheBox's construction-time default in both directions.
+func TestInterceptor_UsesRuleStrategy(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, "body")
+	}))
+	defer srv.Close()
+	u, _ := url.Parse(srv.URL)
+
+	// Construction-time default is "exact" -- if the rule's context isn't
+	// honored, the derived key would be "exact:"-prefixed instead of "v2:".
+	cb := cachebox.New(cachebox.Config{KeyStrategy: cachebox.KeyStrategyExact})
+	t.Cleanup(func() { cb.Stop() })
+
+	v2Rule := evaluator.StaticRule{
+		Name:   "v2-rule",
+		Point:  evaluator.Egress,
+		Labels: map[string]string{trace.AttrHTTPHost: u.Host},
+		Decision: evaluator.Decision{
+			Reason:   "test",
+			CacheBox: evaluator.CacheBoxPassthrough,
+			CacheBoxContext: &cachebox.CacheBoxContext{
+				ExperimentID: "exp-1", PhaseID: "phase-1",
+				KeyStrategy: "canonical_v2", StrategyVersion: 2,
+			},
+		},
+	}
+	iV2 := New(evaluator.NewStaticEvaluator(v2Rule), trace.Noop(), WithCacheBox(cb))
+	clientV2 := &http.Client{Transport: iV2.EgressTransport(http.DefaultTransport)}
+	respV2, err := clientV2.Get(srv.URL + "/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, respV2.Body)
+	respV2.Body.Close()
+	if key := respV2.Header.Get("X-Atropos-Cache-Key"); !strings.HasPrefix(key, "v2:") {
+		t.Fatalf("expected canonical_v2-shaped key from rule context, got %q", key)
+	}
+
+	// Flip it: a CacheBox whose construction-time default is canonical_v2
+	// (the package default), paired with a rule whose context pins "exact"
+	// instead. If the rule wins in both directions, this proves the context
+	// is authoritative rather than just "used when the default agrees."
+	cbV2Default := cachebox.New(cachebox.Config{}) // default is canonical_v2
+	t.Cleanup(func() { cbV2Default.Stop() })
+
+	exactRule := evaluator.StaticRule{
+		Name:   "exact-rule",
+		Point:  evaluator.Egress,
+		Labels: map[string]string{trace.AttrHTTPHost: u.Host},
+		Decision: evaluator.Decision{
+			Reason:   "test",
+			CacheBox: evaluator.CacheBoxPassthrough,
+			CacheBoxContext: &cachebox.CacheBoxContext{
+				ExperimentID: "exp-1", PhaseID: "phase-1",
+				KeyStrategy: "exact", StrategyVersion: 1,
+			},
+		},
+	}
+	iExact := New(evaluator.NewStaticEvaluator(exactRule), trace.Noop(), WithCacheBox(cbV2Default))
+	clientExact := &http.Client{Transport: iExact.EgressTransport(http.DefaultTransport)}
+	respExact, err := clientExact.Get(srv.URL + "/y")
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, respExact.Body)
+	respExact.Body.Close()
+	if key := respExact.Header.Get("X-Atropos-Cache-Key"); !strings.HasPrefix(key, "exact:") {
+		t.Fatalf("expected exact-shaped key from rule context despite a canonical_v2 CacheBox default, got %q", key)
+	}
+}

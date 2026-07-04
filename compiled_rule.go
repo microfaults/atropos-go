@@ -174,6 +174,7 @@ func DecodeCompiledRule(cr CompiledRule, opts ...DecodeOption) (StaticRule, erro
 	if cr.CacheBox != nil {
 		sr.Decision.CacheBox = parseCacheBoxMode(cr.CacheBox.Mode)
 		sr.Decision.CacheBoxKeyStrategy = cr.CacheBox.KeyStrategy
+		sr.Decision.CacheBoxContext = cr.CacheBox.Context
 	}
 
 	return sr, nil

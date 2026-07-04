@@ -56,11 +56,23 @@ func (i *Interceptor) handleCacheBox(r *http.Request, base http.RoundTripper, re
 	// cache-box span as parent.
 	r = r.WithContext(ctx)
 
+	// The matched rule's CacheBoxContext, when present, is authoritative
+	// end-to-end (design doc Q3): it overrides both the key strategy and
+	// the miss status code the CacheBox was constructed with. Absence
+	// (legacy rules, or the freeze/admin paths that don't carry one yet)
+	// falls back to the CacheBox's construction-time behavior.
+	cbCtx := decision.CacheBoxContext
+
+	needsBody := cb.NeedsRequestBody()
+	if cbCtx != nil {
+		needsBody = cachebox.KeyStrategy(cbCtx.KeyStrategy).NeedsBody()
+	}
+
 	// Capture the request body if the key strategy needs it. For strategies
 	// that don't need the body (the default), this is a no-op.
 	var reqBody []byte
 	var bodyBufferErr error
-	if cb.NeedsRequestBody() {
+	if needsBody {
 		captured, err := cachebox.BufferRequestBody(r, cb.MaxBodyBytes())
 		if err != nil {
 			span.AddEvent(trace.EventCacheBoxError,
@@ -70,7 +82,12 @@ func (i *Interceptor) handleCacheBox(r *http.Request, base http.RoundTripper, re
 		reqBody = captured
 	}
 
-	key := cb.DeriveKey(r, reqBody)
+	var key string
+	if cbCtx != nil {
+		key = cachebox.Derive(cachebox.KeyStrategy(cbCtx.KeyStrategy), cbCtx.KeyHeaders, r, reqBody)
+	} else {
+		key = cb.DeriveKey(r, reqBody)
+	}
 	span.SetAttributes(attribute.String(trace.AttrCacheBoxKey, key))
 
 	// A failed body capture under a replay-family action means we cannot
@@ -78,7 +95,7 @@ func (i *Interceptor) handleCacheBox(r *http.Request, base http.RoundTripper, re
 	// had). Falling back to a live call would violate INV-1, so fail closed
 	// immediately rather than entering the switch below.
 	if bodyBufferErr != nil && isReplayAction(decision.CacheBox) {
-		return cacheBoxMissResponse(key, decision.CacheBox, cachebox.MissReasonBodyBufferFailed, span), nil
+		return cacheBoxMissResponse(key, decision.CacheBox, cachebox.MissReasonBodyBufferFailed, cbCtx, span), nil
 	}
 
 	switch decision.CacheBox {
@@ -89,7 +106,7 @@ func (i *Interceptor) handleCacheBox(r *http.Request, base http.RoundTripper, re
 		if entry, ok := cb.Lookup(key); ok {
 			return cacheBoxServe(entry, key, decision.CacheBox, 0, span), nil
 		}
-		return cacheBoxMissResponse(key, decision.CacheBox, cachebox.MissReasonKeyAbsent, span), nil
+		return cacheBoxMissResponse(key, decision.CacheBox, cachebox.MissReasonKeyAbsent, cbCtx, span), nil
 
 	case evaluator.CacheBoxReplayDelay:
 		if entry, ok := cb.Lookup(key); ok {
@@ -103,12 +120,12 @@ func (i *Interceptor) handleCacheBox(r *http.Request, base http.RoundTripper, re
 			}
 			return cacheBoxServe(entry, key, decision.CacheBox, delay, span), nil
 		}
-		return cacheBoxMissResponse(key, decision.CacheBox, cachebox.MissReasonKeyAbsent, span), nil
+		return cacheBoxMissResponse(key, decision.CacheBox, cachebox.MissReasonKeyAbsent, cbCtx, span), nil
 	}
 
 	// Unknown/unrecognized action -- INV-1 requires every non-passthrough
 	// path to fail closed rather than silently reaching the live downstream.
-	return cacheBoxMissResponse(key, decision.CacheBox, cachebox.MissReasonKeyAbsent, span), nil
+	return cacheBoxMissResponse(key, decision.CacheBox, cachebox.MissReasonKeyAbsent, cbCtx, span), nil
 }
 
 // isReplayAction reports whether action is one of the replay-family actions
@@ -122,18 +139,27 @@ func isReplayAction(a evaluator.CacheBoxAction) bool {
 // downstream (no base.RoundTrip) and is never written to the store (no
 // cb.Record). reason is one of the cachebox.MissReason* constants; it is
 // surfaced as a span event and, temporarily (pending ATRO-7's fidelity
-// registry), as a package-local counter.
-func cacheBoxMissResponse(key string, action evaluator.CacheBoxAction, reason string, span trace.Span) *http.Response {
+// registry), as a package-local counter. cbCtx is the matched rule's
+// CacheBoxContext, if any: its MissStatus overrides the default 503, and
+// its ExperimentID/PhaseID are echoed in the response body. A nil cbCtx
+// (legacy rule, or the freeze/admin paths) uses the plain default.
+func cacheBoxMissResponse(key string, action evaluator.CacheBoxAction, reason string, cbCtx *cachebox.CacheBoxContext, span trace.Span) *http.Response {
 	cachebox.RecordMiss(reason)
 	span.AddEvent(trace.EventCacheBoxMissFailClosed,
 		attribute.String(trace.AttrCacheBoxKey, key),
 		attribute.String(trace.AttrCacheBoxMissReason, reason),
 	)
 
-	body, _ := json.Marshal(cacheBoxMissBody{
-		Error: "cachebox_miss",
-		Key:   key,
-	})
+	status := defaultMissStatus
+	miss := cacheBoxMissBody{Error: "cachebox_miss", Key: key}
+	if cbCtx != nil {
+		if cbCtx.MissStatus != 0 {
+			status = cbCtx.MissStatus
+		}
+		miss.ExperimentID = cbCtx.ExperimentID
+		miss.PhaseID = cbCtx.PhaseID
+	}
+	body, _ := json.Marshal(miss)
 
 	header := http.Header{}
 	header.Set("Content-Type", "application/problem+json")
@@ -142,8 +168,8 @@ func cacheBoxMissResponse(key string, action evaluator.CacheBoxAction, reason st
 	header.Set(headerCacheMode, action.String())
 
 	return &http.Response{
-		Status:        http.StatusText(defaultMissStatus),
-		StatusCode:    defaultMissStatus,
+		Status:        http.StatusText(status),
+		StatusCode:    status,
 		Proto:         "HTTP/1.1",
 		ProtoMajor:    1,
 		ProtoMinor:    1,
@@ -154,8 +180,8 @@ func cacheBoxMissResponse(key string, action evaluator.CacheBoxAction, reason st
 }
 
 // cacheBoxMissBody is the application/problem+json body for a fail-closed
-// miss. ExperimentID/PhaseID will be populated once CacheBoxContext is
-// plumbed through the matched rule; until then they are omitted.
+// miss. ExperimentID/PhaseID are populated when the matched rule carries a
+// CacheBoxContext; omitted otherwise.
 type cacheBoxMissBody struct {
 	Error        string `json:"error"`
 	Key          string `json:"key"`

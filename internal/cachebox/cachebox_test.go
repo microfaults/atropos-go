@@ -450,8 +450,11 @@ func TestNewDefaults(t *testing.T) {
 	if cb.MaxBodyBytes() != DefaultMaxBodyBytes {
 		t.Fatalf("default body cap = %d, want %d", cb.MaxBodyBytes(), DefaultMaxBodyBytes)
 	}
-	if cb.NeedsRequestBody() {
-		t.Fatal("default strategy should not need body")
+	// canonical_v2 is the default strategy (design doc Q3) and it folds the
+	// body into the key, so the default now needs it -- unlike the old
+	// "exact" default.
+	if !cb.NeedsRequestBody() {
+		t.Fatal("default strategy (canonical_v2) should need body")
 	}
 	if cb.OTelCaptureLimit() != 0 {
 		t.Fatal("otel capture should be disabled by default")
