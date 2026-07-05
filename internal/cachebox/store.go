@@ -29,6 +29,12 @@ import (
 // time, never from ambient/registration-time state. Entries installed via
 // InstallReplaySet (the preload path) don't need them populated -- the
 // owning phase is tracked at the ReplaySet level instead (PhaseKey).
+//
+// KeyStrategy/StrategyVersion record which keyer produced Key (INV-2).
+// They travel with the entry onto the wire so manteion's preload
+// preflight can verify record-time and replay-time strategies agree --
+// an empty KeyStrategy means the entry predates provenance stamping and
+// is exempt from the preflight.
 type Entry struct {
 	Key             string
 	StatusCode      int
@@ -39,6 +45,8 @@ type Entry struct {
 	HitCount        atomic.Int64
 	ExperimentID    string
 	PhaseID         string
+	KeyStrategy     string
+	StrategyVersion int
 }
 
 // Size returns an approximate byte count for the entry, used by the store

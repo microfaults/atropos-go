@@ -51,6 +51,8 @@ func EntryToWire(e *Entry) WireEntry {
 		Body:              e.Body,
 		ObservedLatencyUs: e.ObservedLatency.Microseconds(),
 		RecordedAt:        e.RecordedAt,
+		KeyStrategy:       e.KeyStrategy,
+		StrategyVersion:   e.StrategyVersion,
 	}
 }
 
@@ -68,5 +70,7 @@ func WireToEntry(w *WireEntry) *Entry {
 		Body:            w.Body,
 		ObservedLatency: time.Duration(w.ObservedLatencyUs) * time.Microsecond,
 		RecordedAt:      w.RecordedAt,
+		KeyStrategy:     w.KeyStrategy,
+		StrategyVersion: w.StrategyVersion,
 	}
 }

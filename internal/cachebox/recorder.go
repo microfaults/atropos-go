@@ -11,16 +11,29 @@ import (
 // these on the passthrough path and hands it to the recorder via the
 // Recorder.Record method.
 //
-// Request is kept so the recorder can derive the key off the hot path.
-// RequestBody is only set when the key strategy needs it (exact_with_body).
-// Neither the Request nor the Body is cloned by the recorder; callers must
-// ensure the values are safe to read from the drain goroutine.
+// Key, when set, is the authoritative cache key: the one the interceptor
+// derived from the matched rule's CacheBoxContext (strategy + key headers)
+// on the hot path -- the same derivation a replay-family decision will use
+// at lookup time (INV-2: record-time and replay-time keys must be
+// provably identical, so the replay-side derivation is captured rather
+// than re-derived). KeyStrategy/StrategyVersion name that derivation for
+// wire provenance. An empty Key falls back to the recorder's
+// construction-time keyFn (legacy callers without a rule context).
+//
+// Request is kept so the fallback path can derive the key off the hot
+// path. RequestBody is only set when the key strategy needs it
+// (exact_with_body, canonical_v2). Neither the Request nor the Body is
+// cloned by the recorder; callers must ensure the values are safe to read
+// from the drain goroutine.
 //
 // ExperimentID/PhaseID are the matched rule's CacheBoxContext provenance
 // (design doc Q5/INV-5). The interceptor only builds a CacheRecord when
 // both are non-empty (see cacheBoxPassthrough) -- there is no ambient
 // fallback for a missing pair.
 type CacheRecord struct {
+	Key             string
+	KeyStrategy     string
+	StrategyVersion int
 	Request         *http.Request
 	RequestBody     []byte
 	StatusCode      int
@@ -139,7 +152,14 @@ func (r *Recorder) drain() {
 			close(rec.flushBarrier)
 			continue
 		}
-		key := r.keyFn(rec.Request, rec.RequestBody)
+		// The record's own Key (the rule-context derivation captured on the
+		// hot path) is authoritative; keyFn is only the fallback for records
+		// without one. Re-deriving here with a different strategy than the
+		// replay side would silently 100%-miss under freeze (INV-2).
+		key := rec.Key
+		if key == "" {
+			key = r.keyFn(rec.Request, rec.RequestBody)
+		}
 		var header http.Header
 		if rec.ResponseHeader != nil {
 			header = rec.ResponseHeader.Clone()
@@ -153,6 +173,8 @@ func (r *Recorder) drain() {
 			RecordedAt:      rec.Timestamp,
 			ExperimentID:    rec.ExperimentID,
 			PhaseID:         rec.PhaseID,
+			KeyStrategy:     rec.KeyStrategy,
+			StrategyVersion: rec.StrategyVersion,
 		}
 		r.store.Put(key, entry)
 		r.recorded.Add(1)

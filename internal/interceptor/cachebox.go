@@ -284,7 +284,15 @@ func (i *Interceptor) cacheBoxPassthrough(ctx context.Context, r *http.Request, 
 		// drain goroutine has its own snapshot and the caller can freely
 		// mutate resp.Header (e.g. to add the X-Atropos-Cache-* headers
 		// below) without racing the recorder.
+		//
+		// The record carries the key derived above from the rule's own
+		// context (INV-2): the recorder must store under the exact key a
+		// replay-family decision for this rule will look up, so it must not
+		// re-derive with its construction-time strategy.
 		cb.Record(cachebox.CacheRecord{
+			Key:             key,
+			KeyStrategy:     cbCtx.KeyStrategy,
+			StrategyVersion: cbCtx.StrategyVersion,
 			Request:         r,
 			RequestBody:     reqBody,
 			StatusCode:      resp.StatusCode,
