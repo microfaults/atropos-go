@@ -26,9 +26,19 @@ type CachePushConfig struct {
 
 	// Fidelity, if set, receives per-(experiment_id, phase_id)
 	// record_pushed/record_dropped/push_rejected_terminal counts (ATRO-7,
-	// design doc Q6). Pass the same registry the CacheBox this client
-	// pushes for was built with (CacheBox.Fidelity()) so both sides of the
-	// record/replay/push pipeline land in one shared per-pair view.
+	// design doc Q6). It MUST be the same registry the CacheBox this
+	// client pushes for uses -- the drain report snapshots ONE registry,
+	// so a split leaves the report's push-side counts at zero.
+	//
+	// The construction order is circular for external callers (the
+	// CacheBox needs this client's PushFunc; this client needs the
+	// CacheBox's registry, whose internal type external modules cannot
+	// name). Two ways out:
+	//   - in-module: build a registry first and pass it to both this
+	//     config and cachebox.Config.Fidelity;
+	//   - external hosts: leave this nil, build the CacheBox with
+	//     PushFunc(), then call BindFidelity(cb.Fidelity()) BEFORE any
+	//     traffic flows.
 	Fidelity *cachebox.FidelityRegistry
 }
 
@@ -83,6 +93,12 @@ type CachePushClient struct {
 	timer        *time.Timer
 	stopped      bool
 
+	// inflight tracks posts launched asynchronously by flushLocked so that
+	// Flush/Stop can wait for them: a drain report built while a batch is
+	// still mid-retry would under-count pushed entries and race manteion's
+	// received count (INV-3's per-instance identity).
+	inflight sync.WaitGroup
+
 	pushed               atomic.Int64
 	dropped              atomic.Int64
 	pushRejectedTerminal atomic.Int64
@@ -131,6 +147,26 @@ func (c *CachePushClient) PushFunc() cachebox.PushFunc {
 	return func(key string, entry *cachebox.Entry) {
 		c.add(entry)
 	}
+}
+
+// BindFidelity points this client's per-pair counters at reg -- pass
+// CacheBox.Fidelity() so push-side and record-side counts land in the one
+// registry the drain report snapshots. This is the external-host half of
+// the circular construction described on CachePushConfig.Fidelity; it must
+// be called before any traffic flows (counts recorded before the bind are
+// lost to the report).
+func (c *CachePushClient) BindFidelity(reg *cachebox.FidelityRegistry) {
+	c.mu.Lock()
+	c.fidelity = reg
+	c.mu.Unlock()
+}
+
+// fid returns the current fidelity registry under the lock; post() snapshots
+// it once so BindFidelity cannot race the counter calls.
+func (c *CachePushClient) fid() *cachebox.FidelityRegistry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.fidelity
 }
 
 // Stats returns a snapshot of push counters.
@@ -196,32 +232,46 @@ func (c *CachePushClient) flushLocked() {
 	c.batchSeq++
 	seq := c.batchSeq
 	c.batch = make([]cachebox.WireEntry, 0, c.maxBatch)
-	go c.post(entries, expID, phaseID, seq)
+	c.inflight.Add(1)
+	go func() {
+		defer c.inflight.Done()
+		c.post(entries, expID, phaseID, seq)
+	}()
 }
 
 // Flush immediately sends whatever is currently batched, without waiting
-// for MaxBatch or MaxWait, and blocks until that push attempt (including
-// retries) completes. Unlike Stop, it does not prevent further adds. Used
-// at recording-phase end (ATRO-5, design doc Q2) so a drain report can be
-// built only after every batched entry has been attempted.
+// for MaxBatch or MaxWait, and blocks until that push attempt AND every
+// previously-launched asynchronous batch post (including retries) has
+// completed. Unlike Stop, it does not prevent further adds. Used at
+// recording-phase end (ATRO-5, design doc Q2) so a drain report can be
+// built only after every entry handed to this client has been attempted
+// -- a report that ignored in-flight batches would under-count pushed.
 func (c *CachePushClient) Flush() {
 	c.mu.Lock()
-	if c.stopped || len(c.batch) == 0 {
+	if c.stopped {
 		c.mu.Unlock()
-		return
+		return // Stop already flushed and waited
 	}
-	if c.timer != nil {
-		c.timer.Stop()
-		c.timer = nil
+	var entries []cachebox.WireEntry
+	var expID, phaseID string
+	var seq int
+	if len(c.batch) > 0 {
+		if c.timer != nil {
+			c.timer.Stop()
+			c.timer = nil
+		}
+		entries = c.batch
+		expID, phaseID = c.batchExpID, c.batchPhaseID
+		c.batchSeq++
+		seq = c.batchSeq
+		c.batch = make([]cachebox.WireEntry, 0, c.maxBatch)
 	}
-	entries := c.batch
-	expID, phaseID := c.batchExpID, c.batchPhaseID
-	c.batchSeq++
-	seq := c.batchSeq
-	c.batch = make([]cachebox.WireEntry, 0, c.maxBatch)
 	c.mu.Unlock()
 
-	c.post(entries, expID, phaseID, seq) // synchronous, not `go` -- caller waits
+	if len(entries) > 0 {
+		c.post(entries, expID, phaseID, seq) // synchronous -- caller waits
+	}
+	c.inflight.Wait()
 }
 
 // ingestEnvelope is the POST body for /api/v1/cache/ingest (wire spec §W2).
@@ -245,6 +295,7 @@ type ingestEnvelope struct {
 // Flush/Stop (synchronous, caller waits).
 func (c *CachePushClient) post(entries []cachebox.WireEntry, experimentID, phaseID string, batchSeq int) {
 	pair := cachebox.PhasePair{ExperimentID: experimentID, PhaseID: phaseID}
+	fidelity := c.fid() // snapshot once: BindFidelity may not race the unlocked reads below
 	body, err := json.Marshal(ingestEnvelope{
 		Service:      c.service,
 		Instance:     c.instance,
@@ -256,7 +307,7 @@ func (c *CachePushClient) post(entries []cachebox.WireEntry, experimentID, phase
 	if err != nil {
 		c.logger.Warn("cache push marshal error", "error", err)
 		c.dropped.Add(int64(len(entries)))
-		c.fidelity.RecordDropped(pair, int64(len(entries)))
+		fidelity.RecordDropped(pair, int64(len(entries)))
 		return
 	}
 
@@ -268,15 +319,15 @@ func (c *CachePushClient) post(entries []cachebox.WireEntry, experimentID, phase
 				"batch_seq", batchSeq, "experiment_id", experimentID, "phase_id", phaseID)
 			c.pushRejectedTerminal.Add(1)
 			c.dropped.Add(int64(len(entries)))
-			c.fidelity.RecordPushRejectedTerminal(pair, int64(len(entries)))
-			c.fidelity.RecordDropped(pair, int64(len(entries)))
+			fidelity.RecordPushRejectedTerminal(pair, int64(len(entries)))
+			fidelity.RecordDropped(pair, int64(len(entries)))
 			return
 		}
 
 		if doErr == nil && status >= 200 && status < 300 {
 			c.pushed.Add(int64(len(entries)))
 			c.batchesSent.Add(1)
-			c.fidelity.RecordPushed(pair, int64(len(entries)))
+			fidelity.RecordPushed(pair, int64(len(entries)))
 			return
 		}
 
@@ -293,7 +344,7 @@ func (c *CachePushClient) post(entries []cachebox.WireEntry, experimentID, phase
 	}
 
 	c.dropped.Add(int64(len(entries)))
-	c.fidelity.RecordDropped(pair, int64(len(entries)))
+	fidelity.RecordDropped(pair, int64(len(entries)))
 }
 
 // attempt makes one POST attempt and returns (status, error). status is
@@ -345,17 +396,23 @@ func (c *CachePushClient) Stop() {
 	if len(entries) > 0 {
 		c.post(entries, expID, phaseID, seq) // synchronous — blocks until POST completes or times out
 	}
+	c.inflight.Wait()
 }
 
-// SendDrainReport flushes any pending batch, then builds and POSTs a W3
-// drain report for (experimentID, phaseID), retrying up to
-// maxPushAttempts times on transport errors and 5xx. cb supplies
-// entries-recorded and this pair's collision counts (via its fidelity
-// registry, design doc Q2/Q6); this client supplies the push-side counts.
-// Called when a rule-version change removes the recording context for
-// this pair (ATRO-5(c)) -- detecting that transition is the caller's job
-// (see CacheDrainTracker).
+// SendDrainReport settles the full record pipeline for (experimentID,
+// phaseID) and POSTs a W3 drain report, retrying up to maxPushAttempts
+// times on transport errors and 5xx. Settling order matters: first the
+// recorder's queue (so every accepted record reaches this client), then
+// this client's pending batch and every in-flight post (so pushed/dropped
+// are final). Only then is the pair's fidelity snapshot taken -- the
+// report's counts are per-(experiment, phase), NOT process-lifetime; a
+// second recording phase in the same process must not inherit the first
+// phase's totals, and manteion's drain gate compares them against its
+// per-pair received count (INV-3). Called when a rule-version change
+// removes the recording context for this pair (ATRO-5(c)) -- detecting
+// that transition is the caller's job (see CacheDrainTracker).
 func (c *CachePushClient) SendDrainReport(experimentID, phaseID string, cb *CacheBox) DrainReportResponse {
+	cb.FlushRecording()
 	c.Flush()
 
 	pair := cachebox.PhasePair{ExperimentID: experimentID, PhaseID: phaseID}
@@ -365,9 +422,9 @@ func (c *CachePushClient) SendDrainReport(experimentID, phaseID string, cb *Cach
 		PhaseID:                phaseID,
 		Service:                c.service,
 		InstanceID:             c.instance,
-		EntriesRecorded:        cb.RecorderStats().Recorded,
-		EntriesPushed:          c.pushed.Load(),
-		EntriesDropped:         c.dropped.Load(),
+		EntriesRecorded:        fc.RecordEnqueued,
+		EntriesPushed:          fc.RecordPushed,
+		EntriesDropped:         fc.RecordDropped,
 		BatchesSent:            c.batchesSent.Load(),
 		LastBatchSeq:           int64(c.currentBatchSeq()),
 		KeyCollisionsDivergent: fc.KeyCollisionsDivergent,

@@ -286,6 +286,9 @@ func TestPush_DrainReportCountsMatchEnqueued(t *testing.T) {
 	}))
 	defer server.Close()
 
+	// Canonical external-host wiring: the push client and CacheBox need ONE
+	// shared fidelity registry (the drain report snapshots it), but the
+	// construction is circular -- so bind after building the CacheBox.
 	pusher := atropos.NewCachePushClient(atropos.CachePushConfig{
 		BaseURL: server.URL, Service: "cart", Instance: "pod-1",
 		MaxBatch: 100, MaxWait: 10 * time.Second,
@@ -297,6 +300,7 @@ func TestPush_DrainReportCountsMatchEnqueued(t *testing.T) {
 		Push:        pusher.PushFunc(),
 	})
 	defer cb.Stop()
+	pusher.BindFidelity(cb.Fidelity())
 
 	const n = 25
 	for i := 0; i < n; i++ {
@@ -329,5 +333,76 @@ func TestPush_DrainReportCountsMatchEnqueued(t *testing.T) {
 	if report.EntriesRecorded != report.EntriesPushed+report.EntriesDropped {
 		t.Fatalf("EntriesRecorded (%d) != EntriesPushed (%d) + EntriesDropped (%d)",
 			report.EntriesRecorded, report.EntriesPushed, report.EntriesDropped)
+	}
+}
+
+// TestPush_DrainReportIsPerPhase pins F2: the drain report's counts are
+// scoped to the reported (experiment, phase) -- a second recording phase in
+// the same process must not inherit the first phase's totals, or manteion's
+// drain gate (received == recorded per instance) can never be satisfied for
+// any phase after the first.
+func TestPush_DrainReportIsPerPhase(t *testing.T) {
+	var mu sync.Mutex
+	var drainReports []atropos.DrainReport
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/cache/ingest":
+			w.WriteHeader(http.StatusCreated)
+		case "/api/v1/sdk/cachebox/drain":
+			var report atropos.DrainReport
+			b, _ := io.ReadAll(r.Body)
+			json.Unmarshal(b, &report)
+			mu.Lock()
+			drainReports = append(drainReports, report)
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(atropos.DrainReportResponse{Accepted: true})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	pusher := atropos.NewCachePushClient(atropos.CachePushConfig{
+		BaseURL: server.URL, Service: "cart", Instance: "pod-1",
+		MaxBatch: 100, MaxWait: 10 * time.Second,
+	})
+	defer pusher.Stop()
+	cb := atropos.NewCacheBox(atropos.CacheBoxConfig{
+		KeyStrategy: atropos.KeyStrategyExact,
+		Push:        pusher.PushFunc(),
+	})
+	defer cb.Stop()
+	pusher.BindFidelity(cb.Fidelity())
+
+	record := func(phase string, n int) {
+		for i := 0; i < n; i++ {
+			req, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("http://svc/%s/x%d", phase, i), nil)
+			cb.Record(cachebox.CacheRecord{
+				Request: req, StatusCode: 200, ResponseBody: []byte("v"),
+				Timestamp: time.Now(), ExperimentID: "exp-1", PhaseID: phase,
+			})
+		}
+	}
+
+	record("phase-1", 7)
+	if resp := pusher.SendDrainReport("exp-1", "phase-1", cb); !resp.Accepted {
+		t.Fatal("phase-1 drain report not accepted")
+	}
+	record("phase-2", 3)
+	if resp := pusher.SendDrainReport("exp-1", "phase-2", cb); !resp.Accepted {
+		t.Fatal("phase-2 drain report not accepted")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(drainReports) != 2 {
+		t.Fatalf("expected 2 drain reports, got %d", len(drainReports))
+	}
+	for i, want := range []int64{7, 3} {
+		r := drainReports[i]
+		if r.EntriesRecorded != want || r.EntriesPushed != want || r.EntriesDropped != 0 {
+			t.Fatalf("report %d (%s): recorded=%d pushed=%d dropped=%d, want %d/%d/0 -- counts leaked across phases",
+				i, r.PhaseID, r.EntriesRecorded, r.EntriesPushed, r.EntriesDropped, want, want)
+		}
 	}
 }

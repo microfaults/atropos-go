@@ -21,6 +21,13 @@ type CacheBoxContext = cachebox.CacheBoxContext
 // /api/v1/sdk/cachebox/drain at recording-phase end, confirming every
 // buffered record was flushed (or accounting for what wasn't). Idempotent
 // on (ExperimentID, PhaseID, InstanceID).
+//
+// EntriesRecorded/EntriesPushed/EntriesDropped are scoped to exactly
+// (ExperimentID, PhaseID) -- manteion's drain gate compares them against
+// its per-pair received count, so process-lifetime totals here would
+// make every phase after the first unsatisfiable (INV-3).
+// BatchesSent/LastBatchSeq are client-lifetime diagnostics only; no gate
+// may depend on them.
 type DrainReport struct {
 	ExperimentID           string `json:"experiment_id"`
 	PhaseID                string `json:"phase_id"`

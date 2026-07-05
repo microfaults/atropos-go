@@ -84,13 +84,27 @@ type Config struct {
 	// RecorderBuf is passed through to the built-in recorder if Recorder
 	// is nil. 0 uses the recorder default (1024).
 	RecorderBuf int
+
+	// Fidelity, if non-nil, is adopted as the CacheBox's per-(experiment,
+	// phase) counter registry instead of New creating a fresh one. Supply
+	// this when another component (a CachePushClient) must count into the
+	// same registry and is constructed before the CacheBox -- the drain
+	// report reads record-side and push-side counts from ONE registry, so
+	// splitting them across two silently zeroes the push-side counts.
+	// External modules that cannot name this internal type should instead
+	// construct the CacheBox first and call CachePushClient.BindFidelity
+	// with CacheBox.Fidelity().
+	Fidelity *FidelityRegistry
 }
 
 // New constructs a CacheBox from Config. All unset fields get sensible
 // defaults. The returned *CacheBox owns its recorder's drain goroutine;
 // callers should invoke Stop when the CacheBox is no longer needed.
 func New(cfg Config) *CacheBox {
-	fidelity := NewFidelityRegistry()
+	fidelity := cfg.Fidelity
+	if fidelity == nil {
+		fidelity = NewFidelityRegistry()
+	}
 
 	if cfg.Store == nil {
 		cfg.Store = NewRecordBuffer(RecordBufferConfig{MaxEntries: 10000, Fidelity: fidelity})
