@@ -196,7 +196,8 @@ func (r *FidelityRegistry) RecordPushed(pair PhasePair, n int64) {
 }
 
 // RecordDropped records n entries that never made it to manteion for pair
-// (recorder backpressure, buffer overflow, or exhausted push retries).
+// (recorder backpressure, buffer overflow, exhausted push retries, or an
+// oversize response skipped at capture time).
 func (r *FidelityRegistry) RecordDropped(pair PhasePair, n int64) {
 	if r == nil || pair.isZero() || n == 0 {
 		return

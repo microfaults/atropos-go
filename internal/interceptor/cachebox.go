@@ -103,14 +103,14 @@ func (i *Interceptor) handleCacheBox(r *http.Request, base http.RoundTripper, re
 		return i.cacheBoxPassthrough(ctx, r, base, cb, key, reqBody, cbCtx, span)
 
 	case evaluator.CacheBoxReplay:
-		if entry, ok := cb.Lookup(key); ok {
+		if entry, ok := replayLookup(cb, cbCtx, key); ok {
 			recordReplayHit(cb, cbCtx, entry)
 			return cacheBoxServe(entry, key, decision.CacheBox, 0, span), nil
 		}
 		return cacheBoxMissResponse(cb, key, decision.CacheBox, replayMissReason(cb, cbCtx), cbCtx, span), nil
 
 	case evaluator.CacheBoxReplayDelay:
-		if entry, ok := cb.Lookup(key); ok {
+		if entry, ok := replayLookup(cb, cbCtx, key); ok {
 			recordReplayHit(cb, cbCtx, entry)
 			delay := cb.SampleDelay(entry)
 			if delay > 0 {
@@ -147,12 +147,26 @@ func isReplayAction(a evaluator.CacheBoxAction) bool {
 	return a == evaluator.CacheBoxReplay || a == evaluator.CacheBoxReplayDelay
 }
 
+// replayLookup is Lookup gated on ReplaySet ownership: when the decision
+// carries a context, the installed set must belong to that context's
+// (experiment_id, phase_id) or the lookup misses unconditionally. Without
+// this gate a same-key hit against a stale phase's (or, under operator
+// override, another experiment's) installed set would be served silently
+// -- undetectable cross-phase data bleed. Failing closed turns it into a
+// counted not_committed miss (see replayMissReason). A nil cbCtx (legacy
+// rule, freeze/admin paths) keeps the ungated behavior.
+func replayLookup(cb *cachebox.CacheBox, cbCtx *cachebox.CacheBoxContext, key string) (*cachebox.Entry, bool) {
+	if cbCtx != nil && cb.ReplaySetPhaseKey() != cachebox.PhaseKey(cbCtx.ExperimentID, cbCtx.PhaseID) {
+		return nil, false
+	}
+	return cb.Lookup(key)
+}
+
 // replayMissReason distinguishes a lookup miss within the correctly
 // installed phase (key_absent) from a miss because the installed
 // ReplaySet doesn't even belong to the matched rule's (experiment_id,
 // phase_id) -- nothing preloaded yet, or a different phase's set is still
-// live (not_committed, ATRO-6 defense in depth: correct preload ordering
-// on the control-plane side should prevent this in practice).
+// live (not_committed; replayLookup refuses such hits outright).
 func replayMissReason(cb *cachebox.CacheBox, cbCtx *cachebox.CacheBoxContext) string {
 	if cbCtx != nil {
 		expected := cachebox.PhaseKey(cbCtx.ExperimentID, cbCtx.PhaseID)
@@ -257,6 +271,16 @@ func (i *Interceptor) cacheBoxPassthrough(ctx context.Context, r *http.Request, 
 		// Oversized: stream the rest of the body through alongside what we
 		// already peeked. The original Body is the Closer; MultiReader is
 		// the Reader. Do NOT close the original body here.
+		//
+		// Under a recording rule this is a coverage hole -- the response is
+		// served live but never recorded, so a later replay of this key
+		// misses. Count it as a per-pair drop ("every drop is counted") so
+		// the drain report and phase verdict see it instead of it reading
+		// as clean coverage.
+		if cbCtx != nil && cbCtx.ExperimentID != "" && cbCtx.PhaseID != "" {
+			cb.Fidelity().RecordDropped(
+				cachebox.PhasePair{ExperimentID: cbCtx.ExperimentID, PhaseID: cbCtx.PhaseID}, 1)
+		}
 		span.AddEvent(trace.EventCacheBoxOversize,
 			attribute.Int64(trace.AttrCacheBoxResponseSize, peeked))
 		orig := resp.Body
