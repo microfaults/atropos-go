@@ -36,9 +36,15 @@ type CompiledRule struct {
 }
 
 // CompiledCacheBox is a resolved cache-box action for a rule.
+//
+// KeyStrategy is the legacy, construction-time-only strategy hint and is
+// kept for backward compatibility. Context, when present, is authoritative
+// end-to-end (design doc Q3): its own KeyStrategy/StrategyVersion/KeyHeaders
+// take precedence over the sibling KeyStrategy field above.
 type CompiledCacheBox struct {
-	Mode        string `json:"mode"`         // "passthrough" | "replay" | "replay_with_delay"
-	KeyStrategy string `json:"key_strategy"` // "exact" | "exact_with_host" | "exact_with_body"
+	Mode        string           `json:"mode"`         // "passthrough" | "replay" | "replay_with_delay"
+	KeyStrategy string           `json:"key_strategy"` // "exact" | "exact_with_host" | "exact_with_body"
+	Context     *CacheBoxContext `json:"context,omitempty"`
 }
 
 // CompiledFault is a resolved fault spec on the wire. It is the same struct
@@ -168,6 +174,7 @@ func DecodeCompiledRule(cr CompiledRule, opts ...DecodeOption) (StaticRule, erro
 	if cr.CacheBox != nil {
 		sr.Decision.CacheBox = parseCacheBoxMode(cr.CacheBox.Mode)
 		sr.Decision.CacheBoxKeyStrategy = cr.CacheBox.KeyStrategy
+		sr.Decision.CacheBoxContext = cr.CacheBox.Context
 	}
 
 	return sr, nil

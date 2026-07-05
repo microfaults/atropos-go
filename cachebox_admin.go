@@ -3,7 +3,6 @@ package atropos
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 
@@ -15,7 +14,12 @@ import (
 // Supported routes (matched on method + last path segment):
 //   - GET  /admin/cachebox          → 200 with JSON stats snapshot
 //   - POST /admin/cachebox/delay    → 204; body: {mu, sigma, seed}
-//   - DELETE /admin/cachebox        → 204; clears the store
+//   - DELETE /admin/cachebox        → 204; clears the record-side store and
+//     the installed replay set (freeze-clear/thaw hygiene, ATRO-6)
+//
+// The single-shot entry-preload route this handler used to serve
+// (POST /admin/cachebox/entries) is replaced by the staged protocol in
+// CacheBoxPreloadHandler (wire spec §W4) -- mount that separately.
 //
 // Example:
 //
@@ -37,10 +41,9 @@ func CacheBoxAdminHandler(cb *CacheBox) http.Handler {
 			handleCacheBoxStats(w, cb)
 		case r.Method == http.MethodPost && suffix == "delay":
 			handleCacheBoxDelay(w, r, cb)
-		case r.Method == http.MethodPost && suffix == "entries":
-			handleCacheBoxPreload(w, r, cb)
 		case r.Method == http.MethodDelete:
 			cb.Store().Clear()
+			cb.ClearReplaySet()
 			w.WriteHeader(http.StatusNoContent)
 		default:
 			jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -52,25 +55,15 @@ func handleCacheBoxStats(w http.ResponseWriter, cb *CacheBox) {
 	json.NewEncoder(w).Encode(cb.Stats())
 }
 
-// DelayRequest is the JSON body for POST /admin/cachebox/delay.
+// DelayRequest is the JSON body for POST /admin/cachebox/delay -- the freeze
+// command manteion sends at freezeServices time. Context, when present,
+// carries the (experiment_id, phase_id, key_strategy, ...) that authorizes
+// and scopes the freeze (wire spec §W1).
 type DelayRequest struct {
-	Mu    float64 `json:"mu"`
-	Sigma float64 `json:"sigma"`
-	Seed  uint64  `json:"seed"`
-}
-
-func handleCacheBoxPreload(w http.ResponseWriter, r *http.Request, cb *CacheBox) {
-	var entries []cachebox.WireEntry
-	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<20)).Decode(&entries); err != nil {
-		jsonError(w, fmt.Sprintf("invalid json: %s", err), http.StatusBadRequest)
-		return
-	}
-	store := cb.Store()
-	for i := range entries {
-		e := cachebox.WireToEntry(&entries[i])
-		store.Put(e.Key, e)
-	}
-	w.WriteHeader(http.StatusNoContent)
+	Mu      float64          `json:"mu"`
+	Sigma   float64          `json:"sigma"`
+	Seed    uint64           `json:"seed"`
+	Context *CacheBoxContext `json:"context,omitempty"`
 }
 
 func handleCacheBoxDelay(w http.ResponseWriter, r *http.Request, cb *CacheBox) {

@@ -20,15 +20,22 @@ import (
 const DefaultMaxBodyBytes = 1 << 20 // 1 MiB
 
 // CacheBox is the runtime coordinator for cache-box operations. It owns
-// the store, recorder, delay source, and key function used by the
-// interceptor to serve cache-box decisions.
+// the record/replay split (design doc Q4, INV-4/INV-7): store is the record
+// side (feeds the recorder/pusher, never consulted by Lookup) and
+// replaySet is the replay side (populated only by InstallReplaySet -- the
+// preload-commit path, ATRO-6 -- and the only thing Lookup consults). It
+// also owns the delay source and key function used by the interceptor to
+// serve cache-box decisions.
 //
 // A nil *CacheBox is safe for Lookup and Record (both become no-ops)
 // but not for SampleDelay or NeedsRequestBody -- the interceptor must
 // check for nil before dispatching to handleCacheBox.
 type CacheBox struct {
 	store        Store
+	replaySet    *ReplaySet
+	preload      *PreloadStore
 	recorder     *Recorder
+	fidelity     *FidelityRegistry
 	keyFn        KeyFunc
 	strategy     KeyStrategy
 	maxBodyBytes int
@@ -40,7 +47,11 @@ type CacheBox struct {
 
 // Config builds a CacheBox.
 type Config struct {
-	// Store is the persistence backend. If nil, a 10k-entry MemStore is used.
+	// Store is the record-side persistence backend the recorder drains
+	// into -- never consulted by Lookup (see ReplaySet). If nil, a
+	// 10000-entry RecordBuffer is used (bounded with an overflow counter
+	// instead of LRU eviction). Supplying a custom Store (e.g. MemStore)
+	// here only affects the record side.
 	Store Store
 
 	// KeyStrategy selects one of the built-in key functions. Ignored if
@@ -79,11 +90,15 @@ type Config struct {
 // defaults. The returned *CacheBox owns its recorder's drain goroutine;
 // callers should invoke Stop when the CacheBox is no longer needed.
 func New(cfg Config) *CacheBox {
+	fidelity := NewFidelityRegistry()
+
 	if cfg.Store == nil {
-		cfg.Store = NewMemStore(MemStoreConfig{MaxEntries: 10000})
+		cfg.Store = NewRecordBuffer(RecordBufferConfig{MaxEntries: 10000, Fidelity: fidelity})
 	}
 	if cfg.KeyStrategy == "" {
-		cfg.KeyStrategy = KeyStrategyExact
+		// canonical_v2 is the authoritative default (design doc Q3); the
+		// legacy strategies remain available for explicit opt-in/compat.
+		cfg.KeyStrategy = KeyStrategyCanonicalV2
 	}
 	if cfg.Delay == nil {
 		cfg.Delay = ObservedDelaySource{}
@@ -100,16 +115,22 @@ func New(cfg Config) *CacheBox {
 	rec := cfg.Recorder
 	if rec == nil {
 		rec = NewRecorder(RecorderConfig{
-			Store:   cfg.Store,
-			KeyFunc: keyFn,
-			Push:    cfg.Push,
-			BufSize: cfg.RecorderBuf,
+			Store:    cfg.Store,
+			KeyFunc:  keyFn,
+			Push:     cfg.Push,
+			BufSize:  cfg.RecorderBuf,
+			Fidelity: fidelity,
 		})
 	}
 
+	replaySet := NewReplaySet()
+
 	return &CacheBox{
 		store:        cfg.Store,
+		replaySet:    replaySet,
+		preload:      NewPreloadStore(replaySet, fidelity),
 		recorder:     rec,
+		fidelity:     fidelity,
 		keyFn:        keyFn,
 		strategy:     cfg.KeyStrategy,
 		maxBodyBytes: cfg.MaxBodyBytes,
@@ -127,20 +148,128 @@ func (cb *CacheBox) DeriveKey(r *http.Request, body []byte) string {
 	return cb.keyFn(r, body)
 }
 
-// Lookup returns a cached entry for the key, if one exists. Nil-safe.
+// Lookup returns an entry from the installed replay set for the key, if one
+// exists. Nil-safe. Lookup consults only the ReplaySet -- never the record
+// side -- so a Record can never make an entry visible to a replay decision
+// (INV-4): the only way an entry becomes replayable is InstallReplaySet.
 func (cb *CacheBox) Lookup(key string) (*Entry, bool) {
 	if cb == nil {
 		return nil, false
 	}
-	return cb.store.Get(key)
+	return cb.replaySet.Get(key)
 }
 
-// Record enqueues a new entry for async insertion. Nil-safe.
+// Record enqueues a new entry for async insertion into the record-side
+// buffer. Nil-safe. Record never makes the entry visible to Lookup -- see
+// InstallReplaySet.
 func (cb *CacheBox) Record(rec CacheRecord) {
 	if cb == nil || cb.recorder == nil {
 		return
 	}
 	cb.recorder.Record(rec)
+}
+
+// FlushRecording blocks until every record enqueued before this call has
+// been processed and (if a push hook is configured) handed to it. Used at
+// recording-phase end, before building a drain report (design doc Q2),
+// so the report's counts reflect everything recorded up to that point.
+// Nil-safe.
+func (cb *CacheBox) FlushRecording() {
+	if cb == nil || cb.recorder == nil {
+		return
+	}
+	cb.recorder.Flush()
+}
+
+// RecorderStats returns a snapshot of the recorder's counters (entries
+// recorded/dropped/pending). Nil-safe.
+func (cb *CacheBox) RecorderStats() RecorderStats {
+	if cb == nil || cb.recorder == nil {
+		return RecorderStats{}
+	}
+	return cb.recorder.Stats()
+}
+
+// Fidelity returns the CacheBox's per-(experiment_id, phase_id) counter
+// registry (ATRO-7, design doc Q6). Wire the same instance into a
+// CachePushClient (CachePushConfig.Fidelity) so push-side counts land in
+// the same registry the replay/record side reports into. Nil-safe (a nil
+// *CacheBox returns nil; FidelityRegistry's own methods are all nil-safe).
+func (cb *CacheBox) Fidelity() *FidelityRegistry {
+	if cb == nil {
+		return nil
+	}
+	return cb.fidelity
+}
+
+// InstallReplaySet atomically replaces the entries a replay-family decision
+// may serve, tagged with phaseKey (the owning (experiment_id, phase_id)
+// pair, for diagnostics). It is the only way entries become visible to
+// Lookup (INV-4) -- called by the preload-commit handler (ATRO-6) after
+// checksum verification. Nil-safe.
+func (cb *CacheBox) InstallReplaySet(phaseKey string, entries map[string]*Entry) {
+	if cb == nil {
+		return
+	}
+	cb.replaySet.Install(phaseKey, entries)
+}
+
+// ClearReplaySet drops the installed replay set entirely (e.g.
+// freeze-clear/thaw hygiene, ATRO-6). Nil-safe.
+func (cb *CacheBox) ClearReplaySet() {
+	if cb == nil {
+		return
+	}
+	cb.replaySet.Clear()
+}
+
+// ReplaySetLen reports how many entries are currently installed.
+func (cb *CacheBox) ReplaySetLen() int {
+	if cb == nil {
+		return 0
+	}
+	return cb.replaySet.Len()
+}
+
+// ReplaySetPhaseKey reports the diagnostic key of the currently-installed
+// replay set, or "" if none is installed.
+func (cb *CacheBox) ReplaySetPhaseKey() string {
+	if cb == nil {
+		return ""
+	}
+	return cb.replaySet.PhaseKey()
+}
+
+// PreloadBegin starts a new staged preload (ATRO-6, wire spec §W4).
+func (cb *CacheBox) PreloadBegin(experimentID, phaseID, keyStrategy string, maxBytes int64) BeginResult {
+	if cb == nil {
+		return BeginResult{}
+	}
+	return cb.preload.Begin(experimentID, phaseID, keyStrategy, maxBytes)
+}
+
+// PreloadChunk appends a chunk to the active staged preload.
+func (cb *CacheBox) PreloadChunk(experimentID, phaseID string, chunkSeq int, entries []*Entry) ChunkResult {
+	if cb == nil {
+		return ChunkResult{}
+	}
+	return cb.preload.Chunk(experimentID, phaseID, chunkSeq, entries)
+}
+
+// PreloadCommit verifies and (on match) installs the staged preload.
+func (cb *CacheBox) PreloadCommit(experimentID, phaseID string, totalEntries int, checksum string) CommitResult {
+	if cb == nil {
+		return CommitResult{}
+	}
+	return cb.preload.Commit(experimentID, phaseID, totalEntries, checksum)
+}
+
+// PreloadAbort drops the active staged preload, if any.
+func (cb *CacheBox) PreloadAbort(experimentID, phaseID string) {
+	if cb == nil {
+		return
+	}
+	cb.preload.Abort(experimentID, phaseID)
 }
 
 // SampleDelay asks the delay source how long replay_with_delay should sleep
@@ -197,18 +326,25 @@ func (cb *CacheBox) Stop() {
 	cb.recorder.Stop()
 }
 
-// Stats returns combined store and recorder stats.
+// Stats returns combined store and recorder stats. RecordBuffer is only
+// populated when the record-side Store happens to be a *RecordBuffer
+// (true by default; a caller-supplied custom Store leaves it zero-valued).
 type Stats struct {
-	Store    StoreStats
-	Recorder RecorderStats
+	Store        StoreStats
+	Recorder     RecorderStats
+	RecordBuffer RecordBufferStats
 }
 
 // Stats returns a snapshot of cache-box observability counters.
 func (cb *CacheBox) Stats() Stats {
-	return Stats{
+	s := Stats{
 		Store:    cb.store.Stats(),
 		Recorder: cb.recorder.Stats(),
 	}
+	if rb, ok := cb.store.(*RecordBuffer); ok {
+		s.RecordBuffer = rb.BufferStats()
+	}
+	return s
 }
 
 // BufferRequestBody reads up to (cap + 1) bytes of r.Body, restores the

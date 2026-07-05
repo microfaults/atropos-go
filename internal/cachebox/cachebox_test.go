@@ -2,6 +2,7 @@ package cachebox
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -449,8 +450,11 @@ func TestNewDefaults(t *testing.T) {
 	if cb.MaxBodyBytes() != DefaultMaxBodyBytes {
 		t.Fatalf("default body cap = %d, want %d", cb.MaxBodyBytes(), DefaultMaxBodyBytes)
 	}
-	if cb.NeedsRequestBody() {
-		t.Fatal("default strategy should not need body")
+	// canonical_v2 is the default strategy (design doc Q3) and it folds the
+	// body into the key, so the default now needs it -- unlike the old
+	// "exact" default.
+	if !cb.NeedsRequestBody() {
+		t.Fatal("default strategy (canonical_v2) should need body")
 	}
 	if cb.OTelCaptureLimit() != 0 {
 		t.Fatal("otel capture should be disabled by default")
@@ -505,7 +509,12 @@ func TestBufferRequestBody_Nil(t *testing.T) {
 	}
 }
 
-func TestCacheBox_LookupAndRecord(t *testing.T) {
+// TestCacheBox_RecordDoesNotFeedLookup pins the record/replay split
+// (design doc Q4, INV-4): Record populates the record-side buffer only.
+// Lookup consults exclusively the ReplaySet, so a recorded entry is never
+// visible to a replay decision -- see TestCacheBox_InstallReplaySetFeedsLookup
+// for the only path that does make an entry visible.
+func TestCacheBox_RecordDoesNotFeedLookup(t *testing.T) {
 	cb := New(Config{
 		Store:       NewMemStore(MemStoreConfig{}),
 		KeyStrategy: KeyStrategyExact,
@@ -516,7 +525,7 @@ func TestCacheBox_LookupAndRecord(t *testing.T) {
 	key := cb.DeriveKey(req, nil)
 
 	if _, ok := cb.Lookup(key); ok {
-		t.Fatal("unexpected hit on empty store")
+		t.Fatal("unexpected hit on empty replay set")
 	}
 
 	cb.Record(CacheRecord{
@@ -527,17 +536,52 @@ func TestCacheBox_LookupAndRecord(t *testing.T) {
 		ObservedLatency: 50 * time.Microsecond,
 		Timestamp:       time.Now(),
 	})
-	cb.Stop() // drains pending
+	cb.Stop() // drains pending into the record buffer
+
+	if _, ok := cb.Lookup(key); ok {
+		t.Fatal("Record must not make an entry visible to Lookup (INV-4)")
+	}
+	if got := cb.Store().Len(); got != 1 {
+		t.Fatalf("expected the record buffer to hold 1 entry, got %d", got)
+	}
+}
+
+func TestCacheBox_InstallReplaySetFeedsLookup(t *testing.T) {
+	cb := New(Config{KeyStrategy: KeyStrategyExact})
+	defer cb.Stop()
+
+	req := mustRequest(t, "GET", "http://svc/items")
+	key := cb.DeriveKey(req, nil)
+
+	if _, ok := cb.Lookup(key); ok {
+		t.Fatal("unexpected hit before install")
+	}
+
+	cb.InstallReplaySet("exp-1:phase-1", map[string]*Entry{
+		key: {
+			Key:             key,
+			StatusCode:      200,
+			Body:            []byte("payload"),
+			ObservedLatency: 50 * time.Microsecond,
+			RecordedAt:      time.Now(),
+		},
+	})
 
 	entry, ok := cb.Lookup(key)
 	if !ok {
-		t.Fatal("expected hit after record")
+		t.Fatal("expected hit after install")
 	}
 	if string(entry.Body) != "payload" {
 		t.Fatalf("unexpected body %q", entry.Body)
 	}
 	if entry.ObservedLatency != 50*time.Microsecond {
 		t.Fatalf("unexpected latency %s", entry.ObservedLatency)
+	}
+	if got := cb.ReplaySetLen(); got != 1 {
+		t.Fatalf("ReplaySetLen = %d, want 1", got)
+	}
+	if got := cb.ReplaySetPhaseKey(); got != "exp-1:phase-1" {
+		t.Fatalf("ReplaySetPhaseKey = %q, want exp-1:phase-1", got)
 	}
 }
 
@@ -587,5 +631,119 @@ func TestEntry_SizeCountsBodyAndHeader(t *testing.T) {
 	}
 	if (*Entry)(nil).Size() != 0 {
 		t.Fatal("nil entry Size should be 0")
+	}
+}
+
+// --- ReplaySet / RecordBuffer split tests (ATRO-4, design doc Q4/INV-4) ---
+
+func TestReplaySet_NoEvictionUnderRecordPressure(t *testing.T) {
+	cb := New(Config{
+		Store:       NewRecordBuffer(RecordBufferConfig{MaxEntries: 10}),
+		KeyStrategy: KeyStrategyExact,
+	})
+	defer cb.Stop()
+
+	const n = 20
+	installed := make(map[string]*Entry, n)
+	for i := 0; i < n; i++ {
+		key := fmt.Sprintf("preloaded-%d", i)
+		installed[key] = &Entry{Key: key, StatusCode: 200, Body: []byte("v")}
+	}
+	cb.InstallReplaySet("exp-1:phase-1", installed)
+
+	// Hammer Record with 10x the RecordBuffer's capacity. None of this
+	// pressure has any path to the installed replay set -- they are
+	// disjoint structures (INV-4).
+	for i := 0; i < 10*n; i++ {
+		req := mustRequest(t, "GET", fmt.Sprintf("http://svc/x%d", i))
+		cb.Record(CacheRecord{
+			Request:        req,
+			StatusCode:     200,
+			ResponseHeader: http.Header{},
+			ResponseBody:   []byte("record-pressure"),
+			Timestamp:      time.Now(),
+		})
+	}
+	cb.Stop()
+
+	for key := range installed {
+		if _, ok := cb.Lookup(key); !ok {
+			t.Fatalf("preloaded entry %q evicted under record pressure", key)
+		}
+	}
+	if got := cb.ReplaySetLen(); got != n {
+		t.Fatalf("ReplaySetLen = %d, want %d", got, n)
+	}
+}
+
+func TestReplaySet_AtomicSwapReplaces(t *testing.T) {
+	rs := NewReplaySet()
+	rs.Install("exp-1:phase-1", map[string]*Entry{
+		"a": {Key: "a", Body: []byte("old")},
+	})
+	if _, ok := rs.Get("a"); !ok {
+		t.Fatal("expected hit after first install")
+	}
+
+	rs.Install("exp-1:phase-2", map[string]*Entry{
+		"b": {Key: "b", Body: []byte("new")},
+	})
+
+	if _, ok := rs.Get("a"); ok {
+		t.Fatal("old phase's entry must be unreachable after swap, not merged")
+	}
+	entry, ok := rs.Get("b")
+	if !ok || string(entry.Body) != "new" {
+		t.Fatalf("expected new phase's entry after swap, got %+v ok=%v", entry, ok)
+	}
+	if got := rs.PhaseKey(); got != "exp-1:phase-2" {
+		t.Fatalf("PhaseKey = %q, want exp-1:phase-2", got)
+	}
+	if got := rs.Len(); got != 1 {
+		t.Fatalf("Len = %d, want 1 -- swap must replace, not merge", got)
+	}
+}
+
+func TestRecord_CollisionCountersDivergentVsIdentical(t *testing.T) {
+	cb := New(Config{KeyStrategy: KeyStrategyExact})
+	defer cb.Stop()
+
+	req := mustRequest(t, "GET", "http://svc/items")
+
+	// Baseline.
+	cb.Record(CacheRecord{
+		Request: req, StatusCode: 200,
+		ResponseHeader: http.Header{}, ResponseBody: []byte("v1"),
+		Timestamp: time.Now(),
+	})
+	// Identical repeat: same status + same body.
+	cb.Record(CacheRecord{
+		Request: req, StatusCode: 200,
+		ResponseHeader: http.Header{}, ResponseBody: []byte("v1"),
+		Timestamp: time.Now(),
+	})
+	// Divergent: same key, different body.
+	cb.Record(CacheRecord{
+		Request: req, StatusCode: 200,
+		ResponseHeader: http.Header{}, ResponseBody: []byte("v2-different"),
+		Timestamp: time.Now(),
+	})
+	// Divergent: same key, different status.
+	cb.Record(CacheRecord{
+		Request: req, StatusCode: 404,
+		ResponseHeader: http.Header{}, ResponseBody: []byte("v2-different"),
+		Timestamp: time.Now(),
+	})
+	cb.Stop()
+
+	stats := cb.Stats().RecordBuffer
+	if stats.CollisionsIdentical != 1 {
+		t.Fatalf("CollisionsIdentical = %d, want 1", stats.CollisionsIdentical)
+	}
+	if stats.CollisionsDivergent != 2 {
+		t.Fatalf("CollisionsDivergent = %d, want 2", stats.CollisionsDivergent)
+	}
+	if stats.Entries != 1 {
+		t.Fatalf("Entries = %d, want 1 (latest-wins, same key)", stats.Entries)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 	fault "git.ucsc.edu/microfaults/atropos-go/internal/fault"
 )
 
@@ -128,8 +129,14 @@ type Decision struct {
 	Reason              string
 	Mode                Mode
 	CacheBox            CacheBoxAction
-	CacheBoxKeyStrategy string // "exact" | "exact_with_host" | "exact_with_body"; empty = default
-	StartPolicy         StartPolicy
+	CacheBoxKeyStrategy string // legacy, construction-time-only hint; empty = default. Superseded by CacheBoxContext when present.
+	// CacheBoxContext, when present, is authoritative end-to-end (design
+	// doc Q3): its KeyStrategy/KeyHeaders/MissStatus take precedence over
+	// CacheBoxKeyStrategy and the CacheBox's construction-time default.
+	// Populated at rule-match time from the matched rule's compiled
+	// cache-box context (or the freeze command's, for the freeze path).
+	CacheBoxContext *cachebox.CacheBoxContext
+	StartPolicy     StartPolicy
 }
 
 // Evaluator is the rule engine contract. Must be safe for concurrent use.

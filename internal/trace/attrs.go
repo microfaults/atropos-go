@@ -52,6 +52,7 @@ const (
 	AttrCacheBoxWorkflow     = "atropos.cachebox.workflow"
 	AttrCacheBoxReason       = "atropos.cachebox.reason"
 	AttrCacheBoxInjection    = "atropos.cachebox.injection_point"
+	AttrCacheBoxMissReason   = "atropos.cachebox.miss_reason"
 
 	// Span names.
 	SpanFaultInject   = "atropos.fault.inject"
@@ -78,9 +79,10 @@ const (
 	EventResourceRampDownComplete = "atropos.resource.ramp_down.complete"
 
 	// Cache-box event names.
-	EventCacheBoxRecord   = "atropos.cachebox.record"
-	EventCacheBoxReplay   = "atropos.cachebox.replay"
-	EventCacheBoxMiss     = "atropos.cachebox.miss"
-	EventCacheBoxOversize = "atropos.cachebox.oversize"
-	EventCacheBoxError    = "atropos.cachebox.error"
+	EventCacheBoxRecord         = "atropos.cachebox.record"
+	EventCacheBoxReplay         = "atropos.cachebox.replay"
+	EventCacheBoxMiss           = "atropos.cachebox.miss"
+	EventCacheBoxOversize       = "atropos.cachebox.oversize"
+	EventCacheBoxError          = "atropos.cachebox.error"
+	EventCacheBoxMissFailClosed = "atropos.cachebox.miss.fail_closed"
 )
