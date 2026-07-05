@@ -102,16 +102,6 @@ type ApplyTargets struct {
 	// NetworkResolver maps logical targets to listen/upstream pairs for network
 	// fault proxies. Required if rules or active_fault contain network-category faults.
 	NetworkResolver NetworkResolver
-	// PhaseIDSink, if set, receives resp.RecordingPhaseID on every Apply (poll
-	// and register).
-	//
-	// Deprecated: since ATRO-5, recording provenance rides on each matched
-	// rule's CacheBoxContext (design doc Q5/INV-5) rather than this ambient,
-	// registration-time signal. Kept only for source compatibility with
-	// existing callers; new code should use CacheDrain instead for
-	// phase-end detection. Optional — nil means this SDK does not record
-	// cache, or has migrated to CacheDrain.
-	PhaseIDSink func(phaseID string)
 	// CacheDrain, if set, is notified with the applied rule set on every
 	// Apply that carries a non-empty rules list. It diffs against the
 	// previously-seen active recording phases and fires a flush + W3 drain
@@ -138,13 +128,6 @@ type ApplyTargets struct {
 // "apply active_fault: ...", "apply freeze_cfg: ...") so log grepping
 // can filter a single bootstrap phase without ambiguity.
 func Apply(resp RegisterResponse, targets ApplyTargets) error {
-	// Deliver the active recording phase id first (independent of rules/faults):
-	// the cache-push client needs it so ingests target the right phase. Empty
-	// means "no recording phase active" — the sink clears its phase id.
-	if targets.PhaseIDSink != nil {
-		targets.PhaseIDSink(resp.RecordingPhaseID)
-	}
-
 	if resp.Rules != nil {
 		if targets.Evaluator == nil && len(resp.Rules) > 0 {
 			return fmt.Errorf("apply rules: no Evaluator target for %d rules", len(resp.Rules))

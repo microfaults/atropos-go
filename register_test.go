@@ -131,34 +131,6 @@ func TestApply_SetsRules(t *testing.T) {
 	}
 }
 
-func TestApply_DeliversRecordingPhaseIDToSink(t *testing.T) {
-	var got string
-	sink := func(phaseID string) { got = phaseID }
-
-	// Non-empty recording phase is delivered.
-	resp := atropos.RegisterResponse{RuleSync: atropos.RuleSync{RecordingPhaseID: "phase-abc"}}
-	if err := atropos.Apply(resp, atropos.ApplyTargets{PhaseIDSink: sink}); err != nil {
-		t.Fatalf("Apply: %v", err)
-	}
-	if got != "phase-abc" {
-		t.Errorf("sink got %q, want phase-abc", got)
-	}
-
-	// Empty recording phase clears the sink (delivered as "").
-	got = "stale"
-	if err := atropos.Apply(atropos.RegisterResponse{}, atropos.ApplyTargets{PhaseIDSink: sink}); err != nil {
-		t.Fatalf("Apply empty: %v", err)
-	}
-	if got != "" {
-		t.Errorf("sink got %q after empty, want empty", got)
-	}
-
-	// Nil sink is a no-op (no panic).
-	if err := atropos.Apply(resp, atropos.ApplyTargets{}); err != nil {
-		t.Fatalf("Apply nil sink: %v", err)
-	}
-}
-
 func TestApply_NoRulesIsNoop(t *testing.T) {
 	eval := atropos.NewStaticEvaluator(atropos.StaticRule{Name: "preexisting", Point: atropos.Ingress})
 	resp := atropos.RegisterResponse{Status: "registered"}

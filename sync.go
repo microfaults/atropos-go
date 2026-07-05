@@ -13,16 +13,15 @@ package atropos
 // change" — the compatibility escape hatch for payloads that don't carry
 // rules — while [] is authoritative desired state. Manteion's poll
 // endpoint always sends the full (possibly empty) compiled set.
+// Recording/replay provenance rides each matched rule's CacheBoxContext
+// (design doc Q5/INV-5); there is no ambient recording-phase signal here.
+// The former recording_phase_id field (and its ApplyTargets.PhaseIDSink
+// consumer) was a second, registration-time delivery path for the same
+// fact -- manteion stopped writing it, the SDK delivered "" every poll,
+// and two owners for one signal is one too many.
 type RuleSync struct {
 	Version      uint64         `json:"version"`
 	Rules        []CompiledRule `json:"rules"`
 	ActiveFaults []FaultRequest `json:"active_faults"`
 	FreezeCfg    *DelayRequest  `json:"freeze_cfg,omitempty"`
-	// RecordingPhaseID is the experiment phase the SDK should record cache-box
-	// entries INTO (the currently-running baseline phase with persist_cache).
-	// Empty when no recording phase is active. Apply hands it to
-	// ApplyTargets.PhaseIDSink so the cache-push client tags ingests with the
-	// right phase; a recording phase start/stop bumps the rule version so this
-	// rides the normal poll fast-path.
-	RecordingPhaseID string `json:"recording_phase_id,omitempty"`
 }
