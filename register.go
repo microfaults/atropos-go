@@ -158,7 +158,7 @@ func Apply(resp RegisterResponse, targets ApplyTargets) error {
 			if err != nil {
 				return fmt.Errorf("apply rules: %w", err)
 			}
-			targets.Evaluator.SetRules(rules)
+			applyRuleSet(targets.Evaluator, rules)
 		}
 
 		// Observe every authoritative rule set, INCLUDING empty: the
@@ -191,6 +191,9 @@ func Apply(resp RegisterResponse, targets ApplyTargets) error {
 		for _, id := range targets.DemoEval.ActiveIDs() {
 			if !activeIDs[id] {
 				targets.DemoEval.ClearSlot(id)
+				// Manteion dropped the slot; a running background fault it
+				// started must not keep executing under a withdrawn intent.
+				stopBackgroundFaults(id)
 			}
 		}
 
@@ -222,6 +225,12 @@ func Apply(resp RegisterResponse, targets ApplyTargets) error {
 
 // applyActiveFault builds a Fault from a FaultRequest and installs it on the
 // DemoEvaluator. Uses the shared buildFault dispatcher.
+//
+// Decision.Name is the slot id (the same key Set stores under): it becomes
+// the fault registry's key, so ClearSlot(id) can stop the running fault by
+// the identical name. A shared constant name here would collapse distinct
+// slots into one registry entry -- deduplicating faults that should
+// coexist and stopping strangers on clear.
 func applyActiveFault(req FaultRequest, eval *DemoEvaluator, resolve NetworkResolver) error {
 	f, err := buildFault(req, resolve)
 	if err != nil {
@@ -233,8 +242,12 @@ func applyActiveFault(req FaultRequest, eval *DemoEvaluator, resolve NetworkReso
 		mode = Background
 	}
 
+	id := req.ID
+	if id == "" {
+		id = req.effectiveCategory()
+	}
 	eval.Set(&Decision{
-		Name:   "active_fault",
+		Name:   id,
 		Fault:  f,
 		Reason: "register",
 		Mode:   mode,
@@ -275,6 +288,9 @@ func StartFaultWatchdog(ctx context.Context, eval *DemoEvaluator, pollInterval t
 		case <-t.C:
 			for _, cat := range eval.StaleSlots(grace) {
 				eval.ClearSlot(cat)
+				// Clearing the slot only stops NEW starts; the zombie guard
+				// is only real if the running instance dies too.
+				stopBackgroundFaults(cat)
 				if logger != nil {
 					logger.Warn("watchdog: dropped stale fault slot", "category", cat, "grace", grace)
 				}

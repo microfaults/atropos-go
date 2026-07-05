@@ -133,3 +133,75 @@ func TestRegistry_DifferentKeys_Independent(t *testing.T) {
 		t.Errorf("expected 2 starts for different keys, got %d", starts.Load())
 	}
 }
+
+func TestRegistry_StopByKey_CancelsAllInstances(t *testing.T) {
+	r := NewFaultRegistry()
+	defer r.Close()
+
+	startFn := func(ctx context.Context) (*fault.Handle, error) {
+		return newStubFault(10 * time.Second).Start(ctx)
+	}
+	h1, _, _ := r.StartOrJoin("rule-a", evaluator.AlwaysStart, startFn)
+	h2, _, _ := r.StartOrJoin("rule-a", evaluator.AlwaysStart, startFn)
+	hOther, _, _ := r.StartOrJoin("rule-b", evaluator.DeduplicateByRule, startFn)
+
+	r.Stop("rule-a")
+
+	for i, h := range []*fault.Handle{h1, h2} {
+		select {
+		case <-h.Done():
+		case <-time.After(2 * time.Second):
+			t.Fatalf("Stop(rule-a) did not cancel instance %d within 2s", i)
+		}
+	}
+	select {
+	case <-hOther.Done():
+		t.Fatal("Stop(rule-a) must not cancel rule-b's fault")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// The key frees once its faults drain: a fresh start must not dedup
+	// against stopped instances.
+	time.Sleep(50 * time.Millisecond)
+	_, deduped, err := r.StartOrJoin("rule-a", evaluator.DeduplicateByRule, startFn)
+	if err != nil {
+		t.Fatalf("restart after stop: %v", err)
+	}
+	if deduped {
+		t.Fatal("restart after Stop was deduped against a cancelled fault")
+	}
+}
+
+// TestRegistry_InstantFaultDoesNotLeak pins the SetOnResult contract fix:
+// a fault that completes before the registry registers its bookkeeping
+// callback must still be removed from tracking (previously the callback
+// was silently dropped, leaking the entry and hanging Close's WaitGroup).
+func TestRegistry_InstantFaultDoesNotLeak(t *testing.T) {
+	r := NewFaultRegistry()
+
+	_, _, err := r.StartOrJoin("instant", evaluator.DeduplicateByRule, func(ctx context.Context) (*fault.Handle, error) {
+		_, cancel := context.WithCancel(ctx)
+		h := fault.NewHandle(cancel)
+		h.Send(fault.Result{}) // completes before StartOrJoin can SetOnResult
+		return h, nil
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() { r.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close hung: instant fault leaked its registry entry")
+	}
+}
+
+func TestRegistry_StopUnknownKeyAndNil(t *testing.T) {
+	r := NewFaultRegistry()
+	defer r.Close()
+	r.Stop("never-started") // no-op
+	var nilReg *FaultRegistry
+	nilReg.Stop("x") // no-op, no panic
+}

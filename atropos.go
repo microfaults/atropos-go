@@ -15,10 +15,32 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 )
 
-var defaultInterceptor *Interceptor
+var (
+	defaultInterceptor *Interceptor
+
+	// defaultRegistry holds every running background fault so rule/slot
+	// removal can stop it (see FaultRegistry). It is swapped together with
+	// defaultInterceptor by Configure; like defaultInterceptor, it is
+	// unsynchronized package state -- Configure is init-time API.
+	defaultRegistry *interceptor.FaultRegistry
+)
 
 func init() {
-	defaultInterceptor = interceptor.New(nil, trace.NewOTelTracer())
+	defaultRegistry = interceptor.NewFaultRegistry()
+	defaultInterceptor = interceptor.New(nil, trace.NewOTelTracer(),
+		interceptor.WithRegistry(defaultRegistry))
+}
+
+// stopBackgroundFaults cancels the running background faults started under
+// the given rule/slot keys (Decision.Name; the registry's key). Called
+// wherever a rule or fault slot is removed -- rule removal is the
+// platform's fault-stop signal, and a background fault that outlives its
+// phase contaminates the next phase's measurement (X1).
+func stopBackgroundFaults(keys ...string) {
+	reg := defaultRegistry
+	for _, k := range keys {
+		reg.Stop(k)
+	}
 }
 
 // ConfigureOption mutates the package-level interceptor configuration when
@@ -62,7 +84,19 @@ func Configure(opts ...ConfigureOption) {
 	if s.cacheBox != nil {
 		interceptOpts = append(interceptOpts, interceptor.WithCacheBox(s.cacheBox))
 	}
+
+	// Each configuration owns a fresh fault registry; closing the previous
+	// one cancels any background faults the old configuration started
+	// (reconfigure = clean slate). Close waits for them to drain, so it
+	// runs off the caller's goroutine.
+	old := defaultRegistry
+	defaultRegistry = interceptor.NewFaultRegistry()
+	interceptOpts = append(interceptOpts, interceptor.WithRegistry(defaultRegistry))
+
 	defaultInterceptor = interceptor.New(s.eval, trace.NewOTelTracer(), interceptOpts...)
+	if old != nil {
+		go old.Close()
+	}
 }
 
 // DefaultInterceptor returns the package-level interceptor.

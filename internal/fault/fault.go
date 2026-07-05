@@ -3,7 +3,7 @@ package fault
 import (
 	"context"
 	"fmt"
-	"sync/atomic"
+	"sync"
 	"time"
 )
 
@@ -46,16 +46,21 @@ type Fault interface {
 
 // Handle provides non-blocking control over a running fault.
 //
-// onResult is stored as an atomic.Pointer so that SetOnResult (called on
-// the caller goroutine after Start returns) does not race with Send
-// (called on the fault's internal goroutine). Without this guard the race
-// detector flagged any fault whose goroutine finishes before Start's caller
-// can register its callback, which is common for short-lived latency and
-// error faults.
+// Callbacks accumulate rather than replace: the interceptor registers a
+// span-recording callback and the fault registry registers its
+// bookkeeping callback on the same handle, and neither may clobber the
+// other. A callback registered after the result was already delivered
+// fires immediately on the registering goroutine -- the previous
+// atomic-pointer implementation silently dropped it, which for a
+// near-instant fault leaked the registry's tracking entry and made
+// FaultRegistry.Close hang on its WaitGroup.
 type Handle struct {
-	done     chan Result
-	cancel   context.CancelFunc
-	onResult atomic.Pointer[func(Result)]
+	done   chan Result
+	cancel context.CancelFunc
+
+	mu        sync.Mutex
+	callbacks []func(Result)
+	result    *Result
 }
 
 // NewHandle creates a Handle wired to the given cancel func.
@@ -66,12 +71,19 @@ func NewHandle(cancel context.CancelFunc) *Handle {
 	}
 }
 
-// SetOnResult registers a callback that fires synchronously on Send.
-// If Send has already fired (e.g. for a near-instantaneous fault), the
-// callback will not be invoked -- callers should register it before they
-// expect the fault to complete.
+// SetOnResult registers a callback that fires synchronously on Send, or
+// immediately if the result has already been delivered. Callbacks fire in
+// registration order.
 func (h *Handle) SetOnResult(fn func(Result)) {
-	h.onResult.Store(&fn)
+	h.mu.Lock()
+	if h.result != nil {
+		r := *h.result
+		h.mu.Unlock()
+		fn(r)
+		return
+	}
+	h.callbacks = append(h.callbacks, fn)
+	h.mu.Unlock()
 }
 
 // Done returns a channel that receives one Result on completion.
@@ -79,15 +91,28 @@ func (h *Handle) Done() <-chan Result {
 	return h.done
 }
 
-// Stop requests early shutdown. Non-blocking.
+// Stop requests early shutdown by cancelling the fault's context.
+// Non-blocking; the fault delivers its Result (with the truncated
+// ActualDuration) through the normal Send path once it has cleaned up.
 func (h *Handle) Stop() {
 	h.cancel()
 }
 
-// Send delivers the result. Fires OnResult callback synchronously first.
+// Send delivers the result exactly once: callbacks fire synchronously
+// first (in registration order), then the done channel receives. A second
+// Send is a no-op.
 func (h *Handle) Send(r Result) {
-	if fn := h.onResult.Load(); fn != nil {
-		(*fn)(r)
+	h.mu.Lock()
+	if h.result != nil {
+		h.mu.Unlock()
+		return
+	}
+	h.result = &r
+	cbs := h.callbacks
+	h.callbacks = nil
+	h.mu.Unlock()
+	for _, fn := range cbs {
+		fn(r)
 	}
 	h.done <- r
 }

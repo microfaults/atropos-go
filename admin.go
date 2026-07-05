@@ -238,11 +238,14 @@ func FaultAdminHandlerWith(eval *DemoEvaluator, resolve NetworkResolver) http.Ha
 		case http.MethodDelete:
 			// check if path is /admin/fault or /admin/fault/{category}
 			if path == "/admin/fault" || path == "/admin/fault/" {
+				ids := eval.ActiveIDs()
 				eval.Clear()
+				stopBackgroundFaults(ids...)
 			} else {
 				// strip /admin/fault/ to get ID
 				id := path[len("/admin/fault/"):]
 				eval.ClearSlot(id)
+				stopBackgroundFaults(id)
 			}
 			json.NewEncoder(w).Encode(FaultStatus{Active: false})
 		case http.MethodGet:
@@ -276,8 +279,14 @@ func handleFaultPost(w http.ResponseWriter, r *http.Request, eval *DemoEvaluator
 		mode = Background
 	}
 
+	// Name = slot id, matching Set's key, so DELETE can stop the running
+	// fault through the registry under the same name (see applyActiveFault).
+	id := req.ID
+	if id == "" {
+		id = req.effectiveCategory()
+	}
 	decision := &Decision{
-		Name:   "admin",
+		Name:   id,
 		Fault:  f,
 		Reason: "admin",
 		Mode:   mode,

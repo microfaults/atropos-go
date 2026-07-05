@@ -6,6 +6,28 @@ import (
 	"net/http"
 )
 
+// applyRuleSet atomically replaces eval's rules and stops any running
+// background fault whose owning rule dropped out of the set. This is the
+// single rule-application path (poll/register Apply and the push endpoint
+// both funnel here): a background fault must not outlive the rule that
+// started it, and the rule's removal -- however it arrives -- is the stop
+// signal. Replacement happens before the stops so a re-evaluated request
+// cannot restart a fault under the outgoing rule set.
+func applyRuleSet(eval *StaticEvaluator, rules []StaticRule) {
+	prev := eval.Rules()
+	eval.SetRules(rules)
+
+	next := make(map[string]bool, len(rules))
+	for _, r := range rules {
+		next[r.Name] = true
+	}
+	for _, r := range prev {
+		if !next[r.Name] {
+			stopBackgroundFaults(r.Name)
+		}
+	}
+}
+
 // RulesAdminHandler returns an http.Handler for runtime rule management on a
 // StaticEvaluator.
 //
@@ -35,7 +57,7 @@ func RulesAdminHandler(eval *StaticEvaluator, opts ...DecodeOption) http.Handler
 				return
 			}
 			if compiled == nil {
-				eval.SetRules(nil)
+				applyRuleSet(eval, nil)
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}
@@ -44,7 +66,7 @@ func RulesAdminHandler(eval *StaticEvaluator, opts ...DecodeOption) http.Handler
 				jsonError(w, fmt.Sprintf("decode rules: %s", err), http.StatusBadRequest)
 				return
 			}
-			eval.SetRules(rules)
+			applyRuleSet(eval, rules)
 			w.WriteHeader(http.StatusNoContent)
 
 		default:
