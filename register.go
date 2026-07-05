@@ -126,8 +126,13 @@ type ApplyTargets struct {
 // Returns an error if the response carries a category but the corresponding
 // target is nil, or if any component fails to apply.
 //
-// A nil or empty rules slice is treated as 'no change' — only a populated
-// rule list replaces the evaluator's current rules.
+// Rules contract: a nil slice means 'no change' (absent field -- a legacy
+// manteion, or a payload that doesn't carry rules); a non-nil slice is
+// authoritative desired state INCLUDING when empty. Empty-clears is what
+// makes the poll loop a true reconciler: phase teardown clears rules via
+// a push fanout that can miss instances (deregistered, filtered, down),
+// and an instance that missed it must converge to zero rules on its next
+// poll -- otherwise it keeps replaying/faulting forever.
 //
 // Error messages are prefixed by category ("apply rules: ...",
 // "apply active_fault: ...", "apply freeze_cfg: ...") so log grepping
@@ -140,25 +145,27 @@ func Apply(resp RegisterResponse, targets ApplyTargets) error {
 		targets.PhaseIDSink(resp.RecordingPhaseID)
 	}
 
-	if len(resp.Rules) > 0 {
-		if targets.Evaluator == nil {
+	if resp.Rules != nil {
+		if targets.Evaluator == nil && len(resp.Rules) > 0 {
 			return fmt.Errorf("apply rules: no Evaluator target for %d rules", len(resp.Rules))
 		}
-		var opts []DecodeOption
-		if targets.NetworkResolver != nil {
-			opts = append(opts, WithNetworkResolver(targets.NetworkResolver))
+		if targets.Evaluator != nil {
+			var opts []DecodeOption
+			if targets.NetworkResolver != nil {
+				opts = append(opts, WithNetworkResolver(targets.NetworkResolver))
+			}
+			rules, err := DecodeCompiledRules(resp.Rules, opts...)
+			if err != nil {
+				return fmt.Errorf("apply rules: %w", err)
+			}
+			targets.Evaluator.SetRules(rules)
 		}
-		rules, err := DecodeCompiledRules(resp.Rules, opts...)
-		if err != nil {
-			return fmt.Errorf("apply rules: %w", err)
-		}
-		targets.Evaluator.SetRules(rules)
 
-		// Gated on the same "non-empty rules" condition as SetRules above:
-		// an empty rules list means "no change" (see the doc comment on
-		// RuleSync), not "every recording phase just ended" -- observing it
-		// unconditionally would misfire a drain report on every poll that
-		// simply didn't carry a rule update.
+		// Observe every authoritative rule set, INCLUDING empty: the
+		// recording phase whose rule drops out of the set most often leaves
+		// it empty (a baseline service has no other rules), and that
+		// transition is exactly what triggers the flush + drain report. A
+		// nil set is skipped -- it carries no information to diff against.
 		targets.CacheDrain.Observe(resp.Rules)
 	}
 

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -340,5 +341,82 @@ func TestApply_FreezeCfg_SetsDistributionDelay(t *testing.T) {
 	}
 	if delay == entry.ObservedLatency {
 		t.Error("expected fitted delay to differ from observed (sigma > 0)")
+	}
+}
+
+// TestApply_EmptyRulesClears pins the reconciliation contract: a non-nil
+// EMPTY rules list is authoritative desired state, not "no change". Phase
+// teardown clears rules via a push fanout that can miss instances; the
+// poll path must converge a missed instance to zero rules or it keeps
+// replaying/faulting forever. (A nil list stays a no-op -- see
+// TestApply_NoRulesIsNoop.)
+func TestApply_EmptyRulesClears(t *testing.T) {
+	eval := atropos.NewStaticEvaluator(atropos.StaticRule{Name: "leftover", Point: atropos.Egress})
+	resp := atropos.RegisterResponse{RuleSync: atropos.RuleSync{Rules: []atropos.CompiledRule{}}}
+	if err := atropos.Apply(resp, atropos.ApplyTargets{Evaluator: eval}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if rules := eval.Rules(); len(rules) != 0 {
+		t.Fatalf("empty rule set must clear the evaluator, still have %+v", rules)
+	}
+}
+
+// TestApply_EmptyRulesFiresDrainTracker pins the drain fast path for the
+// canonical topology: a baseline-recorded service usually has NO rules
+// besides the synthesized recording rule, so the rule update that ends the
+// phase arrives as an empty set -- and must still trigger the flush + W3
+// drain report.
+func TestApply_EmptyRulesFiresDrainTracker(t *testing.T) {
+	var drains atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/cache/ingest":
+			w.WriteHeader(http.StatusCreated)
+		case "/api/v1/sdk/cachebox/drain":
+			drains.Add(1)
+			_ = json.NewEncoder(w).Encode(atropos.DrainReportResponse{Accepted: true})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	pusher := atropos.NewCachePushClient(atropos.CachePushConfig{
+		BaseURL: server.URL, Service: "cart", Instance: "pod-1",
+	})
+	defer pusher.Stop()
+	cb := atropos.NewCacheBox(atropos.CacheBoxConfig{Push: pusher.PushFunc()})
+	defer cb.Stop()
+	pusher.BindFidelity(cb.Fidelity())
+
+	eval := atropos.NewStaticEvaluator()
+	tracker := atropos.NewCacheDrainTracker(cb, pusher, nil)
+	targets := atropos.ApplyTargets{Evaluator: eval, CacheDrain: tracker}
+
+	recording := atropos.RegisterResponse{RuleSync: atropos.RuleSync{Rules: []atropos.CompiledRule{{
+		Name: "cachebox:passthrough:phase-1", InjectionPoint: "egress", Mode: "inline",
+		CacheBox: &atropos.CompiledCacheBox{
+			Mode: "passthrough",
+			Context: &atropos.CacheBoxContext{
+				ExperimentID: "exp-1", PhaseID: "phase-1",
+				KeyStrategy: "canonical_v2", StrategyVersion: 2,
+			},
+		},
+	}}}}
+	if err := atropos.Apply(recording, targets); err != nil {
+		t.Fatalf("Apply recording rules: %v", err)
+	}
+	if got := drains.Load(); got != 0 {
+		t.Fatalf("no phase ended yet, but %d drain reports sent", got)
+	}
+
+	// Drain start: the recording rule drops out and, this being the only
+	// rule for the service, the authoritative set is EMPTY.
+	empty := atropos.RegisterResponse{RuleSync: atropos.RuleSync{Rules: []atropos.CompiledRule{}}}
+	if err := atropos.Apply(empty, targets); err != nil {
+		t.Fatalf("Apply empty rules: %v", err)
+	}
+	if got := drains.Load(); got != 1 {
+		t.Fatalf("empty authoritative set must fire the drain report, got %d", got)
 	}
 }

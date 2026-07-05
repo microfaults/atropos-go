@@ -48,8 +48,10 @@ func EndedRecordingPhases(prev, curr map[RecordingPhaseKey]bool) []RecordingPhas
 // phases that have ended and triggers a flush + W3 drain report for each
 // (design doc Q2: "the poll-driven bump manteion issues at drain start"
 // removes the phase's CacheBoxContext from the rule set). Wire it via
-// ApplyTargets.CacheDrain; Apply calls Observe whenever it applies a
-// non-empty rule set.
+// ApplyTargets.CacheDrain; Apply calls Observe for every authoritative
+// (non-nil, including empty) rule set it applies -- the empty set is the
+// common drain trigger, since a baseline-recorded service usually has no
+// rules besides the synthesized recording rule.
 type CacheDrainTracker struct {
 	cb     *CacheBox
 	pusher *CachePushClient

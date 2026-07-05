@@ -7,10 +7,12 @@ package atropos
 // control plane and SDK.
 //
 // Rules and ActiveFaults are deliberately NOT omitempty: under Apply's
-// reconciliation an empty active_faults array means "clear all manual
-// faults", which must be explicit on the wire rather than indistinguishable
-// from "field absent". (An empty rules list is still treated as "no change"
-// by Apply — see its doc.)
+// reconciliation an empty array means "clear everything in this category",
+// which must be explicit on the wire rather than indistinguishable from
+// "field absent". A null/absent rules field (nil after decode) means "no
+// change" — the compatibility escape hatch for payloads that don't carry
+// rules — while [] is authoritative desired state. Manteion's poll
+// endpoint always sends the full (possibly empty) compiled set.
 type RuleSync struct {
 	Version      uint64         `json:"version"`
 	Rules        []CompiledRule `json:"rules"`
