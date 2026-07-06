@@ -4,6 +4,11 @@ All notable changes to atropos-go are documented in this file.
 
 ## Unreleased
 
+### Added — Route publication for the workflow-builder catalog
+
+- **`atropos.RegisterRoutes(routes ...Route)`** records the service's HTTP route inventory; `ManteionClient` includes it in every register payload (`RegisterRequest.Routes`, wire key `routes`). Manteion aggregates routes across live SDK instances into `GET /api/v1/catalog/endpoints`, which feeds the manteion-ui workflow-builder endpoint picker. Call at startup before `ConnectManteion`; calling later triggers a best-effort background re-register so the catalog converges. Each call replaces the inventory; gRPC-only services skip it.
+- **`Route` type** — `{method, path, description?, depends_on?}`. `Path` is the literal serve template (e.g. `/product/{id}`). `DependsOn` names prerequisite routes as `"METHOD /path"` (same service) or `"service METHOD /path"` (fully qualified) for workflow ordering.
+
 ### Added — Long-running faults & SDK liveness
 
 - **Multi-slot `DemoEvaluator`.** Active faults are now stored as a map keyed by ID rather than a single decision. New APIs: `Set(decision, req)`, `ClearSlot(id)`, `ActiveIDs()`, `Active()` (returns all `FaultRequest`s), `Confirm(id)` (heartbeat), `StaleSlots(maxAge)`. Per-call `Evaluate` returns the first match in `inline > network > resource` priority, with deterministic lex order within a category. Limitation: still a single decision per `Evaluate` — see `docs/plans/2026-05-17-concurrent-multi-fault-execution.md`.

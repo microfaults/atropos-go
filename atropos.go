@@ -28,7 +28,8 @@ var (
 func init() {
 	defaultRegistry = interceptor.NewFaultRegistry()
 	defaultInterceptor = interceptor.New(nil, trace.NewOTelTracer(),
-		interceptor.WithRegistry(defaultRegistry))
+		interceptor.WithRegistry(defaultRegistry),
+		interceptor.WithInjectionHook(recordFaultInjection))
 }
 
 // stopBackgroundFaults cancels the running background faults started under
@@ -80,7 +81,7 @@ func Configure(opts ...ConfigureOption) {
 		}
 		opt(&s)
 	}
-	var interceptOpts []interceptor.Option
+	interceptOpts := []interceptor.Option{interceptor.WithInjectionHook(recordFaultInjection)}
 	if s.cacheBox != nil {
 		interceptOpts = append(interceptOpts, interceptor.WithCacheBox(s.cacheBox))
 	}

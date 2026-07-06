@@ -117,13 +117,15 @@ Services embedding atropos-go register with manteion on startup so manteion can 
 
 ### Types
 
-- `RegisterRequest{ID, Service, Version, Address}` — the POST body.
+- `RegisterRequest{ID, Service, Version, Address, PollIntervalMs, Routes}` — the POST body. `Routes` is the optional HTTP route inventory for manteion's workflow-builder catalog.
+- `Route{Method, Path, Description, DependsOn}` — one published HTTP route. `DependsOn` entries are `"METHOD /path"` (same service) or `"service METHOD /path"` (fully qualified).
 - `RegisterResponse{Status, Rules, ActiveFault, FreezeCfg}` — the response. Rules/ActiveFault/FreezeCfg are populated when manteion has intent tracked for the service.
 - `CompiledRule`, `CompiledFault`, `CompiledComposition`, `CompiledCompositionMember` — the JSON wire format for rules, mirroring `manteion-go/internal/ruleconv`. `CompiledComposition` is carried on the wire but not yet executable on the SDK side; `DecodeCompiledRules` errors on composition rules.
 
 ### Functions
 
 - `Register(ctx, manteionURL, req) (RegisterResponse, error)` — POSTs to `manteionURL + /api/v1/sdk/register` with a 5s default timeout.
+- `RegisterRoutes(routes ...Route)` — records the HTTP route inventory published on every (re-)register. Call at startup before `ConnectManteion`; manteion aggregates routes into the workflow-builder catalog (`GET /api/v1/catalog/endpoints`).
 - `Apply(resp, ApplyTargets{Evaluator, DemoEval, CacheBox}) error` — installs rules, active fault, and freeze config onto the provided SDK objects. Missing targets for populated response fields are errors.
 - `DecodeCompiledRules([]CompiledRule) ([]StaticRule, error)` — lower-level helper used by Apply.
 

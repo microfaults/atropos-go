@@ -148,6 +148,7 @@ func (c *ManteionClient) register(ctx context.Context) error {
 		Version:        c.cfg.serviceVersion,
 		Address:        c.cfg.address,
 		PollIntervalMs: c.cfg.pollInterval.Milliseconds(),
+		Routes:         publishedRoutes(),
 	})
 	if err != nil {
 		return err
