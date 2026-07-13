@@ -10,6 +10,8 @@
 package atropos
 
 import (
+	"sync/atomic"
+
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
 	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
@@ -19,10 +21,19 @@ var (
 	defaultInterceptor *Interceptor
 
 	// defaultRegistry holds every running background fault so rule/slot
-	// removal can stop it (see FaultRegistry). It is swapped together with
-	// defaultInterceptor by Configure; like defaultInterceptor, it is
-	// unsynchronized package state -- Configure is init-time API.
+	// removal can stop it (see FaultRegistry). It is created ONCE in init()
+	// and shared across every Configure call: the registry is rule-name-keyed
+	// and evaluator-agnostic, so reconfiguring the evaluator/cache-box must
+	// not orphan the faults the live middleware is still routing through it
+	// (A1). Like defaultInterceptor, it is unsynchronized package state --
+	// Configure is init-time API.
 	defaultRegistry *interceptor.FaultRegistry
+
+	// hostConfigured records whether a host service has called Configure. Once
+	// set, the zero-arg FaultAdminHandler refuses to lazily reconfigure the
+	// SDK onto the demo evaluator -- doing so would drop the host's evaluator
+	// and cache-box and rebuild the interceptor mid-experiment (A1).
+	hostConfigured atomic.Bool
 )
 
 func init() {
@@ -86,18 +97,17 @@ func Configure(opts ...ConfigureOption) {
 		interceptOpts = append(interceptOpts, interceptor.WithCacheBox(s.cacheBox))
 	}
 
-	// Each configuration owns a fresh fault registry; closing the previous
-	// one cancels any background faults the old configuration started
-	// (reconfigure = clean slate). Close waits for them to drain, so it
-	// runs off the caller's goroutine.
-	old := defaultRegistry
-	defaultRegistry = interceptor.NewFaultRegistry()
+	// The fault registry is process-lifetime and shared across Configure calls
+	// (see defaultRegistry). It is deliberately NOT swapped or closed here: the
+	// live middleware captured the previous interceptor at construction and
+	// still routes background faults through this registry, so replacing it
+	// would orphan running faults and make stopBackgroundFaults consult a
+	// registry the middleware never uses (A1). Reconfigure swaps the evaluator
+	// and cache-box only.
 	interceptOpts = append(interceptOpts, interceptor.WithRegistry(defaultRegistry))
 
 	defaultInterceptor = interceptor.New(s.eval, trace.NewOTelTracer(), interceptOpts...)
-	if old != nil {
-		go old.Close()
-	}
+	hostConfigured.Store(true)
 }
 
 // DefaultInterceptor returns the package-level interceptor.

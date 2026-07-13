@@ -209,6 +209,16 @@ func ensureDemoEval() *DemoEvaluator {
 //	// curl http://localhost:8080/admin/fault
 func FaultAdminHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A host-configured SDK already owns its evaluator and cache-box via
+		// Configure. Lazily configuring the demo evaluator here would drop
+		// them and rebuild the interceptor, so a stray request (even a GET)
+		// must not trigger it -- refuse and tell the operator to mount the
+		// explicit handler instead (A1).
+		if hostConfigured.Load() {
+			w.Header().Set("Content-Type", "application/json")
+			jsonError(w, "SDK is host-configured; mount FaultAdminHandlerWith(eval, ...) explicitly", http.StatusConflict)
+			return
+		}
 		eval := ensureDemoEval()
 		FaultAdminHandlerWith(eval, nil).ServeHTTP(w, r)
 	})

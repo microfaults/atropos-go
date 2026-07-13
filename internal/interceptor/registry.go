@@ -2,11 +2,18 @@ package interceptor
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
 )
+
+// errRegistryClosed is returned by StartOrJoin once the registry is closed.
+// A closed registry's context is cancelled and its WaitGroup has already
+// drained, so starting a fault would run it on a dead context and call
+// wg.Add after Wait returned. Refusing keeps that invariant intact.
+var errRegistryClosed = errors.New("interceptor: fault registry is closed")
 
 // FaultRegistry tracks every running background fault under its rule/slot
 // key. It exists for two reasons, and both are lifecycle, not bookkeeping:
@@ -57,6 +64,10 @@ func (r *FaultRegistry) StartOrJoin(
 	startFn func(ctx context.Context) (*fault.Handle, error),
 ) (*fault.Handle, bool, error) {
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil, false, errRegistryClosed
+	}
 	if policy == evaluator.DeduplicateByRule && len(r.active[key]) > 0 {
 		r.mu.Unlock()
 		return nil, true, nil
