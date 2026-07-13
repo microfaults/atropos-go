@@ -201,6 +201,74 @@ func TestProxy_Stop(t *testing.T) {
 	t.Logf("proxy stopped: listened on %s, total=%d conns", d.ListenAddr, d.TotalConnections)
 }
 
+// TestProxy_Stop_TearsDownIdleAffectedConn pins the X4 fix: a network fault
+// with a live but idle "affected" connection must tear that connection down
+// when Stopped. The per-direction toxics block in src.Read on an idle
+// keep-alive stream and only check ctx between reads, so without a ctx-done
+// watcher closing the conns the blocked reads never return -- the fault's
+// shaping crosses into the next phase and handle.Send never fires, hanging
+// registry teardown.
+func TestProxy_Stop_TearsDownIdleAffectedConn(t *testing.T) {
+	upstream, cleanup := startEchoServer(t)
+	defer cleanup()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyAddr := ln.Addr().String()
+	ln.Close()
+
+	// Scope defaults to 1.0, so the single connection below is always
+	// affected. Both directions carry a blocking toxic: each stream worker
+	// sits in Latency.Pipe's src.Read on its idle half (client->server and
+	// server->client), so neither returns on ctx cancellation on its own --
+	// only closing the conns can unblock them.
+	p := &Proxy{Config: Config{
+		FaultConfig: fault.FaultConfig{Duration: 30 * time.Second},
+		Listen:      proxyAddr,
+		Upstream:    upstream,
+		Toxics: []ToxicLink{
+			{Toxic: &Latency{Delay: 10 * time.Millisecond}, Direction: Upstream},
+			{Toxic: &Latency{Delay: 10 * time.Millisecond}, Direction: Downstream},
+		},
+	}}
+
+	handle, err := p.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Open a connection through the proxy and hold it idle (no bytes sent).
+	conn, err := net.DialTimeout("tcp", proxyAddr, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Let the proxy accept, dial upstream, and settle both stream workers
+	// into their blocking reads.
+	time.Sleep(200 * time.Millisecond)
+
+	// Rule removed at phase end -> the registry cancels the fault ctx.
+	handle.Stop()
+
+	select {
+	case res := <-handle.Done():
+		if res.ActualDuration > 5*time.Second {
+			t.Fatalf("proxy kept running %s after Stop (idle conn not torn down)", res.ActualDuration)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not tear down the idle affected connection: handle never fired (phase-isolation leak / Close would hang)")
+	}
+
+	// The client side must observe the connection close, not keep flowing.
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("expected the affected client connection to be closed after Stop")
+	}
+}
+
 func TestProxy_InvalidConfig(t *testing.T) {
 	tests := []struct {
 		name string

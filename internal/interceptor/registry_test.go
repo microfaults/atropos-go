@@ -198,6 +198,29 @@ func TestRegistry_InstantFaultDoesNotLeak(t *testing.T) {
 	}
 }
 
+// TestRegistry_StartOrJoin_AfterCloseRefuses pins the closed-guard: once the
+// registry is closed, StartOrJoin must refuse rather than start a fault on a
+// cancelled context and call wg.Add after Close's Wait already returned.
+func TestRegistry_StartOrJoin_AfterCloseRefuses(t *testing.T) {
+	r := NewFaultRegistry()
+	r.Close()
+
+	var started atomic.Int32
+	h, deduped, err := r.StartOrJoin("k", evaluator.DeduplicateByRule, func(ctx context.Context) (*fault.Handle, error) {
+		started.Add(1)
+		return newStubFault(time.Second).Start(ctx)
+	})
+	if err == nil {
+		t.Fatal("expected error from StartOrJoin on a closed registry")
+	}
+	if h != nil || deduped {
+		t.Fatalf("closed registry must not start or dedup: h=%v deduped=%v", h, deduped)
+	}
+	if started.Load() != 0 {
+		t.Fatalf("startFn ran %d times on a closed registry, want 0", started.Load())
+	}
+}
+
 func TestRegistry_StopUnknownKeyAndNil(t *testing.T) {
 	r := NewFaultRegistry()
 	defer r.Close()

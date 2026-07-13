@@ -1,11 +1,16 @@
 package atropos
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
 )
 
 func TestFaultAdmin_PostCPUStress(t *testing.T) {
@@ -181,6 +186,129 @@ func TestFaultAdmin_MethodNotAllowed(t *testing.T) {
 
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("expected 405, got %d", rec.Code)
+	}
+}
+
+// seedLongFault returns a startFn for a background-style fault that runs
+// until its context is cancelled, mirroring how rule-attached background
+// faults land in the registry.
+func seedLongFault(ctx context.Context) (*fault.Handle, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	h := fault.NewHandle(cancel)
+	go func() {
+		<-ctx.Done()
+		h.Send(fault.Result{})
+	}()
+	return h, nil
+}
+
+// TestFaultAdminHandler_HostConfigured_Returns409 pins the A1 fix: once a
+// host has called Configure, a stray request to the zero-arg admin handler
+// (even a GET) must NOT lazily reconfigure the SDK onto the demo evaluator.
+// Doing so previously closed the shared fault registry mid-experiment,
+// cancelling running background faults and orphaning the live middleware's
+// interceptor. The handler must return 409 and leave the registry untouched.
+func TestFaultAdminHandler_HostConfigured_Returns409(t *testing.T) {
+	// Host configures the SDK with its own evaluator + cache-box (the
+	// manteion-driven path). The live middleware captures this interceptor.
+	eval := NewStaticEvaluator(StaticRule{Name: "r1", Point: Egress})
+	cb := NewCacheBox(CacheBoxConfig{})
+	Configure(WithEvaluator(eval), WithCacheBoxCoordinator(cb))
+	defer Configure() // reset the package interceptor for later tests
+
+	regBefore := defaultRegistry
+
+	mwCalled := false
+	mw := IngressMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mwCalled = true
+		w.WriteHeader(http.StatusOK)
+	}), "a1-svc")
+
+	// Seed a running background fault through the shared registry.
+	h, deduped, err := defaultRegistry.StartOrJoin("a1-bg", evaluator.DeduplicateByRule, seedLongFault)
+	if err != nil || deduped {
+		t.Fatalf("seed fault: err=%v deduped=%v", err, deduped)
+	}
+
+	// A stray GET to the zero-arg admin handler must be refused, not honored.
+	rec := httptest.NewRecorder()
+	FaultAdminHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/admin/fault", nil))
+
+	// (a) 409 with a JSON error envelope.
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("GET on host-configured SDK: status = %d, want 409; body = %s", rec.Code, rec.Body.String())
+	}
+	var er ErrorResponse
+	if uerr := json.Unmarshal(rec.Body.Bytes(), &er); uerr != nil || er.Error == "" {
+		t.Fatalf("expected JSON error body, got %q (unmarshal err=%v)", rec.Body.String(), uerr)
+	}
+
+	// (b) the registry was neither swapped nor closed: same pointer, and the
+	// previously-started fault is still live (not cancelled by a reconfigure).
+	if defaultRegistry != regBefore {
+		t.Fatal("defaultRegistry pointer changed after a host-configured GET")
+	}
+	select {
+	case <-h.Done():
+		t.Fatal("host-configured GET closed the registry and cancelled a running background fault")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// (c) a fresh StartOrJoin on the same registry still succeeds (not closed).
+	h2, _, err := defaultRegistry.StartOrJoin("a1-probe", evaluator.DeduplicateByRule, seedLongFault)
+	if err != nil {
+		t.Fatalf("registry refused a new fault after the GET (closed?): %v", err)
+	}
+
+	// The live middleware still routes through its captured interceptor.
+	mwRec := httptest.NewRecorder()
+	mw.ServeHTTP(mwRec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if mwRec.Code != http.StatusOK || !mwCalled {
+		t.Fatalf("live middleware broken after GET: code=%d called=%v", mwRec.Code, mwCalled)
+	}
+
+	// The seeded fault remains stoppable through the same registry.
+	defaultRegistry.Stop("a1-bg")
+	select {
+	case <-h.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("seeded fault did not stop through the registry")
+	}
+
+	// Clean up so the shared registry returns empty for later tests.
+	defaultRegistry.Stop("a1-probe")
+	<-h2.Done()
+}
+
+// TestFaultAdminHandlerWith_ExplicitMountUnaffected proves the 409 guard is
+// scoped to the zero-arg handler: the explicit mount-your-own constructor
+// keeps serving normally even when the SDK is host-configured.
+func TestFaultAdminHandlerWith_ExplicitMountUnaffected(t *testing.T) {
+	Configure(WithEvaluator(NewStaticEvaluator()))
+	defer Configure()
+	if !hostConfigured.Load() {
+		t.Fatal("precondition: expected hostConfigured after Configure")
+	}
+
+	eval := &DemoEvaluator{}
+	handler := FaultAdminHandlerWith(eval, nil)
+
+	rec := httptest.NewRecorder()
+	body := `{"fault_type":"latency","params":{"delay":"100ms"}}`
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body)))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("explicit handler POST: status = %d, want 201; body = %s", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/admin/fault", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("explicit handler GET: status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	var status FaultStatus
+	json.NewDecoder(rec.Body).Decode(&status)
+	if !status.Active {
+		t.Fatal("expected explicit handler to report the active fault")
 	}
 }
 
