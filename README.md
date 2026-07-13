@@ -4,6 +4,8 @@ Go SDK for fault injection, observability instrumentation, and request correlati
 
 Atropos embeds into your services as a library. It provides OpenTelemetry instrumentation out of the box, evaluates developer-defined rules to decide when and where to inject faults, and emits rich trace data so the effects of those faults are observable. The SDK is useful for pure observability even without fault injection configured.
 
+In the faults-lab instrument, atropos is the in-process measurement arm: it records a service's egress HTTP responses during baseline phases, replays them **fail-closed** when the service is frozen for isolation phases, injects faults on rule match, and keeps per-`(experiment, phase)` fidelity counters — all driven by rules polled from the manteion control plane.
+
 ```go
 // Bootstrap OTel for the entire service (replaces manual TracerProvider boilerplate).
 shutdown, _ := atropos.Init(ctx, atropos.WithServiceName("checkout"))
@@ -28,14 +30,13 @@ A snapshot of what's shipped on `main`. For the research vision (cache-box primi
 | Inline faults (latency, error, hang) | Shipped |
 | Network faults (TCP proxy: RST, blackhole, retransmit_delay, latency, throttle, drip) | Shipped |
 | Resource faults (CPU, I/O, disk, memory) | Shipped |
-| Cache-box (egress HTTP) — passthrough / replay / replay-with-delay | Shipped (Stage 1) |
-| `FaultAdminHandler` — `/admin/fault` runtime fault control | Shipped |
-| `CacheBoxAdminHandler` — `/admin/cachebox` stats, delay source, clear | Shipped |
-| `RulesAdminHandler` — `/admin/rules` atomic rule swap | Shipped |
+| Cache-box fidelity stack — fail-closed replay, split record/replay store, staged preload (W5 checksum), per-phase fidelity counters, drain reports | Shipped |
+| SDK ↔ manteion wire protocol — `ConnectManteion` poll loop (empty rule set is authoritative), `Register`/`Apply`, `CompiledRule` decoders, SSE nudge | Shipped |
+| Fault registry — per-key `Stop`, fired on rule replace / slot clear / watchdog / admin delete | Shipped |
+| Route publishing — `RegisterRoutes` rides the register payload | Shipped |
+| `FaultAdminHandler` / `CacheBoxAdminHandler` / `RulesAdminHandler` runtime control | Shipped |
 | `StaticEvaluator` with versioned atomic rule swap (`SetRules`) | Shipped |
-| Prometheus metrics for HTTP ingress/egress | Shipped |
-| SDK → manteion `Register` / `Apply` wire types | On `feat/admin-endpoints`, not yet merged |
-| `CompiledRule` decoder for manteion wire format | On `feat/admin-endpoints`, not yet merged |
+| Prometheus metrics for HTTP ingress/egress + cache-box | Shipped |
 | Cache-box on ingress + gRPC | Not yet implemented |
 | OPA-backed evaluator | Not yet implemented |
 | Polyglot bindings (DeathStarBench target) | Design only (branch `chore/polyglot-bindings`) |
@@ -71,10 +72,11 @@ A snapshot of what's shipped on `main`. For the research vision (cache-box primi
 │  Cache-box                   (internal/cachebox)             │
 │                                                              │
 │   passthrough  ──► forward to real upstream, record          │
-│   replay       ──► serve cached response, zero upstream load │
-│   replay_delay ──► serve cached response + synthetic latency │
+│   replay       ──► serve installed set; miss = synthetic 503 │
+│   replay_delay ──► replay + synthetic latency (fail-closed)  │
 │                                                              │
-│   MemStore (LRU + TTL) · Recorder (async) · DelaySource      │
+│   ReplaySet (immutable) · RecordBuffer · PreloadStore (W5)   │
+│   FidelityRegistry (per-phase) · Recorder (async) · Delay    │
 │                                                              │
 ├──────────────────────────────────────────────────────────────┤
 │  Fault taxonomy             (internal/fault)                 │
@@ -96,13 +98,16 @@ A snapshot of what's shipped on `main`. For the research vision (cache-box primi
 ## Installation
 
 ```bash
-go get atropos-go
+go get git.ucsc.edu/microfaults/atropos-go@<tag>   # pin a v0.0.9-alpha.<sha> tag; never track a branch
 ```
 
-The gRPC interceptors live in a separate subpackage so HTTP-only services never pull in `google.golang.org/grpc`:
+Consumers (manteion, the service-beds mesh) require the SDK **by tag** with no `replace`
+directive, so a build is reproducible from the module proxy/VCS alone (`GOPRIVATE=git.ucsc.edu/*`).
+The gRPC interceptors live in a separate subpackage so HTTP-only services never pull in
+`google.golang.org/grpc`:
 
 ```bash
-go get atropos-go/grpc
+go get git.ucsc.edu/microfaults/atropos-go/grpc
 ```
 
 ## Quick Start
@@ -225,20 +230,16 @@ atropos.Configure(atropos.WithEvaluator(eval))
 
 ### 6. Cache-Box (Egress)
 
-Cache-box is a testing primitive that "freezes" a downstream dependency by replaying recorded responses instead of forwarding to the real service. Three modes, selectable per-request via `Decision.CacheBox`:
+Cache-box is the measurement primitive that "freezes" a downstream dependency by replaying recorded responses instead of forwarding to the real service. Three modes, selectable per-request via `Decision.CacheBox` (in practice: via the cache-box rule manteion synthesizes for the active experiment phase):
 
-- **`CacheBoxPassthrough`** (default): forward to real upstream, record request/response pair asynchronously
-- **`CacheBoxReplay`**: serve cached response immediately; zero upstream load
-- **`CacheBoxReplayDelay`**: serve cached response after a synthetic delay (observed p50, or a fitted lognormal distribution)
+- **`CacheBoxPassthrough`**: forward to real upstream, record the request/response pair asynchronously under the rule's authoritative key strategy
+- **`CacheBoxReplay`**: serve from the installed replay set; a miss is a **counted synthetic 503**, never a live call (fail-closed — this is what makes a frozen phase trustworthy)
+- **`CacheBoxReplayDelay`**: replay plus a synthetic delay (fitted lognormal pushed by manteion, or observed)
+
+The store is split so record traffic can never evict replay data: an immutable, atomically-swapped **ReplaySet** serves replays (installed only via staged preload or commit), while a bounded **RecordBuffer** absorbs recording. Replay lookups are scoped to the rule's `(experiment_id, phase_id)` — a hit against another phase's set fails closed and is counted. Every drop (recorder backpressure, oversize response, push failure) increments a per-phase fidelity counter, and phase end triggers a flush + **drain report** to manteion so recording completeness is verified, not assumed.
 
 ```go
-import "atropos-go/internal/cachebox"
-
-cb := cachebox.New(
-    cachebox.NewMemStore(cachebox.MemStoreConfig{MaxBytes: 64 << 20}),
-    cachebox.WithKeyStrategy(cachebox.KeyStrategyExact),
-    cachebox.WithDelaySource(cachebox.NewObservedDelaySource()),
-)
+cb := atropos.NewCacheBox(atropos.CacheBoxConfig{ /* zero value = sane defaults */ })
 atropos.Configure(atropos.WithCacheBoxCoordinator(cb))
 
 client := &http.Client{
@@ -246,9 +247,9 @@ client := &http.Client{
 }
 ```
 
-Response headers on replay: `X-Atropos-Cache-Key`, `X-Atropos-Cache-Mode`, `X-Atropos-Cache-Latency-Us`. Cache misses fall through to passthrough. Responses larger than `DefaultMaxBodyBytes` (1 MiB) stream through unchanged without caching.
+Response headers on replay: `X-Atropos-Cache-Key`, `X-Atropos-Cache-Mode`, `X-Atropos-Cache-Latency-Us`; fail-closed misses carry `X-Atropos-Cache-Miss`. Oversize responses (> 1 MiB by default) stream through unchanged and are **counted as drops** under a recording rule. See "Manteion integration & the fidelity pipeline" below for the full host wiring.
 
-Stage 1 covers **egress HTTP only**. Ingress and gRPC are tracked in Ongoing Development.
+Cache-box covers **egress HTTP only**. Ingress and gRPC are tracked in Ongoing Development.
 
 ### 7. Admin Handlers
 
@@ -256,7 +257,7 @@ Three `http.Handler` factories for runtime control. Mount on an internal admin m
 
 #### `FaultAdminHandler()` — `/admin/fault`
 
-Single-fault runtime control via a built-in `DemoEvaluator`. Suitable for demos and single-fault scenarios; not for rule libraries.
+Single-fault runtime control via a built-in `DemoEvaluator`. Suitable for demos and single-fault scenarios; not for rule libraries. On a host that has already called `Configure` (any manteion-connected service), the zero-argument `FaultAdminHandler()` refuses with **409** rather than silently reconfiguring the SDK — mount `FaultAdminHandlerWith(eval, ...)` explicitly if you need both.
 
 | Method | Body | Response |
 |---|---|---|
@@ -370,9 +371,9 @@ Faults run in one of two modes:
 - **Inline:** Blocks the request until the fault completes. Used for latency, error, and hang faults where the caller should experience the delay.
 - **Background:** Runs independently of the request lifecycle. Used for resource faults (CPU, I/O, memory, disk) and network proxies that outlive individual requests.
 
-### Cache-box never blocks the hot path
+### Cache-box never blocks the hot path — but every drop is counted
 
-The cache-box recorder uses a bounded channel with an async drain goroutine. When the channel is full (e.g., a burst of unique requests faster than the recorder can persist), new entries are dropped rather than blocking the request path. Replay reads are O(1) against the in-memory LRU. Oversized responses (> 1 MiB) stream through unchanged via `io.MultiReader` without caching.
+The cache-box recorder uses a bounded channel with an async drain goroutine. When the channel is full (e.g., a burst of unique requests faster than the recorder can persist), new entries are dropped rather than blocking the request path — and the drop increments the per-`(experiment, phase)` fidelity counter, so the drain barrier and verdict see it. Replay reads are O(1) against the immutable ReplaySet snapshot. Oversized responses (> 1 MiB) stream through unchanged via `io.MultiReader`, counted as drops under a recording rule.
 
 ### gRPC in a separate subpackage
 
@@ -461,30 +462,63 @@ Call `Configure` after `Init` and before serving traffic. Each option replaces i
 
 ---
 
+## Manteion integration & the fidelity pipeline
+
+The SDK-initiated path is the production one: `ConnectManteion(ctx, serviceName, opts...)`
+registers the instance, then polls `GET /api/v1/sdk/rules` (SSE `rules_changed` nudges between
+intervals). The poll payload is the **full desired state** — an empty rule set is authoritative
+(rules cleared, running background faults stopped by key, drain tracker fired), not "no change".
+Cache-box record/replay rules arrive with a `CacheBoxContext` carrying the `(experiment_id,
+phase_id)` pair and the authoritative key strategy; the record path keys entries with exactly that
+strategy and ships it as wire provenance.
+
+The fidelity pipeline around a recording phase:
+
+1. **Record** — passthrough rule active; entries land in the RecordBuffer and stream to manteion
+   (`POST /api/v1/cache/ingest`) in batches with per-pair monotonic `batch_seq`.
+2. **Drain** — the rule leaves the poll set at phase end; the drain tracker flushes the recorder,
+   settles all in-flight batches, then POSTs a per-pair drain report (recorded / pushed / dropped).
+   Manteion's drain barrier compares those against what it actually received.
+3. **Preload** — for the isolation phase, manteion stages the recording back in via
+   `POST /cachebox/preload/{begin,chunk,commit}`; commit verifies a W5 checksum and atomically
+   installs the ReplaySet. Mismatch = 409, staging dropped, prior set untouched.
+4. **Freeze/replay** — the synthesized replay rule + a delay source (`POST /admin/cachebox/delay`)
+   freeze the service; misses fail closed and are counted; manteion pulls
+   `GET /cachebox/fidelity?experiment_id=&phase_id=` (W6) at phase end for the verdict.
+
+Canonical host wiring — identity resolution, push client, handler mounts — lives in service-beds
+(`microservices-demo-go/src/*/atropos_wiring.go`, copied verbatim across the mesh services). The
+essentials:
+
+```go
+cb := atropos.NewCacheBox(atropos.CacheBoxConfig{})
+push := atropos.NewCachePushClient(atropos.CachePushConfig{
+    BaseURL: manteionURL, Service: service, Instance: instanceID,
+})
+push.BindFidelity(cb.Fidelity()) // before traffic — else drain reports carry zero push counts
+
+mux.Handle("/admin/cachebox", atropos.CacheBoxAdminHandler(cb))  // bare AND subtree: a subtree
+mux.Handle("/admin/cachebox/", atropos.CacheBoxAdminHandler(cb)) // pattern alone 301s the bare path
+mux.Handle("/cachebox/preload/", atropos.CacheBoxPreloadHandler(cb))
+mux.Handle("GET /cachebox/fidelity", atropos.CacheBoxFidelityHandler(cb, service, instanceID))
+```
+
+The instance identity **must be the same string** in the register call, the push client, and the
+fidelity handler — manteion correlates all three (precedence: `MANTEION_INSTANCE_ID` > hostname >
+service name). Environment read by `ConnectManteion`: `MANTEION_URL`, `MANTEION_INSTANCE_ID`,
+`MANTEION_ADVERTISE_ADDR`, `MANTEION_SERVICE_VERSION`, `MANTEION_INIT_TIMEOUT`; `ATROPOS_CONFIG`
+points at an optional config file. Services can publish their route table into the register
+payload with `atropos.RegisterRoutes(...)`.
+
+---
+
 ## Ongoing Development
 
-Active work in flight. Branches are called out where relevant.
+### Cache-box Stage 2
 
-### SDK ↔ manteion wire protocol (on `feat/admin-endpoints`, not yet merged)
-
-The next merge brings the SDK-side of the manteion integration:
-
-- `RegisterRequest` / `RegisterResponse` wire types for SDK startup registration
-- `Register(ctx, url)` — `POST /api/v1/sdk/register` against the manteion control plane
-- `Apply(resp *RegisterResponse)` — install intent state (active fault, compiled rules, cache-box config) returned by manteion
-- `CompiledRule` / `CompiledComposition` / `CompiledFault` decoders for manteion's wire format (inline, network, resource categories — all six toxic types, all four resource types)
-- `FaultRegistry` in the interceptor with dedup-by-rule + graceful shutdown so multiple overlapping rules don't start duplicate background faults
-- `StartPolicy` on `Decision` so non-inline faults can force Background execution cleanly
-
-Already exposed on main: `RulesAdminHandler` (manteion can push rules via HTTP right now), `CacheBoxAdminHandler` (manteion can swap the delay source with a fitted lognormal). The missing pieces above are for the SDK-initiated path (SDK registers with manteion on startup, pulls rules via register response) rather than the manteion-initiated push path that already works.
-
-### Cache-box Stage 2 and 3
-
-**Stage 2** — extend the modal dispatch to ingress HTTP and gRPC. The `Decision.CacheBox` field, key strategies, store, and recorder are already protocol-agnostic — only the middleware/interceptor glue is missing.
-
-**Stage 3** — wire the recorder's `PushFunc` hook so that:
-- Cached entries flow from the SDK to manteion asynchronously (for cross-pod replay consistency)
-- Fitted distribution parameters (lognormal mu/sigma) flow from manteion back to the SDK, replacing the in-process observed-delay source with a statistical one — the `POST /admin/cachebox/delay` endpoint is already shipped; manteion just needs to call it.
+Extend the modal dispatch to ingress HTTP and gRPC. The `Decision.CacheBox` field, key strategies,
+store, and recorder are already protocol-agnostic — only the middleware/interceptor glue is
+missing. (Egress HTTP, including the full fidelity pipeline above, is shipped.)
 
 ### Polyglot bindings for DeathStarBench
 
@@ -555,7 +589,7 @@ The public API is intentionally minimal so language bindings can stay thin. For 
 
 ## Related Repos
 
-- **`manteion-go`** — central control plane (rules, SDK registration, policy distribution, zeus proxy)
+- **`manteion-go`** — control plane: experiment/phase FSM, rule oracle, cache store, drain barrier, fidelity verdicts
 - **`manteion-ui`** — React admin UI on top of manteion
-- **`zeus-go`** — k6 workload runner and Archer attack orchestrator
-- **`service-beds`** — Online Boutique microservices in Go, target testbed
+- **`zeus-go`** — execution plane: k6 workflow-run launcher + vegeta attacks, driven by manteion
+- **`service-beds`** — Online Boutique microservices in Go, the instrumented target mesh
