@@ -127,6 +127,20 @@ func (p *Proxy) handleAffected(ctx context.Context, client *net.TCPConn, connID 
 		}
 	}
 
+	// The toxics block in src.Read and only check ctx between reads, so a
+	// stopped idle connection would keep shaping traffic into the next phase
+	// and pin the fault handle -- streamWorker's wg.Wait never returns, so
+	// FaultRegistry.Close hangs (X4). Close both conns on ctx.Done to force
+	// every blocked Read to return, mirroring bidirectionalCopy. The goroutine
+	// exits once ctx is cancelled (the proxy ctx always is, via its duration
+	// timeout or Stop); the redundant Close on the normal-close path is a
+	// harmless double-close.
+	go func() {
+		<-ctx.Done()
+		client.Close()
+		serverTCP.Close()
+	}()
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
