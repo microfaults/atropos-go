@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"time"
 
+	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
+
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
@@ -91,10 +93,16 @@ func EgressTransport(base http.RoundTripper, opts ...MiddlewareOption) http.Roun
 		httpClientRequestDuration.WithLabelValues(r.Method, status, target).Observe(duration)
 		httpClientRequestsTotal.WithLabelValues(r.Method, status, target).Inc()
 
+		// Classification order matters: a fail-closed miss carries BOTH the
+		// miss marker and the mode header, so the miss check must run first
+		// or every counted-503 miss inflates the hit counter.
 		if resp != nil {
-			if mode := resp.Header.Get("X-Atropos-Cache-Mode"); mode != "" {
+			switch {
+			case resp.Header.Get(interceptor.HeaderCacheMiss) != "":
+				cacheBoxMissesTotal.Inc()
+			case resp.Header.Get(interceptor.HeaderCacheMode) != "":
 				cacheBoxHitsTotal.Inc()
-			} else if resp.Header.Get("X-Atropos-Cache-Key") != "" {
+			case resp.Header.Get(interceptor.HeaderCacheKey) != "":
 				cacheBoxRecordsTotal.Inc()
 			}
 		}
