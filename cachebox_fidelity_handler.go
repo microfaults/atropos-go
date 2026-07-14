@@ -7,7 +7,7 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 )
 
-// CacheBoxFidelityHandler returns an http.Handler serving
+// cacheBoxFidelityHandler serves
 // GET /cachebox/fidelity?experiment_id=&phase_id= (wire spec §W6) --
 // manteion's synchronous, pull-based read of everything needed to compute
 // a phase's VALID/INVALID verdict from this instance (design doc Q6).
@@ -16,9 +16,7 @@ import (
 // this SDK instance, not the queried experiment/phase.
 //
 // Example:
-//
-//	mux.Handle("/cachebox/fidelity", atropos.CacheBoxFidelityHandler(cb, "cart", instanceID))
-func CacheBoxFidelityHandler(cb *CacheBox, service, instanceID string) http.Handler {
+func cacheBoxFidelityHandler(cb *cachebox.CacheBox, service, instanceID string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			jsonError(w, "method not allowed", http.StatusMethodNotAllowed)

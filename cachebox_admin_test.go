@@ -6,19 +6,21 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 )
 
 func TestCacheBoxAdminHandler(t *testing.T) {
-	newCB := func(t *testing.T) *CacheBox {
+	newCB := func(t *testing.T) *cachebox.CacheBox {
 		t.Helper()
-		cb := NewCacheBox(CacheBoxConfig{})
+		cb := cachebox.New(cachebox.Config{})
 		t.Cleanup(cb.Stop)
 		return cb
 	}
 
 	t.Run("GET returns 200 with store and recorder stats", func(t *testing.T) {
 		cb := newCB(t)
-		handler := CacheBoxAdminHandler(cb)
+		handler := cacheBoxAdminHandler(cb)
 
 		req := httptest.NewRequest(http.MethodGet, "/admin/cachebox", nil)
 		rec := httptest.NewRecorder()
@@ -46,7 +48,7 @@ func TestCacheBoxAdminHandler(t *testing.T) {
 
 	t.Run("POST /delay with valid params returns 204", func(t *testing.T) {
 		cb := newCB(t)
-		handler := CacheBoxAdminHandler(cb)
+		handler := cacheBoxAdminHandler(cb)
 
 		body := `{"mu":1.0,"sigma":0.5,"seed":42}`
 		req := httptest.NewRequest(http.MethodPost, "/admin/cachebox/delay", strings.NewReader(body))
@@ -60,7 +62,7 @@ func TestCacheBoxAdminHandler(t *testing.T) {
 
 	t.Run("POST /delay with negative sigma returns 400", func(t *testing.T) {
 		cb := newCB(t)
-		handler := CacheBoxAdminHandler(cb)
+		handler := cacheBoxAdminHandler(cb)
 
 		body := `{"mu":1.0,"sigma":-1.0,"seed":42}`
 		req := httptest.NewRequest(http.MethodPost, "/admin/cachebox/delay", strings.NewReader(body))
@@ -74,7 +76,7 @@ func TestCacheBoxAdminHandler(t *testing.T) {
 
 	t.Run("DELETE returns 204 and clears the store", func(t *testing.T) {
 		cb := newCB(t)
-		handler := CacheBoxAdminHandler(cb)
+		handler := cacheBoxAdminHandler(cb)
 
 		req := httptest.NewRequest(http.MethodDelete, "/admin/cachebox", nil)
 		rec := httptest.NewRecorder()
@@ -90,7 +92,7 @@ func TestCacheBoxAdminHandler(t *testing.T) {
 
 	t.Run("PUT returns 405", func(t *testing.T) {
 		cb := newCB(t)
-		handler := CacheBoxAdminHandler(cb)
+		handler := cacheBoxAdminHandler(cb)
 
 		req := httptest.NewRequest(http.MethodPut, "/admin/cachebox", nil)
 		rec := httptest.NewRecorder()

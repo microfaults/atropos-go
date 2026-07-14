@@ -21,24 +21,24 @@ func TestIntegration_IngressMiddleware_WithFault(t *testing.T) {
 		sdktrace.WithSampler(sdktrace.AlwaysSample()),
 	)
 
-	shutdown, err := Init(context.Background(), WithTracerProvider(tp))
+	shutdown, err := initTelemetry(context.Background(), telemetryConfig{tracerProvider: tp})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer shutdown(context.Background())
 
-	Configure(WithEvaluator(&integrationEval{
+	configure(&integrationEval{
 		decision: &evaluator.Decision{
 			Fault:  &inline.Latency{Delay: 50 * time.Millisecond},
 			Reason: "integration test",
 			Mode:   evaluator.Inline,
 		},
-	}))
-	defer Configure()
+	}, nil)
+	defer configure(nil, nil)
 
-	handler := IngressMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := ingressMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-	}), "test-service")
+	}), "test-service", currentInterceptor())
 
 	req := httptest.NewRequest("GET", "/test", nil)
 	rec := httptest.NewRecorder()

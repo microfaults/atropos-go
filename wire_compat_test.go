@@ -1,9 +1,9 @@
-package atropos_test
+package atropos
 
 // Cross-repo wire contract tests for the manteion↔SDK sync payload. The
 // historical bug class here: manteion emitted "active_fault" (singular,
 // object) while the SDK decoded "active_faults" (plural, array) and silently
-// dropped the intent. Both ends now marshal/unmarshal atropos.RuleSync, and
+// dropped the intent. Both ends now marshal/unmarshal RuleSync, and
 // this test guards the full marshal → unmarshal → Apply loop including the
 // omitted-vs-empty field semantics Apply's reconciliation relies on.
 
@@ -12,20 +12,21 @@ import (
 	"strings"
 	"testing"
 
-	atropos "git.ucsc.edu/microfaults/atropos-go"
+	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
+	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 )
 
 func TestRuleSync_WireRoundTripAndApply(t *testing.T) {
-	sync := atropos.RuleSync{
+	sync := RuleSync{
 		Version: 7,
-		Rules: []atropos.CompiledRule{
+		Rules: []CompiledRule{
 			{
 				Name:           "lat-rule",
 				InjectionPoint: "ingress",
-				Labels:         map[string]string{"atropos.workflow": "browse"},
+				Labels:         map[string]string{"workflow": "browse"},
 				Mode:           "background",
 				Priority:       50,
-				Fault: &atropos.CompiledFault{
+				Fault: &CompiledFault{
 					Category:  "inline",
 					FaultType: "latency",
 					Params:    json.RawMessage(`{"delay":"250ms","jitter":"50ms"}`),
@@ -35,17 +36,17 @@ func TestRuleSync_WireRoundTripAndApply(t *testing.T) {
 				Name:           "cb-rule",
 				InjectionPoint: "egress",
 				Mode:           "inline",
-				CacheBox:       &atropos.CompiledCacheBox{Mode: "replay_with_delay", KeyStrategy: "exact_with_host"},
+				CacheBox:       &CompiledCacheBox{Mode: "replay_with_delay", KeyStrategy: "exact_with_host"},
 			},
 		},
-		ActiveFaults: []atropos.FaultRequest{{
+		ActiveFaults: []FaultRequest{{
 			ID:         "cfg-123",
 			Category:   "resource",
 			FaultType:  "cpu",
 			DurationMs: 60000,
 			Params:     json.RawMessage(`{"target_load":0.7}`),
 		}},
-		FreezeCfg: &atropos.DelayRequest{Mu: 8.5, Sigma: 0.3, Seed: 42},
+		FreezeCfg: &DelayRequest{Mu: 8.5, Sigma: 0.3, Seed: 42},
 	}
 
 	// Wire round-trip.
@@ -60,19 +61,19 @@ func TestRuleSync_WireRoundTripAndApply(t *testing.T) {
 			t.Errorf("wire payload missing %s: %s", key, raw)
 		}
 	}
-	var decoded atropos.RuleSync
+	var decoded RuleSync
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
 	// Apply the decoded payload into fresh targets.
-	eval := atropos.NewStaticEvaluator()
-	demo := &atropos.DemoEvaluator{}
-	cb := atropos.NewCacheBox(atropos.CacheBoxConfig{})
+	eval := evaluator.NewStaticEvaluator()
+	demo := &demoEvaluator{}
+	cb := cachebox.New(cachebox.Config{})
 	defer cb.Stop()
 
-	resp := atropos.RegisterResponse{Status: "poll", RuleSync: decoded}
-	if err := atropos.Apply(resp, atropos.ApplyTargets{Evaluator: eval, DemoEval: demo, CacheBox: cb}); err != nil {
+	resp := RegisterResponse{Status: "poll", RuleSync: decoded}
+	if err := apply(resp, applyTargets{Evaluator: eval, DemoEval: demo, CacheBox: cb}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	if got := len(eval.Rules()); got != 2 {
@@ -90,15 +91,15 @@ func TestRuleSync_WireRoundTripAndApply(t *testing.T) {
 // explicitly instead of omitempty.
 func TestRuleSync_EmptyVsAbsentSemantics(t *testing.T) {
 	// Arm one slot first.
-	demo := &atropos.DemoEvaluator{}
-	armed := atropos.RegisterResponse{RuleSync: atropos.RuleSync{
-		ActiveFaults: []atropos.FaultRequest{{
+	demo := &demoEvaluator{}
+	armed := RegisterResponse{RuleSync: RuleSync{
+		ActiveFaults: []FaultRequest{{
 			ID:        "f1",
 			FaultType: "latency",
 			Params:    json.RawMessage(`{"delay":"100ms"}`),
 		}},
 	}}
-	if err := atropos.Apply(armed, atropos.ApplyTargets{DemoEval: demo}); err != nil {
+	if err := apply(armed, applyTargets{DemoEval: demo}); err != nil {
 		t.Fatalf("arm: %v", err)
 	}
 	if len(demo.Active()) != 1 {
@@ -106,22 +107,22 @@ func TestRuleSync_EmptyVsAbsentSemantics(t *testing.T) {
 	}
 
 	// Pre-existing rules must survive an empty rules list.
-	eval := atropos.NewStaticEvaluator(atropos.StaticRule{Name: "keep", Point: atropos.Ingress})
+	eval := evaluator.NewStaticEvaluator(StaticRule{Name: "keep", Point: evaluator.Ingress})
 
 	// A marshalled empty RuleSync carries explicit empty arrays.
-	raw, _ := json.Marshal(atropos.RuleSync{Version: 8})
+	raw, _ := json.Marshal(RuleSync{Version: 8})
 	for _, key := range []string{`"rules"`, `"active_faults"`} {
 		if !strings.Contains(string(raw), key) {
 			t.Fatalf("empty RuleSync must still carry %s explicitly: %s", key, raw)
 		}
 	}
-	var decoded atropos.RuleSync
+	var decoded RuleSync
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	resp := atropos.RegisterResponse{Status: "poll", RuleSync: decoded}
-	if err := atropos.Apply(resp, atropos.ApplyTargets{Evaluator: eval, DemoEval: demo}); err != nil {
+	resp := RegisterResponse{Status: "poll", RuleSync: decoded}
+	if err := apply(resp, applyTargets{Evaluator: eval, DemoEval: demo}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 

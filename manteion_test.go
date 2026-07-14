@@ -10,16 +10,18 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 )
 
 // newTestEvaluator returns a fresh StaticEvaluator with zero rules.
-func newTestEvaluator() *StaticEvaluator {
-	return NewStaticEvaluator()
+func newTestEvaluator() *evaluator.StaticEvaluator {
+	return evaluator.NewStaticEvaluator()
 }
 
-// newTestTargets returns ApplyTargets with a fresh evaluator.
-func newTestTargets() ApplyTargets {
-	return ApplyTargets{Evaluator: newTestEvaluator()}
+// newTestTargets returns applyTargets with a fresh evaluator.
+func newTestTargets() applyTargets {
+	return applyTargets{Evaluator: newTestEvaluator()}
 }
 
 // ---------- waitForReady ----------
@@ -32,7 +34,7 @@ func TestManteionClient_WaitForReady_Success(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := &ManteionClient{
+	c := &manteionClient{
 		cfg: manteionConfig{
 			url:         srv.URL,
 			initTimeout: 5 * time.Second,
@@ -59,7 +61,7 @@ func TestManteionClient_WaitForReady_Retry(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := &ManteionClient{
+	c := &manteionClient{
 		cfg: manteionConfig{
 			url:         srv.URL,
 			initTimeout: 10 * time.Second,
@@ -81,7 +83,7 @@ func TestManteionClient_WaitForReady_Timeout(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := &ManteionClient{
+	c := &manteionClient{
 		cfg: manteionConfig{
 			url:         srv.URL,
 			initTimeout: 600 * time.Millisecond,
@@ -105,10 +107,10 @@ func TestManteionClient_PollLoop_304(t *testing.T) {
 	defer srv.Close()
 
 	eval := newTestEvaluator()
-	c := &ManteionClient{
+	c := &manteionClient{
 		cfg:        manteionConfig{url: srv.URL, serviceName: "svc"},
 		httpClient: &http.Client{Timeout: 5 * time.Second},
-		targets:    ApplyTargets{Evaluator: eval},
+		targets:    applyTargets{Evaluator: eval},
 		logger:     slog.New(slog.DiscardHandler),
 	}
 
@@ -142,10 +144,10 @@ func TestManteionClient_PollLoop_RuleUpdate(t *testing.T) {
 	defer srv.Close()
 
 	eval := newTestEvaluator()
-	c := &ManteionClient{
+	c := &manteionClient{
 		cfg:        manteionConfig{url: srv.URL, serviceName: "svc"},
 		httpClient: &http.Client{Timeout: 5 * time.Second},
-		targets:    ApplyTargets{Evaluator: eval},
+		targets:    applyTargets{Evaluator: eval},
 		logger:     slog.New(slog.DiscardHandler),
 	}
 
@@ -183,14 +185,14 @@ func TestManteionClient_PollLoop_Recovery(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
 
-	c := &ManteionClient{
+	c := &manteionClient{
 		cfg:        manteionConfig{url: srv.URL, serviceName: "svc", pollInterval: 50 * time.Millisecond},
 		httpClient: &http.Client{Timeout: 5 * time.Second},
-		targets:    ApplyTargets{Evaluator: eval},
+		targets:    applyTargets{Evaluator: eval},
 		logger:     slog.New(slog.DiscardHandler),
 		pollCtx:    ctx,
 	}
-	c.status.Store(int32(ManteionConnected))
+	c.status.Store(int32(manteionConnected))
 
 	trigger := make(chan struct{}, 1)
 	c.wg.Go(func() { c.pollLoopWithTrigger(ctx, trigger) })
@@ -198,7 +200,7 @@ func TestManteionClient_PollLoop_Recovery(t *testing.T) {
 	// Wait until status recovers to Connected.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if ManteionStatus(c.status.Load()) == ManteionConnected && calls.Load() >= 3 {
+		if manteionStatus(c.status.Load()) == manteionConnected && calls.Load() >= 3 {
 			cancel()
 			c.wg.Wait()
 			return
@@ -221,24 +223,21 @@ func TestHealth_Status_AllStates(t *testing.T) {
 	}
 
 	eval := newTestEvaluator()
-	c := &ManteionClient{
+	c := &manteionClient{
 		cfg:     manteionConfig{url: "http://manteion:8080", serviceName: "svc"},
-		targets: ApplyTargets{Evaluator: eval},
+		targets: applyTargets{Evaluator: eval},
 		logger:  slog.New(slog.DiscardHandler),
 	}
 
 	// disconnected
-	c.status.Store(int32(ManteionDisconnected))
+	c.status.Store(int32(manteionDisconnected))
 	h = healthFrom(c)
 	if h.Status != "disconnected" {
 		t.Fatalf("disconnected status = %q, want disconnected", h.Status)
 	}
-	if Ready() { // global not set yet, uses healthFrom(nil) → offline
-		// OK — Ready() is offline mode (returns true)
-	}
 
 	// connected
-	c.status.Store(int32(ManteionConnected))
+	c.status.Store(int32(manteionConnected))
 	c.ruleVersion.Store(3)
 	c.lastPollAt.Store(time.Now().UnixNano())
 	h = healthFrom(c)
@@ -250,7 +249,7 @@ func TestHealth_Status_AllStates(t *testing.T) {
 	}
 
 	// degraded
-	c.status.Store(int32(ManteionDegraded))
+	c.status.Store(int32(manteionDegraded))
 	c.lastPollAt.Store(time.Now().Add(-30 * time.Second).UnixNano())
 	h = healthFrom(c)
 	if h.Status != "degraded" {
@@ -261,10 +260,15 @@ func TestHealth_Status_AllStates(t *testing.T) {
 	}
 }
 
-// ---------- ConnectManteion offline mode ----------
+// ---------- connectManteion offline mode ----------
 
 func TestConnectManteion_Offline_NilNil(t *testing.T) {
-	c, err := ConnectManteion(t.Context(), "svc", WithOfflineMode(), WithApplyTargets(newTestTargets()))
+	c, err := connectManteion(t.Context(), manteionConfig{
+		serviceName: "svc",
+		offline:     true,
+		targets:     newTestTargets(),
+		logger:      slog.New(slog.DiscardHandler),
+	})
 	if err != nil {
 		t.Fatalf("offline mode returned error: %v", err)
 	}
@@ -272,8 +276,8 @@ func TestConnectManteion_Offline_NilNil(t *testing.T) {
 		t.Fatal("offline mode should return nil client")
 	}
 	// nil-receiver safe
-	if c.Status() != ManteionDisconnected {
-		t.Fatal("nil client Status() should be ManteionDisconnected")
+	if c.Status() != manteionDisconnected {
+		t.Fatal("nil client Status() should be manteionDisconnected")
 	}
 	if err := c.Close(t.Context()); err != nil {
 		t.Fatalf("nil Close: %v", err)
@@ -281,7 +285,11 @@ func TestConnectManteion_Offline_NilNil(t *testing.T) {
 }
 
 func TestConnectManteion_NoEvaluator_Error(t *testing.T) {
-	_, err := ConnectManteion(t.Context(), "svc", WithManteionURL("http://localhost:9999"))
+	_, err := connectManteion(t.Context(), manteionConfig{
+		serviceName: "svc",
+		url:         "http://localhost:9999",
+		logger:      slog.New(slog.DiscardHandler),
+	})
 	if err == nil {
 		t.Fatal("expected error when Evaluator is nil")
 	}
@@ -313,10 +321,10 @@ func TestFetchRules_BodyLimitEnforced(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := &ManteionClient{
+	c := &manteionClient{
 		cfg:        manteionConfig{url: srv.URL, serviceName: "svc"},
 		httpClient: &http.Client{Timeout: 5 * time.Second},
-		targets:    ApplyTargets{Evaluator: newTestEvaluator()},
+		targets:    applyTargets{Evaluator: newTestEvaluator()},
 		logger:     slog.New(slog.DiscardHandler),
 	}
 
@@ -328,10 +336,10 @@ func TestFetchRules_BodyLimitEnforced(t *testing.T) {
 
 // ---------- SSE stream parsing ----------
 
-// newTestSSEClient returns a ManteionClient wired to srv for SSE tests.
-func newTestSSEClient(t *testing.T, srv *httptest.Server) *ManteionClient {
+// newTestSSEClient returns a manteionClient wired to srv for SSE tests.
+func newTestSSEClient(t *testing.T, srv *httptest.Server) *manteionClient {
 	t.Helper()
-	return &ManteionClient{
+	return &manteionClient{
 		cfg:       manteionConfig{url: srv.URL, serviceName: "svc"},
 		sseClient: &http.Client{Timeout: 5 * time.Second},
 		logger:    slog.New(slog.DiscardHandler),
@@ -415,14 +423,14 @@ func TestClose_WaitsForRegisterGoroutine(t *testing.T) {
 
 	pollCtx, cancel := context.WithCancel(context.Background())
 
-	c := &ManteionClient{
+	c := &manteionClient{
 		cfg: manteionConfig{
 			url:         srv.URL,
 			serviceName: "svc",
 			instanceID:  "test-instance",
 		},
 		httpClient: &http.Client{Timeout: 5 * time.Second},
-		targets:    ApplyTargets{Evaluator: newTestEvaluator()},
+		targets:    applyTargets{Evaluator: newTestEvaluator()},
 		logger:     slog.New(slog.DiscardHandler),
 		pollCtx:    pollCtx,
 		cancel:     cancel,

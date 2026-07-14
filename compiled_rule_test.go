@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault/inline"
+
+	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 )
 
 func TestDecodeCompiledRules_Latency(t *testing.T) {
@@ -22,9 +24,9 @@ func TestDecodeCompiledRules_Latency(t *testing.T) {
 		},
 	}}
 
-	rules, err := DecodeCompiledRules(compiled)
+	rules, err := decodeCompiledRules(compiled)
 	if err != nil {
-		t.Fatalf("DecodeCompiledRules: %v", err)
+		t.Fatalf("decodeCompiledRules: %v", err)
 	}
 	if len(rules) != 1 {
 		t.Fatalf("expected 1 rule, got %d", len(rules))
@@ -34,10 +36,10 @@ func TestDecodeCompiledRules_Latency(t *testing.T) {
 	if sr.Name != "inject-latency" {
 		t.Errorf("Name: %q", sr.Name)
 	}
-	if sr.Point != Egress {
+	if sr.Point != evaluator.Egress {
 		t.Errorf("Point: %v", sr.Point)
 	}
-	if sr.Decision.Mode != Inline {
+	if sr.Decision.Mode != evaluator.Inline {
 		t.Errorf("Mode: %v", sr.Decision.Mode)
 	}
 	if sr.Decision.Fault == nil {
@@ -67,9 +69,9 @@ func TestDecodeCompiledRules_Error(t *testing.T) {
 		},
 	}}
 
-	rules, err := DecodeCompiledRules(compiled)
+	rules, err := decodeCompiledRules(compiled)
 	if err != nil {
-		t.Fatalf("DecodeCompiledRules: %v", err)
+		t.Fatalf("decodeCompiledRules: %v", err)
 	}
 
 	errFault, ok := rules[0].Decision.Fault.(*inline.Error)
@@ -92,9 +94,9 @@ func TestDecodeCompiledRules_Hang(t *testing.T) {
 		},
 	}}
 
-	rules, err := DecodeCompiledRules(compiled)
+	rules, err := decodeCompiledRules(compiled)
 	if err != nil {
-		t.Fatalf("DecodeCompiledRules: %v", err)
+		t.Fatalf("decodeCompiledRules: %v", err)
 	}
 
 	_, ok := rules[0].Decision.Fault.(*inline.Hang)
@@ -110,14 +112,14 @@ func TestDecodeCompiledRules_NoFault(t *testing.T) {
 		Mode:           "background",
 	}}
 
-	rules, err := DecodeCompiledRules(compiled)
+	rules, err := decodeCompiledRules(compiled)
 	if err != nil {
-		t.Fatalf("DecodeCompiledRules: %v", err)
+		t.Fatalf("decodeCompiledRules: %v", err)
 	}
 	if rules[0].Decision.Fault != nil {
 		t.Error("expected nil Fault for metadata-only rule")
 	}
-	if rules[0].Decision.Mode != Background {
+	if rules[0].Decision.Mode != evaluator.Background {
 		t.Errorf("Mode: %v", rules[0].Decision.Mode)
 	}
 }
@@ -147,7 +149,7 @@ func TestDecodeCompiledRules_JSONRoundtrip(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	rules, err := DecodeCompiledRules(decoded)
+	rules, err := decodeCompiledRules(decoded)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -175,7 +177,7 @@ func TestDecodeCompiledRules_UnknownCategory(t *testing.T) {
 		},
 	}}
 
-	_, err := DecodeCompiledRules(compiled)
+	_, err := decodeCompiledRules(compiled)
 	if err == nil {
 		t.Fatal("expected error for unknown category")
 	}
@@ -209,9 +211,9 @@ func TestDecodeCompiledRules_ResourceTypes(t *testing.T) {
 					RampDownMs: tc.rampDownMs,
 				},
 			}}
-			rules, err := DecodeCompiledRules(compiled)
+			rules, err := decodeCompiledRules(compiled)
 			if err != nil {
-				t.Fatalf("DecodeCompiledRules: %v", err)
+				t.Fatalf("decodeCompiledRules: %v", err)
 			}
 			if rules[0].Decision.Fault == nil {
 				t.Fatal("expected Fault to be set")
@@ -235,7 +237,7 @@ func TestDecodeCompiledRules_UnknownResourceType(t *testing.T) {
 		},
 	}}
 
-	_, err := DecodeCompiledRules(compiled)
+	_, err := decodeCompiledRules(compiled)
 	if err == nil {
 		t.Fatal("expected error for unknown resource type")
 	}
@@ -274,9 +276,9 @@ func TestDecodeCompiledRules_NetworkTypes(t *testing.T) {
 					DurationMs: 10000,
 				},
 			}}
-			rules, err := DecodeCompiledRules(compiled, WithNetworkResolver(stubResolver(tc.listen, "localhost:6379")))
+			rules, err := decodeCompiledRules(compiled, withNetworkResolver(stubResolver(tc.listen, "localhost:6379")))
 			if err != nil {
-				t.Fatalf("DecodeCompiledRules: %v", err)
+				t.Fatalf("decodeCompiledRules: %v", err)
 			}
 			if rules[0].Decision.Fault == nil {
 				t.Fatal("expected Fault to be set")
@@ -296,7 +298,7 @@ func TestDecodeCompiledRules_NetworkRequiresEnvelope(t *testing.T) {
 			DurationMs: 5000,
 		},
 	}}
-	_, err := DecodeCompiledRules(compiled, WithNetworkResolver(stubResolver(":1", "localhost:6379")))
+	_, err := decodeCompiledRules(compiled, withNetworkResolver(stubResolver(":1", "localhost:6379")))
 	if err == nil {
 		t.Fatal("expected error: missing network envelope")
 	}
@@ -313,7 +315,7 @@ func TestDecodeCompiledRules_NonNetworkRejectsEnvelope(t *testing.T) {
 			Params:    json.RawMessage(`{"delay":"10ms"}`),
 		},
 	}}
-	_, err := DecodeCompiledRules(compiled)
+	_, err := decodeCompiledRules(compiled)
 	if err == nil {
 		t.Fatal("expected error: envelope on non-network category")
 	}
@@ -331,7 +333,7 @@ func TestDecodeCompiledRules_NetworkInlineHostNotYetSupported(t *testing.T) {
 			DurationMs: 5000,
 		},
 	}}
-	_, err := DecodeCompiledRules(compiled)
+	_, err := decodeCompiledRules(compiled)
 	if err == nil {
 		t.Fatal("expected error: inline host not yet supported")
 	}
@@ -352,7 +354,7 @@ func TestDecodeCompiledRules_NetworkNoResolver(t *testing.T) {
 			DurationMs: 5000,
 		},
 	}}
-	_, err := DecodeCompiledRules(compiled)
+	_, err := decodeCompiledRules(compiled)
 	if err == nil {
 		t.Fatal("expected error: no resolver provided")
 	}
@@ -370,7 +372,7 @@ func TestDecodeCompiledRules_UnknownNetworkType(t *testing.T) {
 			DurationMs: 5000,
 		},
 	}}
-	_, err := DecodeCompiledRules(compiled, WithNetworkResolver(stubResolver(":19099", "localhost:6379")))
+	_, err := decodeCompiledRules(compiled, withNetworkResolver(stubResolver(":19099", "localhost:6379")))
 	if err == nil {
 		t.Fatal("expected error for unknown network type")
 	}
@@ -389,7 +391,7 @@ func TestDecodeCompiledRules_CompositionRejected(t *testing.T) {
 		},
 	}}
 
-	_, err := DecodeCompiledRules(compiled)
+	_, err := decodeCompiledRules(compiled)
 	if err == nil {
 		t.Fatal("expected error for composition rule")
 	}
@@ -417,9 +419,9 @@ func TestDecodeCompiledRules_PrioritySorted(t *testing.T) {
 		}},
 	}
 
-	rules, err := DecodeCompiledRules(compiled)
+	rules, err := decodeCompiledRules(compiled)
 	if err != nil {
-		t.Fatalf("DecodeCompiledRules: %v", err)
+		t.Fatalf("decodeCompiledRules: %v", err)
 	}
 	if len(rules) != 3 {
 		t.Fatalf("expected 3 rules, got %d", len(rules))
@@ -443,9 +445,9 @@ func TestDecodeCompiledRules_PriorityStable(t *testing.T) {
 		}},
 	}
 
-	rules, err := DecodeCompiledRules(compiled)
+	rules, err := decodeCompiledRules(compiled)
 	if err != nil {
-		t.Fatalf("DecodeCompiledRules: %v", err)
+		t.Fatalf("decodeCompiledRules: %v", err)
 	}
 
 	if rules[0].Name != "first" || rules[1].Name != "second" {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
+	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 )
 
 // RegisterRequest is the POST body for /api/v1/sdk/register.
@@ -38,23 +39,7 @@ type RegisterResponse struct {
 // registerTimeout is the default per-call deadline for Register.
 const registerTimeout = 5 * time.Second
 
-// Register POSTs a registration to manteion using http.DefaultClient.
-// The returned response may contain rules, active_fault, and freeze_cfg if
-// manteion has intent tracked for the registering service.
-//
-// baseURL is manteion's base URL (e.g. "http://manteion.control.svc:8080").
-// The request is subject to registerTimeout (5s) unless ctx has an earlier deadline.
-func Register(ctx context.Context, baseURL string, req RegisterRequest) (RegisterResponse, error) {
-	return registerWith(ctx, http.DefaultClient, baseURL, req)
-}
-
-// RegisterWithClient is Register but uses the supplied *http.Client.
-// Use when you need explicit transport / timeout control (e.g. ManteionClient).
-func RegisterWithClient(ctx context.Context, hc *http.Client, baseURL string, req RegisterRequest) (RegisterResponse, error) {
-	return registerWith(ctx, hc, baseURL, req)
-}
-
-// registerWith is the private implementation shared by Register and RegisterWithClient.
+// registerWith POSTs a registration to manteion.
 // It marshals req, POSTs to baseURL+"/api/v1/sdk/register" with a 5s timeout
 // (registerTimeout) layered onto ctx, and decodes the response. Response body
 // is read under a 1 MiB cap; a truncated/erroring read still surfaces as a
@@ -94,16 +79,16 @@ func registerWith(ctx context.Context, hc *http.Client, baseURL string, req Regi
 	return resp, nil
 }
 
-// ApplyTargets names the SDK objects Apply mutates. Nil targets mean "this SDK
+// applyTargets names the SDK objects Apply mutates. Nil targets mean "this SDK
 // instance doesn't support that capability"; if the response references that
 // capability, Apply returns an error.
-type ApplyTargets struct {
+type applyTargets struct {
 	// Evaluator receives the decoded rule set. Required if resp.Rules is non-empty.
-	Evaluator *StaticEvaluator
+	Evaluator *evaluator.StaticEvaluator
 	// DemoEval receives the active faults. Required if resp.ActiveFaults is non-empty.
-	DemoEval *DemoEvaluator
+	DemoEval *demoEvaluator
 	// CacheBox receives the freeze config. Required if resp.FreezeCfg is non-nil.
-	CacheBox *CacheBox
+	CacheBox *cachebox.CacheBox
 	// NetworkResolver maps logical targets to listen/upstream pairs for network
 	// fault proxies. Required if rules or active_fault contain network-category faults.
 	NetworkResolver NetworkResolver
@@ -113,10 +98,10 @@ type ApplyTargets struct {
 	// report for any that just ended (design doc Q2). Optional — nil means
 	// this SDK doesn't need automatic drain-report generation (e.g. it
 	// never records, or triggers draining some other way).
-	CacheDrain *CacheDrainTracker
+	CacheDrain *cacheDrainTracker
 }
 
-// Apply installs the register response's intent state onto the supplied
+// apply installs the register response's intent state onto the supplied
 // targets. Each category (rules, active fault, freeze config) is independent.
 // Returns an error if the response carries a category but the corresponding
 // target is nil, or if any component fails to apply.
@@ -132,17 +117,17 @@ type ApplyTargets struct {
 // Error messages are prefixed by category ("apply rules: ...",
 // "apply active_fault: ...", "apply freeze_cfg: ...") so log grepping
 // can filter a single bootstrap phase without ambiguity.
-func Apply(resp RegisterResponse, targets ApplyTargets) error {
+func apply(resp RegisterResponse, targets applyTargets) error {
 	if resp.Rules != nil {
 		if targets.Evaluator == nil && len(resp.Rules) > 0 {
 			return fmt.Errorf("apply rules: no Evaluator target for %d rules", len(resp.Rules))
 		}
 		if targets.Evaluator != nil {
-			var opts []DecodeOption
+			var opts []decodeOption
 			if targets.NetworkResolver != nil {
-				opts = append(opts, WithNetworkResolver(targets.NetworkResolver))
+				opts = append(opts, withNetworkResolver(targets.NetworkResolver))
 			}
-			rules, err := DecodeCompiledRules(resp.Rules, opts...)
+			rules, err := decodeCompiledRules(resp.Rules, opts...)
 			if err != nil {
 				return fmt.Errorf("apply rules: %w", err)
 			}
@@ -212,29 +197,29 @@ func Apply(resp RegisterResponse, targets ApplyTargets) error {
 }
 
 // applyActiveFault builds a Fault from a FaultRequest and installs it on the
-// DemoEvaluator. Uses the shared buildFault dispatcher.
+// demoEvaluator. Uses the shared buildFault dispatcher.
 //
 // Decision.Name is the slot id (the same key Set stores under): it becomes
 // the fault registry's key, so ClearSlot(id) can stop the running fault by
 // the identical name. A shared constant name here would collapse distinct
 // slots into one registry entry -- deduplicating faults that should
 // coexist and stopping strangers on clear.
-func applyActiveFault(req FaultRequest, eval *DemoEvaluator, resolve NetworkResolver) error {
+func applyActiveFault(req FaultRequest, eval *demoEvaluator, resolve NetworkResolver) error {
 	f, err := buildFault(req, resolve)
 	if err != nil {
 		return err
 	}
 
-	mode := Inline
+	mode := evaluator.Inline
 	if req.effectiveCategory() != "inline" {
-		mode = Background
+		mode = evaluator.Background
 	}
 
 	id := req.ID
 	if id == "" {
 		id = req.effectiveCategory()
 	}
-	eval.Set(&Decision{
+	eval.Set(&evaluator.Decision{
 		Name:   id,
 		Fault:  f,
 		Reason: "register",
@@ -245,7 +230,7 @@ func applyActiveFault(req FaultRequest, eval *DemoEvaluator, resolve NetworkReso
 
 // applyFreezeCfg installs a distribution delay source on the CacheBox from a
 // DelayRequest. Mirrors cachebox_admin.go's handleCacheBoxDelay.
-func applyFreezeCfg(req DelayRequest, cb *CacheBox) error {
+func applyFreezeCfg(req DelayRequest, cb *cachebox.CacheBox) error {
 	if req.Mu < 0 {
 		return fmt.Errorf("mu must be >= 0, got %f", req.Mu)
 	}
@@ -256,13 +241,13 @@ func applyFreezeCfg(req DelayRequest, cb *CacheBox) error {
 	return nil
 }
 
-// StartFaultWatchdog runs until ctx is cancelled. Every tick, drops any
+// startFaultWatchdog runs until ctx is cancelled. Every tick, drops any
 // fault slot whose lastConfirmedAt is older than the grace period.
 //
 // Grace = max(3 * pollInterval, 30s). This is the only mechanism that
 // protects against zombie faults when duration_ms = 0 (infinite) AND
 // Manteion crashes.
-func StartFaultWatchdog(ctx context.Context, eval *DemoEvaluator, pollInterval time.Duration, logger interface{ Warn(string, ...any) }) {
+func startFaultWatchdog(ctx context.Context, eval *demoEvaluator, pollInterval time.Duration, logger interface{ Warn(string, ...any) }) {
 	grace := 3 * pollInterval
 	if grace < 30*time.Second {
 		grace = 30 * time.Second

@@ -66,9 +66,9 @@ func mustPreload(t *testing.T, handler http.Handler, experimentID, phaseID strin
 // commit (never before), and the commit response carries a verifiable
 // count+checksum.
 func TestPreload_StageCommitSwap(t *testing.T) {
-	cb := NewCacheBox(CacheBoxConfig{KeyStrategy: KeyStrategyExact})
+	cb := cachebox.New(cachebox.Config{KeyStrategy: cachebox.KeyStrategyExact})
 	defer cb.Stop()
-	handler := CacheBoxPreloadHandler(cb)
+	handler := cacheBoxPreloadHandler(cb)
 
 	entries := []CacheBoxWireEntry{
 		{Key: "v2:aaa", StatusCode: 200, Body: []byte("hello")},
@@ -142,9 +142,9 @@ func TestPreload_StageCommitSwap(t *testing.T) {
 // TestPreload_ChunkRedeliveryIdempotent pins that redelivering the same
 // chunk_seq (an SDK/client retry) never double-counts staged entries.
 func TestPreload_ChunkRedeliveryIdempotent(t *testing.T) {
-	cb := NewCacheBox(CacheBoxConfig{})
+	cb := cachebox.New(cachebox.Config{})
 	defer cb.Stop()
-	handler := CacheBoxPreloadHandler(cb)
+	handler := cacheBoxPreloadHandler(cb)
 
 	doPreloadRequest(t, handler, "/cachebox/preload/begin", PreloadBeginRequest{
 		ExperimentID: "exp-1", PhaseID: "phase-1", TotalEntries: 1, TotalChunks: 1,
@@ -174,9 +174,9 @@ func TestPreload_ChunkRedeliveryIdempotent(t *testing.T) {
 // content diverges from what the commit's checksum claims) is rejected
 // with 409, drops staging, and leaves any prior installed set untouched.
 func TestPreload_CommitMismatchNoSwap(t *testing.T) {
-	cb := NewCacheBox(CacheBoxConfig{KeyStrategy: KeyStrategyExact})
+	cb := cachebox.New(cachebox.Config{KeyStrategy: cachebox.KeyStrategyExact})
 	defer cb.Stop()
-	handler := CacheBoxPreloadHandler(cb)
+	handler := cacheBoxPreloadHandler(cb)
 
 	// A valid, live prior set.
 	priorEntries := []CacheBoxWireEntry{{Key: "v2:aaa", StatusCode: 200, Body: []byte("hello")}}
@@ -226,9 +226,9 @@ func TestPreload_CommitMismatchNoSwap(t *testing.T) {
 // would push staged bytes over the cap is rejected with 413 and never
 // staged, while a within-cap chunk in the same session still succeeds.
 func TestPreload_OversizeRejected413(t *testing.T) {
-	cb := NewCacheBox(CacheBoxConfig{})
+	cb := cachebox.New(cachebox.Config{})
 	defer cb.Stop()
-	handler := CacheBoxPreloadHandler(cb)
+	handler := cacheBoxPreloadHandler(cb)
 
 	doPreloadRequest(t, handler, "/cachebox/preload/begin", PreloadBeginRequest{
 		ExperimentID: "exp-1", PhaseID: "phase-1", TotalEntries: 1, TotalChunks: 1,
@@ -265,9 +265,9 @@ func TestPreload_OversizeRejected413(t *testing.T) {
 // TestPreload_BeginClearsPriorStaging pins that begin always clears
 // whatever was staged (but never committed) before it for the same pair.
 func TestPreload_BeginClearsPriorStaging(t *testing.T) {
-	cb := NewCacheBox(CacheBoxConfig{})
+	cb := cachebox.New(cachebox.Config{})
 	defer cb.Stop()
-	handler := CacheBoxPreloadHandler(cb)
+	handler := cacheBoxPreloadHandler(cb)
 
 	doPreloadRequest(t, handler, "/cachebox/preload/begin", PreloadBeginRequest{
 		ExperimentID: "exp-1", PhaseID: "phase-1", TotalEntries: 3, TotalChunks: 1,
@@ -306,9 +306,9 @@ func TestPreload_BeginClearsPriorStaging(t *testing.T) {
 }
 
 func TestPreload_AbortDropsStaging(t *testing.T) {
-	cb := NewCacheBox(CacheBoxConfig{})
+	cb := cachebox.New(cachebox.Config{})
 	defer cb.Stop()
-	handler := CacheBoxPreloadHandler(cb)
+	handler := cacheBoxPreloadHandler(cb)
 
 	doPreloadRequest(t, handler, "/cachebox/preload/begin", PreloadBeginRequest{
 		ExperimentID: "exp-1", PhaseID: "phase-1", TotalEntries: 1, TotalChunks: 1,
@@ -339,9 +339,9 @@ func TestPreload_AbortDropsStaging(t *testing.T) {
 }
 
 func TestPreload_UnsupportedStrategyRejected409(t *testing.T) {
-	cb := NewCacheBox(CacheBoxConfig{})
+	cb := cachebox.New(cachebox.Config{})
 	defer cb.Stop()
-	handler := CacheBoxPreloadHandler(cb)
+	handler := cacheBoxPreloadHandler(cb)
 
 	rec := doPreloadRequest(t, handler, "/cachebox/preload/begin", PreloadBeginRequest{
 		ExperimentID: "exp-1", PhaseID: "phase-1", TotalEntries: 1, TotalChunks: 1,

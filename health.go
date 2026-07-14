@@ -19,35 +19,25 @@ type HealthStatus struct {
 	StaleFor string `json:"stale_for,omitempty"`
 }
 
-// globalClient is set by ConnectManteion so the package-level Health()/Ready()
-// helpers work without the caller needing to thread the client everywhere.
-var globalClient atomic.Pointer[ManteionClient]
+// globalClient is set by connectManteion so Health() and the health handler
+// work without threading the client everywhere.
+var globalClient atomic.Pointer[manteionClient]
 
 // setGlobalClient stores c as the package-level client.
-// Called internally by ConnectManteion.
-func setGlobalClient(c *ManteionClient) {
+// Called internally by connectManteion.
+func setGlobalClient(c *manteionClient) {
 	globalClient.Store(c)
 }
 
 // Health returns the current SDK health status.
-// If ConnectManteion returned nil (offline mode), Status is "offline".
+// With no control plane configured (offline mode), Status is "offline".
 func Health() HealthStatus {
 	c := globalClient.Load()
 	return healthFrom(c)
 }
 
-// Ready returns true if the service should accept traffic.
-//   - connected:    yes (normal)
-//   - degraded:     yes (stale rules, still functional)
-//   - offline:      yes (no manteion configured, dev mode)
-//   - disconnected: NO  (manteion configured but never connected)
-func Ready() bool {
-	h := Health()
-	return h.Status != "disconnected"
-}
-
-// HealthHandler returns an http.Handler that reports SDK health as JSON.
-func HealthHandler() http.Handler {
+// healthHandler reports SDK health as JSON (mounted at /atropos/health).
+func healthHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := Health()
 		code := http.StatusOK
@@ -60,17 +50,17 @@ func HealthHandler() http.Handler {
 	})
 }
 
-func healthFrom(c *ManteionClient) HealthStatus {
+func healthFrom(c *manteionClient) HealthStatus {
 	if c == nil {
 		return HealthStatus{Status: "offline"}
 	}
 
-	status := ManteionStatus(c.status.Load())
+	status := manteionStatus(c.status.Load())
 	statusStr := "disconnected"
 	switch status {
-	case ManteionConnected:
+	case manteionConnected:
 		statusStr = "connected"
-	case ManteionDegraded:
+	case manteionDegraded:
 		statusStr = "degraded"
 	}
 
@@ -86,7 +76,7 @@ func healthFrom(c *ManteionClient) HealthStatus {
 
 	if nanos := c.lastPollAt.Load(); nanos != 0 {
 		h.LastSuccessfulPollAt = time.Unix(0, nanos)
-		if status == ManteionDegraded {
+		if status == manteionDegraded {
 			h.StaleFor = time.Since(h.LastSuccessfulPollAt).Truncate(time.Second).String()
 		}
 	}

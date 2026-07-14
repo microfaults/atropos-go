@@ -73,7 +73,7 @@ func TestIngressMetrics(t *testing.T) {
 			beforeCount := gatherCounter("http_server_requests_total", labels)
 			beforeHist := gatherHistogramCount("http_server_request_duration_seconds", labels)
 
-			mw := IngressMiddleware(handler, tt.service)
+			mw := ingressMiddleware(handler, tt.service, currentInterceptor())
 			mw.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(tt.method, "/test", nil))
 
 			if delta := gatherCounter("http_server_requests_total", labels) - beforeCount; delta != 1 {
@@ -210,11 +210,11 @@ func TestMetricsHandler_ServesMetrics(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	mw := IngressMiddleware(handler, "handler-test")
+	mw := ingressMiddleware(handler, "handler-test", currentInterceptor())
 	mw.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil))
 
 	rec := httptest.NewRecorder()
-	MetricsHandler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	metricsHandler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
 
 	body, _ := io.ReadAll(rec.Body)
 	text := string(body)

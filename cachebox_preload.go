@@ -10,7 +10,7 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 )
 
-// CacheBoxPreloadHandler returns an http.Handler implementing the ATRO-6
+// cacheBoxPreloadHandler implements the ATRO-6
 // staged preload protocol (wire spec §W4): begin/chunk/commit/abort. A
 // half-delivered preload is never visible to replay -- Commit is the only
 // step that installs anything, and only on an exact count+checksum match
@@ -24,9 +24,7 @@ import (
 //   - .../abort  → 200
 //
 // Example:
-//
-//	mux.Handle("/cachebox/preload/", atropos.CacheBoxPreloadHandler(cb))
-func CacheBoxPreloadHandler(cb *CacheBox) http.Handler {
+func cacheBoxPreloadHandler(cb *cachebox.CacheBox) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -54,7 +52,7 @@ func CacheBoxPreloadHandler(cb *CacheBox) http.Handler {
 	})
 }
 
-func handlePreloadBegin(w http.ResponseWriter, r *http.Request, cb *CacheBox) {
+func handlePreloadBegin(w http.ResponseWriter, r *http.Request, cb *cachebox.CacheBox) {
 	var req PreloadBeginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, fmt.Sprintf("invalid json: %s", err), http.StatusBadRequest)
@@ -68,7 +66,7 @@ func handlePreloadBegin(w http.ResponseWriter, r *http.Request, cb *CacheBox) {
 	_ = json.NewEncoder(w).Encode(PreloadBeginResponse{OK: true})
 }
 
-func handlePreloadChunk(w http.ResponseWriter, r *http.Request, cb *CacheBox) {
+func handlePreloadChunk(w http.ResponseWriter, r *http.Request, cb *cachebox.CacheBox) {
 	var req PreloadChunkRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<20)).Decode(&req); err != nil {
 		jsonError(w, fmt.Sprintf("invalid json: %s", err), http.StatusBadRequest)
@@ -89,7 +87,7 @@ func handlePreloadChunk(w http.ResponseWriter, r *http.Request, cb *CacheBox) {
 	}
 }
 
-func handlePreloadCommit(w http.ResponseWriter, r *http.Request, cb *CacheBox) {
+func handlePreloadCommit(w http.ResponseWriter, r *http.Request, cb *cachebox.CacheBox) {
 	var req PreloadCommitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, fmt.Sprintf("invalid json: %s", err), http.StatusBadRequest)
@@ -108,7 +106,7 @@ func handlePreloadCommit(w http.ResponseWriter, r *http.Request, cb *CacheBox) {
 	})
 }
 
-func handlePreloadAbort(w http.ResponseWriter, r *http.Request, cb *CacheBox) {
+func handlePreloadAbort(w http.ResponseWriter, r *http.Request, cb *cachebox.CacheBox) {
 	var req PreloadAbortRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, fmt.Sprintf("invalid json: %s", err), http.StatusBadRequest)

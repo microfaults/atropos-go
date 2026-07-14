@@ -17,7 +17,7 @@ import (
 // counter to the right field (not just that the wire TYPE round-trips,
 // which TestWireContract_JSONRoundTrip already covers).
 func TestFidelity_SnapshotGoldenJSON(t *testing.T) {
-	cb := NewCacheBox(CacheBoxConfig{})
+	cb := cachebox.New(cachebox.Config{})
 	defer cb.Stop()
 
 	pair := cachebox.PhasePair{ExperimentID: "exp-1", PhaseID: "phase-1"}
@@ -33,7 +33,7 @@ func TestFidelity_SnapshotGoldenJSON(t *testing.T) {
 	fid.RecordCollision(pair, false)
 	fid.SetPreloadState(pair, true, 12345, "deadbeef", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 
-	handler := CacheBoxFidelityHandler(cb, "cart", "pod-1")
+	handler := cacheBoxFidelityHandler(cb, "cart", "pod-1")
 	req := httptest.NewRequest(http.MethodGet, "/cachebox/fidelity?experiment_id=exp-1&phase_id=phase-1", nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -94,9 +94,9 @@ func TestFidelity_SnapshotGoldenJSON(t *testing.T) {
 }
 
 func TestFidelity_RequiresExperimentAndPhaseID(t *testing.T) {
-	cb := NewCacheBox(CacheBoxConfig{})
+	cb := cachebox.New(cachebox.Config{})
 	defer cb.Stop()
-	handler := CacheBoxFidelityHandler(cb, "cart", "pod-1")
+	handler := cacheBoxFidelityHandler(cb, "cart", "pod-1")
 
 	req := httptest.NewRequest(http.MethodGet, "/cachebox/fidelity", nil)
 	rec := httptest.NewRecorder()

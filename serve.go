@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
+	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
@@ -134,17 +135,12 @@ func Serve(ctx context.Context, cfg Config) (http.Handler, ShutdownFunc, error) 
 
 	// Telemetry first: everything below emits spans through the global
 	// tracer provider this installs.
-	initOpts := []Option{
-		WithServiceName(cfg.Service),
-		WithServiceVersion(version),
-	}
-	if cfg.Environment != "" {
-		initOpts = append(initOpts, WithEnvironment(cfg.Environment))
-	}
-	if cfg.TracerProvider != nil {
-		initOpts = append(initOpts, WithTracerProvider(cfg.TracerProvider))
-	}
-	otelShutdown, err := Init(ctx, initOpts...)
+	otelShutdown, err := initTelemetry(ctx, telemetryConfig{
+		serviceName:    cfg.Service,
+		serviceVersion: version,
+		environment:    cfg.Environment,
+		tracerProvider: cfg.TracerProvider,
+	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("atropos: init telemetry: %w", err)
 	}
@@ -155,10 +151,10 @@ func Serve(ctx context.Context, cfg Config) (http.Handler, ShutdownFunc, error) 
 	// snapshot. Constructing both around it removes the order-sensitive
 	// bind step the hand-wired embeds needed.
 	fidelity := cachebox.NewFidelityRegistry()
-	var push *CachePushClient
-	cbCfg := CacheBoxConfig{Fidelity: fidelity}
+	var push *cachePushClient
+	cbCfg := cachebox.Config{Fidelity: fidelity}
 	if manteionURL != "" {
-		push = NewCachePushClient(CachePushConfig{
+		push = newCachePushClient(cachePushConfig{
 			BaseURL:  manteionURL,
 			Service:  cfg.Service,
 			Instance: instanceID,
@@ -167,42 +163,35 @@ func Serve(ctx context.Context, cfg Config) (http.Handler, ShutdownFunc, error) 
 		})
 		cbCfg.Push = push.PushFunc()
 	}
-	cb := NewCacheBox(cbCfg)
+	cb := cachebox.New(cbCfg)
 
 	// The host evaluator receives manteion's compiled rules; the demo
 	// evaluator holds admin/manual fault slots. Composed host-first: an
 	// armed admin fault can fill gaps but never shadow an experiment's
 	// rules — a demo fault that outranked a recording or freeze rule would
 	// silently corrupt the phase's measurement (invariant 7).
-	host := NewStaticEvaluator()
-	demo := &DemoEvaluator{}
-	Configure(
-		WithEvaluator(NewMultiEvaluator(host, demo)),
-		WithCacheBoxCoordinator(cb),
-	)
+	host := evaluator.NewStaticEvaluator()
+	demo := &demoEvaluator{}
+	configure(evaluator.NewMultiEvaluator(host, demo), cb)
 
-	targets := ApplyTargets{
+	targets := applyTargets{
 		Evaluator:       host,
 		DemoEval:        demo,
 		CacheBox:        cb,
 		NetworkResolver: cfg.NetworkResolver,
 	}
 	if push != nil {
-		targets.CacheDrain = NewCacheDrainTracker(cb, push, logger)
+		targets.CacheDrain = newCacheDrainTracker(cb, push, logger)
 	}
 
-	RegisterRoutes(cfg.Routes...)
-
-	connectOpts := []ManteionOption{
-		WithInstanceID(instanceID),
-		WithApplyTargets(targets),
-		WithManteionServiceVersion(version),
-		WithLogger(logger),
-	}
-	if cfg.ManteionURL != "" {
-		connectOpts = append(connectOpts, WithManteionURL(cfg.ManteionURL))
-	}
-	mc, err := ConnectManteion(ctx, cfg.Service, connectOpts...)
+	mcfg := defaultManteionConfig(cfg.Service)
+	mcfg.url = manteionURL
+	mcfg.instanceID = instanceID
+	mcfg.serviceVersion = version
+	mcfg.routes = cfg.Routes
+	mcfg.targets = targets
+	mcfg.logger = logger
+	mc, err := connectManteion(ctx, mcfg)
 	if err != nil {
 		// Fail closed rather than run silently offline with a configured
 		// control plane. Unwind what was built.
@@ -258,32 +247,32 @@ func resolveInstanceID(cfg Config) string {
 // controlMux mounts the control/observability surface at the exact paths
 // manteion addresses, with the business handler as the middleware-wrapped
 // fallback. Control paths deliberately bypass the fault/OTel middleware.
-func controlMux(cfg Config, host *StaticEvaluator, demo *DemoEvaluator, cb *CacheBox, instanceID string) http.Handler {
+func controlMux(cfg Config, host *evaluator.StaticEvaluator, demo *demoEvaluator, cb *cachebox.CacheBox, instanceID string) http.Handler {
 	mux := http.NewServeMux()
 
-	mux.Handle("GET /metrics", MetricsHandler())
-	mux.Handle("/atropos/health", HealthHandler())
+	mux.Handle("GET /metrics", metricsHandler())
+	mux.Handle("/atropos/health", healthHandler())
 
 	// Bare path and subtree both: the subtree pattern alone would
 	// 301-redirect the bare path and drop freeze/thaw verbs.
-	faultAdmin := FaultAdminHandlerWith(demo, cfg.NetworkResolver)
+	faultAdmin := faultAdminHandler(demo, cfg.NetworkResolver)
 	mux.Handle("/admin/fault", faultAdmin)
 	mux.Handle("/admin/fault/", faultAdmin)
 
-	var decodeOpts []DecodeOption
+	var decodeOpts []decodeOption
 	if cfg.NetworkResolver != nil {
-		decodeOpts = append(decodeOpts, WithNetworkResolver(cfg.NetworkResolver))
+		decodeOpts = append(decodeOpts, withNetworkResolver(cfg.NetworkResolver))
 	}
-	mux.Handle("/admin/rules", RulesAdminHandler(host, decodeOpts...))
+	mux.Handle("/admin/rules", rulesAdminHandler(host, decodeOpts...))
 
-	cbAdmin := CacheBoxAdminHandler(cb)
+	cbAdmin := cacheBoxAdminHandler(cb)
 	mux.Handle("/admin/cachebox", cbAdmin)
 	mux.Handle("/admin/cachebox/", cbAdmin)
-	mux.Handle("/cachebox/preload/", CacheBoxPreloadHandler(cb))
-	mux.Handle("GET /cachebox/fidelity", CacheBoxFidelityHandler(cb, cfg.Service, instanceID))
+	mux.Handle("/cachebox/preload/", cacheBoxPreloadHandler(cb))
+	mux.Handle("GET /cachebox/fidelity", cacheBoxFidelityHandler(cb, cfg.Service, instanceID))
 
 	if cfg.Handler != nil {
-		mux.Handle("/", IngressMiddleware(cfg.Handler, cfg.Service))
+		mux.Handle("/", ingressMiddleware(cfg.Handler, cfg.Service, currentInterceptor()))
 	}
 	return mux
 }

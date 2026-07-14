@@ -9,7 +9,8 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 )
 
-// CacheBoxAdminHandler returns an http.Handler for runtime cache-box control.
+// cacheBoxAdminHandler serves runtime cache-box control (mounted at
+// /admin/cachebox).
 //
 // Supported routes (matched on method + last path segment):
 //   - GET  /admin/cachebox          → 200 with JSON stats snapshot
@@ -23,11 +24,10 @@ import (
 //
 // Example:
 //
-//	mux.Handle("/admin/cachebox/", atropos.CacheBoxAdminHandler(cb))
 //	// curl http://localhost:8080/admin/cachebox
 //	// curl -X POST http://localhost:8080/admin/cachebox/delay -d '{"mu":1.0,"sigma":0.5,"seed":42}'
 //	// curl -X DELETE http://localhost:8080/admin/cachebox
-func CacheBoxAdminHandler(cb *CacheBox) http.Handler {
+func cacheBoxAdminHandler(cb *cachebox.CacheBox) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -51,7 +51,7 @@ func CacheBoxAdminHandler(cb *CacheBox) http.Handler {
 	})
 }
 
-func handleCacheBoxStats(w http.ResponseWriter, cb *CacheBox) {
+func handleCacheBoxStats(w http.ResponseWriter, cb *cachebox.CacheBox) {
 	json.NewEncoder(w).Encode(cb.Stats())
 }
 
@@ -66,7 +66,7 @@ type DelayRequest struct {
 	Context *CacheBoxContext `json:"context,omitempty"`
 }
 
-func handleCacheBoxDelay(w http.ResponseWriter, r *http.Request, cb *CacheBox) {
+func handleCacheBoxDelay(w http.ResponseWriter, r *http.Request, cb *cachebox.CacheBox) {
 	var req DelayRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, fmt.Sprintf("invalid json: %s", err), http.StatusBadRequest)

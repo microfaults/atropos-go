@@ -1,177 +1,27 @@
-// types.go
+// types.go declares the wire-shape aliases shared with manteion. Everything
+// here is either decoded from / encoded to one of the SDK's HTTP endpoints
+// or embedded in the manteion sync protocol — the shapes are pinned by the
+// cross-repo wire contract (wire_compat_test.go, wire_fidelity_test.go) and
+// must not drift. Host-side wiring types live behind Serve.
 package atropos
 
 import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
-	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
-	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
-	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
-)
-
-// --- Fault types ---
-
-// Fault is the interface all fault types implement.
-type Fault = fault.Fault
-
-// FaultConfig holds duration and ramp parameters common to all faults.
-type FaultConfig = fault.FaultConfig
-
-// Handle provides non-blocking control over a running fault.
-type Handle = fault.Handle
-
-// Result reports what happened during a fault.
-type Result = fault.Result
-
-// EventEmitter records a timestamped event on a span.
-type EventEmitter = fault.EventEmitter
-
-// EventAware faults emit span events via an injected emitter.
-type EventAware = fault.EventAware
-
-// --- Evaluator types ---
-
-// Evaluator is the rule engine contract. Must be safe for concurrent use.
-type Evaluator = evaluator.Evaluator
-
-// InjectionPoint identifies where a fault check occurs.
-type InjectionPoint = evaluator.InjectionPoint
-
-// Request carries context for the evaluator decision.
-type Request = evaluator.Request
-
-// Decision is what the evaluator returns when rules match.
-type Decision = evaluator.Decision
-
-// Mode indicates how the fault runs relative to the request.
-type Mode = evaluator.Mode
-
-// Re-export InjectionPoint constants.
-const (
-	Ingress   = evaluator.Ingress
-	Egress    = evaluator.Egress
-	Transient = evaluator.Transient
-	Custom    = evaluator.Custom
-)
-
-// Re-export Mode constants.
-const (
-	Background = evaluator.Background
-	Inline     = evaluator.Inline
-)
-
-// StartPolicy controls how the fault registry deduplicates service-scoped faults.
-type StartPolicy = evaluator.StartPolicy
-
-// Re-export StartPolicy constants.
-const (
-	DeduplicateByRule = evaluator.DeduplicateByRule
-	DeduplicateByType = evaluator.DeduplicateByType
-	AlwaysStart       = evaluator.AlwaysStart
 )
 
 // NetworkResolver resolves a target into listen and upstream addresses for
-// network fault proxies.
+// network fault proxies. Supplied via Config.NetworkResolver.
 type NetworkResolver func(target string) (listen, upstream string, err error)
 
-// CacheBoxAction identifies a cache-box operation the evaluator has chosen.
-type CacheBoxAction = evaluator.CacheBoxAction
-
-// Re-export CacheBoxAction constants.
-const (
-	CacheBoxNone        = evaluator.CacheBoxNone
-	CacheBoxPassthrough = evaluator.CacheBoxPassthrough
-	CacheBoxReplay      = evaluator.CacheBoxReplay
-	CacheBoxReplayDelay = evaluator.CacheBoxReplayDelay
-)
-
-// --- Static evaluator (small helper for tests and simple setups) ---
-
-// StaticRule is a single match rule for StaticEvaluator.
+// StaticRule is the JSON shape GET /admin/rules serves (one element per
+// installed rule). Manteion's SDK client decodes into it.
 type StaticRule = evaluator.StaticRule
 
-// StaticEvaluator holds a fixed list of rules and returns the first match.
-type StaticEvaluator = evaluator.StaticEvaluator
-
-// NewStaticEvaluator builds a StaticEvaluator from a rule list.
-func NewStaticEvaluator(rules ...StaticRule) *StaticEvaluator {
-	return evaluator.NewStaticEvaluator(rules...)
-}
-
-// --- Multi evaluator ---
-
-// MultiEvaluator chains multiple evaluators and returns the first non-nil Decision.
-type MultiEvaluator = evaluator.MultiEvaluator
-
-// NewMultiEvaluator creates a new MultiEvaluator that iterates through the provided
-// evaluators in order.
-func NewMultiEvaluator(evaluators ...Evaluator) *MultiEvaluator {
-	return evaluator.NewMultiEvaluator(evaluators...)
-}
-
-// --- Cache-box types ---
-
-// CacheBox is the runtime cache-box coordinator.
-type CacheBox = cachebox.CacheBox
-
-// CacheBoxConfig is the cache-box constructor config.
-type CacheBoxConfig = cachebox.Config
-
-// CacheBoxEntry is the SDK's in-memory representation of a cached HTTP response.
-// Contains atomic.Int64 (HitCount) and Go-native types (http.Header, time.Duration).
-// NOT JSON-serializable — use CacheBoxWireEntry for wire transfer.
-type CacheBoxEntry = cachebox.Entry
-
-// CacheBoxWireEntry is the JSON-serializable transfer format for cache entries.
-// Used for all SDK <-> manteion communication (ingest and preload).
-// Convert with EntryToWire / WireToEntry.
+// CacheBoxWireEntry is the JSON-serializable transfer format for cache
+// entries. Used for all SDK <-> manteion communication (ingest and preload).
 type CacheBoxWireEntry = cachebox.WireEntry
 
-// CacheBoxDelaySource produces delays for replay_with_delay mode.
-type CacheBoxDelaySource = cachebox.DelaySource
-
-// CacheBoxStats is the combined store + recorder stats snapshot.
+// CacheBoxStats is the GET /admin/cachebox response: combined store,
+// recorder, and record-buffer counters.
 type CacheBoxStats = cachebox.Stats
-
-// KeyStrategy names a built-in cache-box key derivation strategy.
-type KeyStrategy = cachebox.KeyStrategy
-
-// Re-export cache-box key strategy constants.
-const (
-	KeyStrategyExact         = cachebox.KeyStrategyExact
-	KeyStrategyExactWithHost = cachebox.KeyStrategyExactWithHost
-	KeyStrategyExactWithBody = cachebox.KeyStrategyExactWithBody
-	KeyStrategyCanonicalV2   = cachebox.KeyStrategyCanonicalV2
-)
-
-// CacheBoxRequestMeta is debug provenance attached to a pushed wire entry.
-type CacheBoxRequestMeta = cachebox.RequestMeta
-
-// NewCacheBox builds a CacheBox coordinator from a config. Safe defaults
-// are applied for unset fields. See cachebox.Config for details.
-func NewCacheBox(cfg CacheBoxConfig) *CacheBox {
-	return cachebox.New(cfg)
-}
-
-// CacheBoxEntryToWire converts an in-memory Entry to a WireEntry for serialization.
-func CacheBoxEntryToWire(e *CacheBoxEntry) CacheBoxWireEntry {
-	return cachebox.EntryToWire(e)
-}
-
-// CacheBoxWireToEntry converts a WireEntry back to an in-memory Entry.
-func CacheBoxWireToEntry(w *CacheBoxWireEntry) *CacheBoxEntry {
-	return cachebox.WireToEntry(w)
-}
-
-// --- Trace types ---
-
-// TraceSpan records attributes, events, and lifecycle signals on a trace span.
-type TraceSpan = trace.Span
-
-// --- Interceptor types ---
-
-// Interceptor ties the evaluator, fault execution, and OTel together.
-type Interceptor = interceptor.Interceptor
-
-// CheckResult holds the outcome of an injection point check.
-type CheckResult = interceptor.CheckResult
