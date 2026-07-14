@@ -6,18 +6,27 @@ Atropos embeds into your services as a library. It provides OpenTelemetry instru
 
 In the faults-lab instrument, atropos is the in-process measurement arm: it records a service's egress HTTP responses during baseline phases, replays them **fail-closed** when the service is frozen for isolation phases, injects faults on rule match, and keeps per-`(experiment, phase)` fidelity counters — all driven by rules polled from the manteion control plane.
 
-```go
-// Bootstrap OTel for the entire service (replaces manual TracerProvider boilerplate).
-shutdown, _ := atropos.Init(ctx, atropos.WithServiceName("checkout"))
-defer shutdown(context.Background())
+Embedding is one call:
 
-// Instrument a code block with a span + fault injection check.
-ctx, span, cr, _ := atropos.SpanWithFault(ctx, "process-payment",
-    map[string]string{"tenant": "acme"},
-    attribute.String("customer_id", id),
-)
-defer span.End()
-if cr.Handle != nil { <-cr.Handle.Done() }
+```go
+h, shutdown, err := atropos.Serve(ctx, atropos.Config{
+    Service: "productcatalogservice",
+    Version: "0.1.0",
+    Routes:  []atropos.Route{{Method: "GET", Path: "/products"}},
+    Handler: businessMux, // the service's own routes
+})
+if err != nil { log.Fatal(err) }
+defer shutdown(ctx)
+http.ListenAndServe(":"+port, h)
+```
+
+Everything else — OTel, the record/replay cache-box with its push client and
+fidelity counters, the manteion connection, and the admin/observability
+endpoints — is wired inside with env-derived defaults, and works offline when
+`MANTEION_URL` is unset. For the service's own outbound calls:
+
+```go
+client := &http.Client{Transport: atropos.EgressTransport(nil)}
 ```
 
 ## Current State
@@ -26,16 +35,15 @@ A snapshot of what's shipped on `main`. For the research vision (cache-box primi
 
 | Area | Status |
 |---|---|
-| OTel bootstrap + HTTP/gRPC middleware | Shipped |
+| One-call embed — `atropos.Serve` wires OTel, evaluator, cache-box, push, manteion, and the control surface | Shipped |
 | Inline faults (latency, error, hang) | Shipped |
 | Network faults (TCP proxy: RST, blackhole, retransmit_delay, latency, throttle, drip) | Shipped |
 | Resource faults (CPU, I/O, disk, memory) | Shipped |
 | Cache-box fidelity stack — fail-closed replay, split record/replay store, staged preload (W5 checksum), per-phase fidelity counters, drain reports | Shipped |
-| SDK ↔ manteion wire protocol — `ConnectManteion` poll loop (empty rule set is authoritative), `Register`/`Apply`, `CompiledRule` decoders, SSE nudge | Shipped |
-| Fault registry — per-key `Stop`, fired on rule replace / slot clear / watchdog / admin delete | Shipped |
-| Route publishing — `RegisterRoutes` rides the register payload | Shipped |
-| `FaultAdminHandler` / `CacheBoxAdminHandler` / `RulesAdminHandler` runtime control | Shipped |
-| `StaticEvaluator` with versioned atomic rule swap (`SetRules`) | Shipped |
+| SDK ↔ manteion wire protocol — poll loop (empty rule set is authoritative), register/apply, `CompiledRule` decoders, SSE nudge | Shipped |
+| Fault registry — per-key stop, fired on rule replace / slot clear / watchdog / admin delete | Shipped |
+| Route publishing — `Config.Routes` rides the register payload | Shipped |
+| `/admin/fault`, `/admin/rules`, `/admin/cachebox` runtime control (mounted by `Serve`, outside the fault middleware) | Shipped |
 | Prometheus metrics for HTTP ingress/egress + cache-box | Shipped |
 | Cache-box on ingress + gRPC | Not yet implemented |
 | OPA-backed evaluator | Not yet implemented |
@@ -47,16 +55,17 @@ A snapshot of what's shipped on `main`. For the research vision (cache-box primi
 ┌──────────────────────────────────────────────────────────────┐
 │  Service code                                                │
 │                                                              │
-│   atropos.Init()          -- OTel bootstrap                  │
-│   atropos.Span()          -- always-on spans                 │
-│   atropos.SpanWithFault() -- spans + fault check             │
-│   atropos.IngressMiddleware()  -- HTTP server                │
-│   atropos.EgressTransport()    -- HTTP client (+ cache-box)  │
-│   atroposgrpc.UnaryServerInterceptor() -- gRPC               │
-│   atropos.FaultAdminHandler()     -- /admin/fault            │
-│   atropos.CacheBoxAdminHandler()  -- /admin/cachebox         │
-│   atropos.RulesAdminHandler()     -- /admin/rules            │
-│   atropos.MetricsHandler()        -- /metrics (Prometheus)   │
+│   atropos.Serve(ctx, Config)  -- the embed: OTel bootstrap,  │
+│     evaluator + admin fault slot, cache-box + push client,   │
+│     manteion connection, and the control surface:            │
+│       /metrics            /atropos/health                    │
+│       /admin/fault[/{id}] /admin/rules                       │
+│       /admin/cachebox     /cachebox/preload/*                │
+│       /cachebox/fidelity                                     │
+│     (control paths bypass the fault/OTel middleware;         │
+│      everything else wraps Config.Handler in it)             │
+│   atropos.EgressTransport()  -- HTTP client (+ cache-box)    │
+│   atroposgrpc.UnaryServerInterceptor(atropos.DefaultInterceptor())│
 │                                                              │
 ├──────────────────────────────────────────────────────────────┤
 │  Interceptor layer          (internal/interceptor)           │
@@ -112,57 +121,83 @@ go get git.ucsc.edu/microfaults/atropos-go/grpc
 
 ## Quick Start
 
-### 1. Bootstrap OTel
+### 1. Embed the instrument
 
 ```go
-import "atropos-go"
+import "git.ucsc.edu/microfaults/atropos-go"
 
 func main() {
     ctx := context.Background()
-    shutdown, err := atropos.Init(ctx,
-        atropos.WithServiceName("frontend"),
-        atropos.WithServiceVersion("1.2.3"),
-        atropos.WithEnvironment("staging"),
-    )
+
+    mux := http.NewServeMux()
+    mux.HandleFunc("GET /products", listProducts)
+
+    h, shutdown, err := atropos.Serve(ctx, atropos.Config{
+        Service: "productcatalogservice",
+        Version: "0.1.0",
+        Routes: []atropos.Route{
+            {Method: "GET", Path: "/products", Description: "List products"},
+        },
+        Handler: mux,
+    })
     if err != nil { log.Fatal(err) }
     defer shutdown(ctx)
 
-    // ...
+    http.ListenAndServe(":8080", h)
 }
 ```
 
-`Init` sets up an OTLP gRPC exporter, W3C TraceContext + Baggage propagators, and a `TracerProvider`. Endpoint resolution: `WithEndpoint()` option > `OTEL_EXPORTER_OTLP_ENDPOINT` env > `COLLECTOR_SERVICE_ADDR` env > `localhost:4317`.
+`Serve` bootstraps OTel (OTLP gRPC exporter, W3C TraceContext + Baggage
+propagators; endpoint from `OTEL_EXPORTER_OTLP_ENDPOINT` >
+`COLLECTOR_SERVICE_ADDR` > `localhost:4317`), builds the record/replay
+cache-box and its manteion push client around one shared fidelity registry,
+composes the host rule evaluator with the admin fault slot (host rules always
+win), connects to manteion, and returns a handler that serves the control
+surface beside the middleware-wrapped business handler.
 
-For tests or existing setups, bring your own provider:
+Offline is first-class: with `MANTEION_URL` unset everything works — tracing,
+`/admin/*` fault control, the cache-box endpoints — there is just no control
+plane to sync with. A configured-but-unreachable `MANTEION_URL` is a startup
+**error**, not a silent offline run: an instrument that pretends to be
+connected corrupts experiments.
 
-```go
-shutdown, _ := atropos.Init(ctx, atropos.WithTracerProvider(myTP))
-```
+`Config` fields (all optional except `Service`; `Handler` may be nil for a
+control-surface-only embed, e.g. a gRPC service's admin port):
 
-### 2. HTTP Middleware
+| Field | Default | Purpose |
+|---|---|---|
+| `Service` | — (required) | OTel `service.name`, manteion identity, metrics label |
+| `Version` | `MANTEION_SERVICE_VERSION` | OTel `service.version` + experiment attribution |
+| `Environment` | `"development"` | OTel `deployment.environment` |
+| `Routes` | none | route inventory published at registration |
+| `Handler` | nil | the service's own routes (nil = control surface only) |
+| `ManteionURL` | `MANTEION_URL` | control-plane base URL; empty = offline |
+| `InstanceID` | `MANTEION_INSTANCE_ID` > hostname > `Service` | the ONE instance identity (register, cache-push, fidelity) |
+| `NetworkResolver` | nil | target → (listen, upstream) for network faults |
+| `TracerProvider` | OTLP exporter | BYO provider (tests, custom OTel setups) |
+| `Logger` | `slog.Default()` | SDK logging |
 
-```go
-mux := http.NewServeMux()
-mux.HandleFunc("/api/checkout", checkoutHandler)
+The returned `ShutdownFunc` tears down in dependency order: manteion close →
+recorder drain → final cache-push flush → OTel span flush. Idempotent.
 
-// Single middleware for both OTel request spans and fault injection.
-handler := atropos.IngressMiddleware(mux, "checkout-service")
-http.ListenAndServe(":8080", handler)
-```
-
-For outbound calls:
+### 2. Outbound calls
 
 ```go
 client := &http.Client{
-    Transport: atropos.EgressTransport(http.DefaultTransport),
+    Transport: atropos.EgressTransport(nil), // nil = http.DefaultTransport
 }
 resp, _ := client.Get("http://payment-service/charge")
 ```
 
+`EgressTransport` composes OTel client spans, egress fault checks, and
+cache-box record/replay dispatch. It resolves the interceptor per round-trip,
+so clients built before `Serve` runs still pick up the wiring `Serve`
+installs.
+
 ### 3. gRPC Interceptors
 
 ```go
-import atroposgrpc "atropos-go/grpc"
+import atroposgrpc "git.ucsc.edu/microfaults/atropos-go/grpc"
 
 server := grpc.NewServer(
     grpc.UnaryInterceptor(atroposgrpc.UnaryServerInterceptor(atropos.DefaultInterceptor())),
@@ -170,302 +205,70 @@ server := grpc.NewServer(
 )
 ```
 
-### 4. Custom Spans
+A gRPC service still calls `Serve` (with `Handler: nil`) and mounts the
+returned control surface on an admin port.
 
-For pure observability (no fault check):
+### 4. Faults and rules at runtime
 
-```go
-ctx, span := atropos.Span(ctx, "drain-queue",
-    attribute.Int("queue_depth", len(q)),
-    attribute.String("consumer_id", id),
-)
-defer span.End()
+Rules normally arrive from manteion. For local work, the control surface
+`Serve` mounts does everything by hand:
 
-span.SetAttributes(attribute.Int("drained", count))
+```bash
+# arm a single admin fault (fills gaps; never shadows manteion rules)
+curl -X POST localhost:8080/admin/fault \
+  -d '{"category":"inline","fault_type":"latency","params":{"delay":"500ms"}}'
+curl localhost:8080/admin/fault
+curl -X DELETE localhost:8080/admin/fault          # clear all
+curl -X DELETE localhost:8080/admin/fault/{id}     # clear one slot
+
+# inspect / replace the compiled rule set (wire-format []CompiledRule)
+curl localhost:8080/admin/rules
+curl -X POST localhost:8080/admin/rules -d @rules.json
+
+# cache-box stats / freeze delay / clear
+curl localhost:8080/admin/cachebox
+curl -X POST localhost:8080/admin/cachebox/delay -d '{"mu":8.5,"sigma":0.3,"seed":42}'
+curl -X DELETE localhost:8080/admin/cachebox
+
+# health + metrics
+curl localhost:8080/atropos/health
+curl localhost:8080/metrics
 ```
 
-For spans with fault injection:
+POST `/admin/fault` body fields by `fault_type`: `latency` requires
+`params.delay` (e.g. `"500ms"`, optional `jitter`); `error` defaults to
+status 500, `"injected fault"`; `hang` requires `params.duration`. The
+admin slot composes AFTER the host evaluator, so an armed admin fault can
+never shadow the rules of a running experiment — and manteion reconciliation
+plus the fault watchdog reap admin slots when connected.
 
-```go
-ctx, span, cr, err := atropos.SpanWithFault(ctx, "process-payment",
-    map[string]string{"tenant": "acme", "region": "us-east-1"},
-    attribute.String("customer_id", id),
-)
-defer span.End()
-if cr.Handle != nil {
-    <-cr.Handle.Done() // wait for inline fault to finish
-}
-```
+### 5. Cache-Box (Egress)
 
-### 5. Enable Fault Injection
+Cache-box is the measurement primitive that "freezes" a downstream dependency by replaying recorded responses instead of forwarding to the real service. Three modes, selected by the cache-box rule manteion synthesizes for the active experiment phase:
 
-The SDK instruments spans by default. To activate faults, configure an evaluator:
+- **passthrough**: forward to real upstream, record the request/response pair asynchronously under the rule's authoritative key strategy
+- **replay**: serve from the installed replay set; a miss is a **counted synthetic 503**, never a live call (fail-closed — this is what makes a frozen phase trustworthy)
+- **replay_with_delay**: replay plus a synthetic delay (fitted lognormal pushed by manteion, or observed)
 
-```go
-atropos.Configure(atropos.WithEvaluator(myEvaluator))
-```
+The store is split so record traffic can never evict replay data: an immutable, atomically-swapped **ReplaySet** serves replays (installed only via staged preload commit), while a bounded **RecordBuffer** absorbs recording. Replay lookups are scoped to the rule's `(experiment_id, phase_id)` — a hit against another phase's set fails closed and is counted. Every drop (recorder backpressure, oversize response, push failure) increments a per-phase fidelity counter, and phase end triggers a flush + **drain report** to manteion so recording completeness is verified, not assumed.
 
-The `Evaluator` interface has a single method:
-
-```go
-type Evaluator interface {
-    Evaluate(ctx context.Context, req Request) *Decision
-}
-```
-
-If `Evaluate` returns nil, no fault fires. If it returns a `Decision`, the interceptor validates the fault, starts it, and records the result on the span.
-
-For testing, demos, and manteion integration, use the built-in `StaticEvaluator` with atomic rule swap:
-
-```go
-eval := atropos.NewStaticEvaluator()
-eval.SetRules([]atropos.StaticRule{{
-    Name: "slow-checkout",
-    Point: atropos.Ingress,
-    Labels: map[string]string{"http.method": "POST"},
-    Decision: atropos.Decision{ /* ... */ },
-}})
-atropos.Configure(atropos.WithEvaluator(eval))
-```
-
-### 6. Cache-Box (Egress)
-
-Cache-box is the measurement primitive that "freezes" a downstream dependency by replaying recorded responses instead of forwarding to the real service. Three modes, selectable per-request via `Decision.CacheBox` (in practice: via the cache-box rule manteion synthesizes for the active experiment phase):
-
-- **`CacheBoxPassthrough`**: forward to real upstream, record the request/response pair asynchronously under the rule's authoritative key strategy
-- **`CacheBoxReplay`**: serve from the installed replay set; a miss is a **counted synthetic 503**, never a live call (fail-closed — this is what makes a frozen phase trustworthy)
-- **`CacheBoxReplayDelay`**: replay plus a synthetic delay (fitted lognormal pushed by manteion, or observed)
-
-The store is split so record traffic can never evict replay data: an immutable, atomically-swapped **ReplaySet** serves replays (installed only via staged preload or commit), while a bounded **RecordBuffer** absorbs recording. Replay lookups are scoped to the rule's `(experiment_id, phase_id)` — a hit against another phase's set fails closed and is counted. Every drop (recorder backpressure, oversize response, push failure) increments a per-phase fidelity counter, and phase end triggers a flush + **drain report** to manteion so recording completeness is verified, not assumed.
-
-```go
-cb := atropos.NewCacheBox(atropos.CacheBoxConfig{ /* zero value = sane defaults */ })
-atropos.Configure(atropos.WithCacheBoxCoordinator(cb))
-
-client := &http.Client{
-    Transport: atropos.EgressTransport(http.DefaultTransport),
-}
-```
-
-Response headers on replay: `X-Atropos-Cache-Key`, `X-Atropos-Cache-Mode`, `X-Atropos-Cache-Latency-Us`; fail-closed misses carry `X-Atropos-Cache-Miss`. Oversize responses (> 1 MiB by default) stream through unchanged and are **counted as drops** under a recording rule. See "Manteion integration & the fidelity pipeline" below for the full host wiring.
+Response headers on replay: `X-Atropos-Cache-Key`, `X-Atropos-Cache-Mode`, `X-Atropos-Cache-Latency-Us`; fail-closed misses carry `X-Atropos-Cache-Miss`. Oversize responses (> 1 MiB by default) stream through unchanged and are **counted as drops** under a recording rule.
 
 Cache-box covers **egress HTTP only**. Ingress and gRPC are tracked in Ongoing Development.
 
-### 7. Admin Handlers
-
-Three `http.Handler` factories for runtime control. Mount on an internal admin mux, never on externally-exposed traffic.
-
-#### `FaultAdminHandler()` — `/admin/fault`
-
-Single-fault runtime control via a built-in `DemoEvaluator`. Suitable for demos and single-fault scenarios; not for rule libraries. On a host that has already called `Configure` (any manteion-connected service), the zero-argument `FaultAdminHandler()` refuses with **409** rather than silently reconfiguring the SDK — mount `FaultAdminHandlerWith(eval, ...)` explicitly if you need both.
-
-| Method | Body | Response |
-|---|---|---|
-| `GET` | — | 200 `{"active": bool, "fault": {...}}` |
-| `POST` | fault request JSON | 201 `{"active": true, "fault": {...}}` |
-| `DELETE` | — | 200 `{"active": false}` |
-
-POST body fields by `type`:
-
-| `type` | Required | Optional | Defaults |
-|---|---|---|---|
-| `latency` | `delay` (e.g. `"500ms"`) | `jitter` (duration) | — |
-| `error`   | — | `status_code` (int), `message` (string) | 500, `"injected fault"` |
-| `hang`    | `duration` | — | — |
-
-```go
-mux.Handle("/admin/fault", atropos.FaultAdminHandler())
-```
-
-```bash
-curl -X POST localhost:8080/admin/fault -d '{"type":"latency","delay":"500ms"}'
-curl localhost:8080/admin/fault
-curl -X DELETE localhost:8080/admin/fault
-```
-
-#### `CacheBoxAdminHandler(cb)` — `/admin/cachebox`
-
-Runtime cache-box control: read stats, replace the delay source with a fitted lognormal distribution, or clear the store.
-
-| Method | Path | Body | Response |
-|---|---|---|---|
-| `GET` | `/admin/cachebox` | — | 200 `Stats` JSON |
-| `POST` | `/admin/cachebox/delay` | `{"mu":float, "sigma":float, "seed"?:uint64}` | 204 |
-| `DELETE` | `/admin/cachebox` | — | 204 (store cleared; lifetime counters preserved) |
-
-```go
-mux.Handle("/admin/cachebox", atropos.CacheBoxAdminHandler(cb))
-mux.Handle("/admin/cachebox/", atropos.CacheBoxAdminHandler(cb))
-```
-
-#### `RulesAdminHandler(eval)` — `/admin/rules`
-
-Runtime rule-set management backed by a `StaticEvaluator`. POST atomically replaces the entire rule list.
-
-| Method | Body | Response |
-|---|---|---|
-| `GET` | — | 200 `[]StaticRule` JSON |
-| `POST` | `[]StaticRule` JSON | 204 |
-
-```go
-eval := atropos.NewStaticEvaluator()
-atropos.Configure(atropos.WithEvaluator(eval))
-mux.Handle("/admin/rules", atropos.RulesAdminHandler(eval))
-```
-
-### 8. Prometheus Metrics
-
-```go
-mux.Handle("/metrics", atropos.MetricsHandler())
-```
-
-Exposes `http_server_requests_total`, `http_server_request_duration_seconds`, `http_client_requests_total`, `http_client_request_duration_seconds` — each labeled by method, path, status, and service.
-
-## Design Decisions
-
-### Always-on spans
-
-Hook points (`Span`, `SpanWithFault`, middleware) always create OTel spans regardless of whether a fault fires. This gives continuous trace coverage during normal operation and makes the SDK useful for pure observability. When a fault does fire, its span nests as a child of the hook span, preserving parent-child relationships.
-
-When no fault fires, a `fault.skipped` event is recorded on the hook span. When a fault fires, a `fault.injected` event is recorded instead. This makes it trivial to query for "all requests that were affected by faults" in your trace backend.
-
-### Events over spans for network and resource faults
-
-Network faults operate at the TCP level (proxy, RST, blackhole, retransmit_delay). Creating child spans per-connection when the connection itself might be reset or blackholed produces misleading trace data: a span implies a successful lifecycle, but these faults deliberately break that assumption.
-
-Instead, network and resource faults implement the `EventAware` interface. The interceptor injects an event emitter before starting the fault, and the fault emits timestamped events on the parent `fault.inject` span at key moments:
-
-**Network events:** `conn.accepted`, `toxic.hijack`, `upstream.dial`, `conn.error`, `conn.closed`
-**Resource events:** `ramp_up.start`, `ramp_up.complete`, `sustain.start`, `ramp_down.start`, `ramp_down.complete`
-
-This gives precise timing correlation without implying a "successful" span lifecycle for something that is by definition breaking.
-
-### Fault lifecycle: linear ramp phases
-
-All faults share a base `FaultConfig` with `Duration`, `RampUp`, and `RampDown`. Resource faults (CPU, I/O, memory, disk) linearly scale intensity during ramp phases. This models real-world degradation patterns better than instant on/off, and lets you observe how services behave under gradually increasing pressure.
-
-### Label threading
-
-Labels passed to `SpanWithFault` or extracted by middleware (`http.method`, `grpc.method`, etc.) serve two purposes:
-
-1. **Evaluator matching:** The rule engine matches predicates against labels to decide if a fault should fire.
-2. **Span attributes:** The same labels are recorded as span attributes so they appear in your trace backend.
-
-This avoids the common gap where rules match on context that never shows up in traces.
-
-### Injection point taxonomy
-
-Faults can fire at four points:
-
-| Point | Where | Example |
-|-------|-------|---------|
-| **Ingress** | Inbound request hitting the service | HTTP middleware, gRPC server interceptor |
-| **Egress** | Outbound call to a dependency | HTTP transport, gRPC client interceptor |
-| **Transient** | After request completion (side effects) | Background jobs, queue consumers |
-| **Custom** | Developer-annotated code block | `SpanWithFault("process-payment", ...)` |
-
-### Execution modes
-
-Faults run in one of two modes:
-
-- **Inline:** Blocks the request until the fault completes. Used for latency, error, and hang faults where the caller should experience the delay.
-- **Background:** Runs independently of the request lifecycle. Used for resource faults (CPU, I/O, memory, disk) and network proxies that outlive individual requests.
-
-### Cache-box never blocks the hot path — but every drop is counted
-
-The cache-box recorder uses a bounded channel with an async drain goroutine. When the channel is full (e.g., a burst of unique requests faster than the recorder can persist), new entries are dropped rather than blocking the request path — and the drop increments the per-`(experiment, phase)` fidelity counter, so the drain barrier and verdict see it. Replay reads are O(1) against the immutable ReplaySet snapshot. Oversized responses (> 1 MiB) stream through unchanged via `io.MultiReader`, counted as drops under a recording rule.
-
-### gRPC in a separate subpackage
-
-The `grpc/` subpackage avoids forcing a `google.golang.org/grpc` dependency on HTTP-only services. Import `atropos-go/grpc` only when you need gRPC interceptors.
-
-## Fault Types
-
-### Inline
-
-| Type | Behavior |
-|------|----------|
-| **Latency** | Sleeps for configured duration with optional jitter |
-| **Error** | Returns immediately with configured HTTP status code and message |
-| **Hang** | Blocks until context cancellation or duration expires (application-level blackhole) |
-
-### Network (TCP Proxy)
-
-The network proxy sits between client and upstream, applying toxic effects to the TCP stream:
-
-| Toxic | Effect |
-|-------|--------|
-| **Blackhole** | Accepts connections, never responds |
-| **RST** | Sends TCP reset |
-| **RetransmitDelay** | Per-chunk stochastic delay simulating TCP retransmit on perceived loss (does not actually drop bytes — that requires kernel-level `tc netem`) |
-| **Latency** | Adds stream-level delay |
-| **Throttle** | Rate-limits to configured bytes/sec |
-| **Drip** | Writes data in tiny chunks with pauses |
-
-### Resource
-
-| Type | Mechanism |
-|------|-----------|
-| **CPU** | Duty-cycle spinning across goroutines pinned to OS threads. Detects CPU quota from cgroup (Docker/k8s) or `runtime.NumCPU()`. Maps to iBench SoI11/12/15 (integer, FP, vector pressure). |
-| **I/O** | Creates random files and reads them at controlled rate using a shared token bucket. |
-| **Memory** | RAM hogger that allocates and touches pages to exert real memory pressure. Ramp phases scale the allocation curve. |
-| **Disk** | Controlled disk-fill and I/O-rate faults targeting a working directory. |
-
-All four support linear ramp-up and ramp-down phases.
-
-### Cache-box (testing primitive, not a failure mode)
-
-| Mode | Effect |
-|------|--------|
-| **Passthrough** | Normal operation; records request/response pairs for later replay |
-| **Replay** | Serves cached response; zero upstream CPU, zero queueing |
-| **Replay-with-delay** | Serves cached response after synthetic latency (observed or fitted distribution) |
-
-See `VISION.md` for the full cache-box experimental methodology.
-
-## Attribute Namespace
-
-All attributes are prefixed with `atropos.` for clean coexistence with standard OTel semantic conventions. Constants live in `internal/trace/attrs.go`.
-
-| Prefix | Attributes |
-|--------|------------|
-| `atropos.fault.*` | type, injection_point, reason, duration_ms, actual_duration, detail |
-| `atropos.hook.*` | name |
-| `atropos.http.*` | method, path, host, user_agent |
-| `atropos.grpc.*` | method, user_agent |
-| `atropos.net.*` | conn.id, conn.remote_addr, conn.affected, upstream.addr, dial_duration_ms, bytes_up, bytes_down |
-| `atropos.resource.*` | target_load, target_rate, ramp_up_ms, ramp_down_ms |
-| `atropos.cachebox.*` | key, mode, hit, observed_latency_us, synthetic_latency_us, oversize |
-
-## Init Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `WithServiceName(name)` | `"unknown"` | `service.name` resource attribute |
-| `WithServiceVersion(v)` | `""` | `service.version` resource attribute |
-| `WithEnvironment(env)` | `"development"` | `deployment.environment` resource attribute |
-| `WithEndpoint(addr)` | `localhost:4317` | OTLP collector address |
-| `WithInsecure(bool)` | `true` | Use plaintext gRPC (disable TLS) |
-| `WithSampler(s)` | `AlwaysSample` | Custom `sdktrace.Sampler` |
-| `WithTracerProvider(tp)` | builds one | Bring your own `TracerProvider` |
-
-## Configure Options
-
-Wire up the package-level default interceptor via `atropos.Configure(opts ...ConfigureOption)`:
-
-| Option | Purpose |
-|--------|---------|
-| `WithEvaluator(e Evaluator)` | Attach a rule-matching evaluator to drive fault decisions |
-| `WithCacheBoxCoordinator(cb *cachebox.CacheBox)` | Enable egress cache-box (passthrough/replay/replay-with-delay) |
-
-Call `Configure` after `Init` and before serving traffic. Each option replaces its slot; missing options keep their existing wiring.
+### 6. Prometheus Metrics
+
+`GET /metrics` (mounted by `Serve`, outside the middleware) exposes
+`http_server_requests_total`, `http_server_request_duration_seconds`,
+`http_client_requests_total`, `http_client_request_duration_seconds`, the
+cache-box hit/miss/record counters, and `atropos_fault_injections_total`.
 
 ---
 
 ## Manteion integration & the fidelity pipeline
 
-The SDK-initiated path is the production one: `ConnectManteion(ctx, serviceName, opts...)`
-registers the instance, then polls `GET /api/v1/sdk/rules` (SSE `rules_changed` nudges between
+The SDK-initiated path is the production one: `Serve` registers the instance,
+then polls `GET /api/v1/sdk/rules` (SSE `rules_changed` nudges between
 intervals). The poll payload is the **full desired state** — an empty rule set is authoritative
 (rules cleared, running background faults stopped by key, drain tracker fired), not "no change".
 Cache-box record/replay rules arrive with a `CacheBoxContext` carrying the `(experiment_id,
@@ -486,29 +289,15 @@ The fidelity pipeline around a recording phase:
    freeze the service; misses fail closed and are counted; manteion pulls
    `GET /cachebox/fidelity?experiment_id=&phase_id=` (W6) at phase end for the verdict.
 
-Canonical host wiring — identity resolution, push client, handler mounts — lives in service-beds
-(`microservices-demo-go/src/*/atropos_wiring.go`, copied verbatim across the mesh services). The
-essentials:
-
-```go
-cb := atropos.NewCacheBox(atropos.CacheBoxConfig{})
-push := atropos.NewCachePushClient(atropos.CachePushConfig{
-    BaseURL: manteionURL, Service: service, Instance: instanceID,
-})
-push.BindFidelity(cb.Fidelity()) // before traffic — else drain reports carry zero push counts
-
-mux.Handle("/admin/cachebox", atropos.CacheBoxAdminHandler(cb))  // bare AND subtree: a subtree
-mux.Handle("/admin/cachebox/", atropos.CacheBoxAdminHandler(cb)) // pattern alone 301s the bare path
-mux.Handle("/cachebox/preload/", atropos.CacheBoxPreloadHandler(cb))
-mux.Handle("GET /cachebox/fidelity", atropos.CacheBoxFidelityHandler(cb, service, instanceID))
-```
-
-The instance identity **must be the same string** in the register call, the push client, and the
-fidelity handler — manteion correlates all three (precedence: `MANTEION_INSTANCE_ID` > hostname >
-service name). Environment read by `ConnectManteion`: `MANTEION_URL`, `MANTEION_INSTANCE_ID`,
-`MANTEION_ADVERTISE_ADDR`, `MANTEION_SERVICE_VERSION`, `MANTEION_INIT_TIMEOUT`; `ATROPOS_CONFIG`
-points at an optional config file. Services can publish their route table into the register
-payload with `atropos.RegisterRoutes(...)`.
+All of the host wiring this pipeline needs — identity resolution, the push
+client bound to the cache-box's fidelity registry, and every handler mount at
+the exact paths manteion addresses — happens inside `Serve`. The instance
+identity is resolved **once** (`Config.InstanceID` > `MANTEION_INSTANCE_ID` >
+hostname > service name) and used verbatim in the register call, the
+cache-push envelopes and drain reports, and the fidelity endpoint — manteion
+correlates all three. Environment read by `Serve`: `MANTEION_URL`,
+`MANTEION_INSTANCE_ID`, `MANTEION_ADVERTISE_ADDR`, `MANTEION_SERVICE_VERSION`,
+`MANTEION_INIT_TIMEOUT`, plus the OTel endpoint vars above.
 
 ---
 
@@ -580,9 +369,7 @@ The public API is intentionally minimal so language bindings can stay thin. For 
 
 | Go (today) | Python | Java | Node/TS |
 |----|--------|------|---------|
-| `Init(ctx, opts...)` | `init(**opts)` | `Atropos.init(opts)` | `init(opts)` |
-| `Span(ctx, name, attrs...)` | `@atropos.span("name", **kw)` | `@AtroposSpan("name")` | `atropos.span("name", attrs, fn)` |
-| `IngressMiddleware(h)` | WSGI/ASGI middleware | Servlet filter | Express middleware |
+| `Serve(ctx, Config)` | `serve(**cfg)` | `Atropos.serve(cfg)` | `serve(cfg)` |
 | `EgressTransport(rt)` | `requests.Session` adapter | `OkHttp` interceptor | `fetch` wrapper |
 
 ---

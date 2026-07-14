@@ -32,13 +32,17 @@ We want to eventually allow this system to be observed on Grafana alongside the 
 ## Request correlation
 Another important tool that is in not Gremlin is the ability to correlate requests. This means that when a fault is triggered, it should be possible to see the few requests that led to up to the fault or sort of caused it to trigger. There might be multiple causes or rather a failure cannot be traced to a single request.
 
-## Admin Handlers
+## Admin Endpoints
 
-The SDK ships three `http.Handler` factories for runtime control. Mount them on an internal/admin mux that is not exposed to external traffic.
+`atropos.Serve` mounts the runtime-control endpoints on the handler it
+returns, at the exact paths below, OUTSIDE the fault/OTel middleware. There
+are no public handler factories to mount by hand.
 
-### FaultAdminHandler
+### /admin/fault
 
-`FaultAdminHandler() http.Handler` exposes runtime fault injection control via a built-in `DemoEvaluator`.
+Runtime fault injection control against the admin fault slot (a second
+evaluator composed after the host rule evaluator — armed admin faults never
+shadow manteion rules).
 
 | Method | Path           | Body             | Response |
 |--------|----------------|------------------|----------|
@@ -71,15 +75,9 @@ Common `params` examples: inline latency `{"delay","jitter"}`; inline error
 `{"duration"}`; resource cpu `{"target_load","window"}`. See
 `faultparams/params.go` for the full catalogue.
 
-Example mount:
+### /admin/cachebox
 
-```go
-mux.Handle("/admin/fault", atropos.FaultAdminHandler())
-```
-
-### CacheBoxAdminHandler
-
-`CacheBoxAdminHandler(cb *CacheBox) http.Handler` exposes runtime cache-box control.
+Runtime cache-box control.
 
 | Method | Path                    | Body                                             | Response |
 |--------|-------------------------|--------------------------------------------------|----------|
@@ -87,33 +85,22 @@ mux.Handle("/admin/fault", atropos.FaultAdminHandler())
 | POST   | `/admin/cachebox/delay` | `{"mu": float, "sigma": float, "seed"?: uint64}` | 204 (replaces delay source with lognormal distribution) |
 | DELETE | `/admin/cachebox`       | —                                                | 204 (clears store; preserves lifetime counters) |
 
-Example mount:
+### /admin/rules
 
-```go
-mux.Handle("/admin/cachebox", atropos.CacheBoxAdminHandler(cb))
-mux.Handle("/admin/cachebox/", atropos.CacheBoxAdminHandler(cb))
-```
-
-### RulesAdminHandler
-
-`RulesAdminHandler(eval *StaticEvaluator) http.Handler` exposes runtime rule-set management.
+Runtime rule-set management against the host evaluator.
 
 | Method | Path           | Body                | Response |
 |--------|----------------|---------------------|----------|
 | GET    | `/admin/rules` | —                   | 200 `[]StaticRule` JSON |
 | POST   | `/admin/rules` | `[]StaticRule` JSON | 204 (atomic replace) |
 
-Example mount:
-
-```go
-eval := atropos.NewStaticEvaluator()
-atropos.Configure(atropos.WithEvaluator(eval))
-mux.Handle("/admin/rules", atropos.RulesAdminHandler(eval))
-```
-
 ## SDK Bootstrap
 
-Services embedding atropos-go register with manteion on startup so manteion can serve them rules and reconcile intent on rolling deploys.
+Services embed via `atropos.Serve(ctx, atropos.Config{...})`, which registers
+with manteion on startup so manteion can serve them rules and reconcile
+intent on rolling deploys. Registration, polling, and intent application are
+internal to `Serve`; the wire types below stay public because manteion
+imports them.
 
 ### Types
 
@@ -122,38 +109,29 @@ Services embedding atropos-go register with manteion on startup so manteion can 
 - `RegisterResponse{Status, Rules, ActiveFault, FreezeCfg}` — the response. Rules/ActiveFault/FreezeCfg are populated when manteion has intent tracked for the service.
 - `CompiledRule`, `CompiledFault`, `CompiledComposition`, `CompiledCompositionMember` — the JSON wire format for rules, mirroring `manteion-go/internal/ruleconv`. `CompiledComposition` is carried on the wire but not yet executable on the SDK side; `DecodeCompiledRules` errors on composition rules.
 
-### Functions
-
-- `Register(ctx, manteionURL, req) (RegisterResponse, error)` — POSTs to `manteionURL + /api/v1/sdk/register` with a 5s default timeout.
-- `RegisterRoutes(routes ...Route)` — records the HTTP route inventory published on every (re-)register. Call at startup before `ConnectManteion`; manteion aggregates routes into the workflow-builder catalog (`GET /api/v1/catalog/endpoints`).
-- `Apply(resp, ApplyTargets{Evaluator, DemoEval, CacheBox}) error` — installs rules, active fault, and freeze config onto the provided SDK objects. Missing targets for populated response fields are errors.
-- `DecodeCompiledRules([]CompiledRule) ([]StaticRule, error)` — lower-level helper used by Apply.
-
 ### Typical Usage
 
 ```go
-eval := atropos.NewStaticEvaluator()
-demo := &atropos.DemoEvaluator{}
-cb := atropos.NewCacheBox(atropos.CacheBoxConfig{Store: atropos.NewCacheBoxMemStore(1024)})
-
-atropos.Configure(atropos.WithEvaluator(eval), atropos.WithCacheBoxCoordinator(cb))
-
-resp, err := atropos.Register(ctx, os.Getenv("ATROPOS_MANTEION_URL"), atropos.RegisterRequest{
-    ID:      os.Getenv("POD_NAME"),
+h, shutdown, err := atropos.Serve(ctx, atropos.Config{
     Service: os.Getenv("SERVICE_NAME"),
-    Address: fmt.Sprintf("http://%s:9090", os.Getenv("POD_IP")),
+    Version: version,
+    Routes:  routes,
+    Handler: mux,
 })
 if err != nil {
-    log.Fatalf("register: %v", err)
+    log.Fatalf("atropos: %v", err)
 }
-if err := atropos.Apply(resp, atropos.ApplyTargets{Evaluator: eval, DemoEval: demo, CacheBox: cb}); err != nil {
-    log.Fatalf("apply: %v", err)
-}
+defer shutdown(ctx)
+http.ListenAndServe(addr, h)
 ```
+
+Registration identity: `Config.InstanceID` > `MANTEION_INSTANCE_ID` >
+hostname > service name — resolved once and used for register, cache-push,
+and the fidelity endpoint alike.
 
 ### Limitations (current)
 
-- `DecodeCompiledRules` supports all three fault categories: inline (latency, error, hang), network (latency, retransmit_delay, blackhole, drip, rst, throttle), and resource (cpu, disk, io, memory). Network faults require a `NetworkResolver` option via `WithNetworkResolver`.
+- The rule decoder supports all three fault categories: inline (latency, error, hang), network (latency, retransmit_delay, blackhole, drip, rst, throttle), and resource (cpu, disk, io, memory). Network faults require `Config.NetworkResolver`.
 - The `host=inline` path on network faults (per-request response shaping via RoundTripper) is recognized by the wire format but rejected with a v6 deferral error until `ToxicTransport` is implemented.
 - Composition rules are rejected on decode with a v6 deferral error — the SDK has no composition evaluator yet (parallel/sequential fault dispatch with direction inheritance is future work).
 - `DecodeCompiledRules` sorts decoded rules by `Priority` descending (higher = evaluated first). Equal-priority rules preserve input order.
