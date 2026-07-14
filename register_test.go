@@ -190,7 +190,7 @@ func TestApply_ActiveFault_UnknownType(t *testing.T) {
 }
 
 func TestApply_FreezeCfg_NegativeMu(t *testing.T) {
-	cb := atropos.NewCacheBox(atropos.CacheBoxConfig{Store: atropos.NewCacheBoxMemStore(16)})
+	cb := atropos.NewCacheBox(atropos.CacheBoxConfig{})
 	resp := atropos.RegisterResponse{
 		RuleSync: atropos.RuleSync{FreezeCfg: &atropos.DelayRequest{Mu: -1}},
 	}
@@ -289,8 +289,7 @@ func TestRegisterAndApply_E2E(t *testing.T) {
 }
 
 func TestApply_FreezeCfg_SetsDistributionDelay(t *testing.T) {
-	store := atropos.NewCacheBoxMemStore(100)
-	cb := atropos.NewCacheBox(atropos.CacheBoxConfig{Store: store})
+	cb := atropos.NewCacheBox(atropos.CacheBoxConfig{})
 	defer cb.Stop()
 
 	resp := atropos.RegisterResponse{

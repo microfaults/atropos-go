@@ -50,8 +50,8 @@ type Config struct {
 	// Store is the record-side persistence backend the recorder drains
 	// into -- never consulted by Lookup (see ReplaySet). If nil, a
 	// 10000-entry RecordBuffer is used (bounded with an overflow counter
-	// instead of LRU eviction). Supplying a custom Store (e.g. MemStore)
-	// here only affects the record side.
+	// instead of LRU eviction). Supplying a custom Store here only
+	// affects the record side.
 	Store Store
 
 	// KeyStrategy selects one of the built-in key functions. Ignored if

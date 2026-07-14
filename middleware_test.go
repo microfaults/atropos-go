@@ -17,6 +17,15 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
+// testEvaluator returns a fixed decision for every request.
+type testEvaluator struct {
+	decision *evaluator.Decision
+}
+
+func (e *testEvaluator) Evaluate(_ context.Context, _ evaluator.Request) *evaluator.Decision {
+	return e.decision
+}
+
 func TestIngressMiddleware_CreatesSpans(t *testing.T) {
 	exporter := tracetest.NewInMemoryExporter()
 	tp := sdktrace.NewTracerProvider(

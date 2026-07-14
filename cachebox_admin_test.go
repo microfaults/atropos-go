@@ -11,9 +11,7 @@ import (
 func TestCacheBoxAdminHandler(t *testing.T) {
 	newCB := func(t *testing.T) *CacheBox {
 		t.Helper()
-		cb := NewCacheBox(CacheBoxConfig{
-			Store: NewCacheBoxMemStore(100),
-		})
+		cb := NewCacheBox(CacheBoxConfig{})
 		t.Cleanup(cb.Stop)
 		return cb
 	}

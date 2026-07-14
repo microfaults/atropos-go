@@ -68,8 +68,7 @@ func TestRuleSync_WireRoundTripAndApply(t *testing.T) {
 	// Apply the decoded payload into fresh targets.
 	eval := atropos.NewStaticEvaluator()
 	demo := &atropos.DemoEvaluator{}
-	store := atropos.NewCacheBoxMemStore(16)
-	cb := atropos.NewCacheBox(atropos.CacheBoxConfig{Store: store})
+	cb := atropos.NewCacheBox(atropos.CacheBoxConfig{})
 	defer cb.Stop()
 
 	resp := atropos.RegisterResponse{Status: "poll", RuleSync: decoded}

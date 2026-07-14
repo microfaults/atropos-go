@@ -127,12 +127,6 @@ type CacheBoxEntry = cachebox.Entry
 // Convert with EntryToWire / WireToEntry.
 type CacheBoxWireEntry = cachebox.WireEntry
 
-// CacheBoxStore is the cache-box persistence contract.
-type CacheBoxStore = cachebox.Store
-
-// CacheBoxMemStoreConfig configures the in-memory cache-box store.
-type CacheBoxMemStoreConfig = cachebox.MemStoreConfig
-
 // CacheBoxDelaySource produces delays for replay_with_delay mode.
 type CacheBoxDelaySource = cachebox.DelaySource
 
@@ -157,12 +151,6 @@ type CacheBoxRequestMeta = cachebox.RequestMeta
 // are applied for unset fields. See cachebox.Config for details.
 func NewCacheBox(cfg CacheBoxConfig) *CacheBox {
 	return cachebox.New(cfg)
-}
-
-// NewCacheBoxMemStore builds the default in-memory LRU store. A zero
-// maxEntries means unbounded -- use with caution in production.
-func NewCacheBoxMemStore(maxEntries int) CacheBoxStore {
-	return cachebox.NewMemStore(cachebox.MemStoreConfig{MaxEntries: maxEntries})
 }
 
 // CacheBoxEntryToWire converts an in-memory Entry to a WireEntry for serialization.
