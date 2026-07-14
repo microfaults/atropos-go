@@ -19,12 +19,14 @@ import (
 
 // Response headers added by the cache-box dispatch path. These are visible
 // both to the caller (which can use them for correlation in its own logs)
-// and to any downstream OTel instrumentation.
+// and to any downstream OTel instrumentation. Exported so the root
+// package's egress metrics layer classifies responses (miss vs hit vs
+// record) from the same definitions this dispatcher stamps.
 const (
-	headerCacheKey       = "X-Atropos-Cache-Key"
-	headerCacheMode      = "X-Atropos-Cache-Mode"
-	headerCacheLatencyUs = "X-Atropos-Cache-Latency-Us"
-	headerCacheMiss      = "X-Atropos-Cache-Miss"
+	HeaderCacheKey       = "X-Atropos-Cache-Key"
+	HeaderCacheMode      = "X-Atropos-Cache-Mode"
+	HeaderCacheLatencyUs = "X-Atropos-Cache-Latency-Us"
+	HeaderCacheMiss      = "X-Atropos-Cache-Miss"
 )
 
 // defaultMissStatus is the synthetic status code returned for a fail-closed
@@ -209,9 +211,9 @@ func cacheBoxMissResponse(cb *cachebox.CacheBox, key string, action evaluator.Ca
 
 	header := http.Header{}
 	header.Set("Content-Type", "application/problem+json")
-	header.Set(headerCacheMiss, "1")
-	header.Set(headerCacheKey, key)
-	header.Set(headerCacheMode, action.String())
+	header.Set(HeaderCacheMiss, "1")
+	header.Set(HeaderCacheKey, key)
+	header.Set(HeaderCacheMode, action.String())
 
 	return &http.Response{
 		Status:        http.StatusText(status),
@@ -335,8 +337,8 @@ func (i *Interceptor) cacheBoxPassthrough(ctx context.Context, r *http.Request, 
 	}
 
 	// Tag the response so callers can see which key was assigned.
-	resp.Header.Set(headerCacheKey, key)
-	resp.Header.Set(headerCacheLatencyUs, strconv.FormatInt(observed.Microseconds(), 10))
+	resp.Header.Set(HeaderCacheKey, key)
+	resp.Header.Set(HeaderCacheLatencyUs, strconv.FormatInt(observed.Microseconds(), 10))
 
 	// Optional: attach the response body to the span (research/debug mode).
 	if limit := cb.OTelCaptureLimit(); limit > 0 && len(body) <= limit {
@@ -354,12 +356,12 @@ func cacheBoxServe(entry *cachebox.Entry, key string, action evaluator.CacheBoxA
 	if entry.Header != nil {
 		header = entry.Header.Clone()
 	}
-	header.Set(headerCacheKey, key)
-	header.Set(headerCacheMode, action.String())
+	header.Set(HeaderCacheKey, key)
+	header.Set(HeaderCacheMode, action.String())
 	if delay > 0 {
-		header.Set(headerCacheLatencyUs, strconv.FormatInt(delay.Microseconds(), 10))
+		header.Set(HeaderCacheLatencyUs, strconv.FormatInt(delay.Microseconds(), 10))
 	} else {
-		header.Set(headerCacheLatencyUs, strconv.FormatInt(entry.ObservedLatency.Microseconds(), 10))
+		header.Set(HeaderCacheLatencyUs, strconv.FormatInt(entry.ObservedLatency.Microseconds(), 10))
 	}
 
 	span.AddEvent(trace.EventCacheBoxReplay,

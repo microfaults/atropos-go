@@ -17,6 +17,15 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
+// testEvaluator returns a fixed decision for every request.
+type testEvaluator struct {
+	decision *evaluator.Decision
+}
+
+func (e *testEvaluator) Evaluate(_ context.Context, _ evaluator.Request) *evaluator.Decision {
+	return e.decision
+}
+
 func TestIngressMiddleware_CreatesSpans(t *testing.T) {
 	exporter := tracetest.NewInMemoryExporter()
 	tp := sdktrace.NewTracerProvider(
@@ -33,7 +42,7 @@ func TestIngressMiddleware_CreatesSpans(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	handler := IngressMiddleware(inner, "test-service", WithInterceptor(i))
+	handler := ingressMiddleware(inner, "test-service", i)
 
 	req := httptest.NewRequest("GET", "/api/health", nil)
 	rec := httptest.NewRecorder()
@@ -86,7 +95,7 @@ func TestIngressMiddleware_WithFault(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	handler := IngressMiddleware(inner, "test-service", WithInterceptor(i))
+	handler := ingressMiddleware(inner, "test-service", i)
 
 	req := httptest.NewRequest("POST", "/checkout", nil)
 	rec := httptest.NewRecorder()
@@ -138,7 +147,7 @@ func TestEgressTransport_CreatesSpans(t *testing.T) {
 	defer ts.Close()
 
 	client := &http.Client{
-		Transport: EgressTransport(http.DefaultTransport, WithInterceptor(i)),
+		Transport: egressTransport(http.DefaultTransport, func() *interceptor.Interceptor { return i }),
 	}
 
 	resp, err := client.Get(ts.URL + "/test")

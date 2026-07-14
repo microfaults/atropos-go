@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"git.ucsc.edu/microfaults/atropos-go/faultparams"
+	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault/inline"
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault/network"
@@ -79,7 +80,7 @@ type NetworkEnvelope struct {
 
 // CompiledComposition is a resolved FaultComposition tree with all specs
 // inlined. Composition execution is not yet supported by the SDK evaluator
-// (deferred to v6); DecodeCompiledRule errors if a rule references one.
+// (deferred to v6); decodeCompiledRule errors if a rule references one.
 type CompiledComposition struct {
 	Name          string                      `json:"name"`
 	ExecutionMode string                      `json:"execution_mode"`
@@ -101,17 +102,17 @@ type decodeConfig struct {
 	resolve NetworkResolver
 }
 
-// DecodeOption configures the behaviour of DecodeCompiledRule(s).
-type DecodeOption func(*decodeConfig)
+// decodeOption configures the behaviour of decodeCompiledRule(s).
+type decodeOption func(*decodeConfig)
 
-// WithNetworkResolver supplies the resolver that maps a logical target name
+// withNetworkResolver supplies the resolver that maps a logical target name
 // (e.g. "redis") to a listen and upstream address pair for network fault
 // proxies. Required when decoding rules whose Network.Host=="proxy".
-func WithNetworkResolver(r NetworkResolver) DecodeOption {
+func withNetworkResolver(r NetworkResolver) decodeOption {
 	return func(c *decodeConfig) { c.resolve = r }
 }
 
-func buildDecodeConfig(opts []DecodeOption) *decodeConfig {
+func buildDecodeConfig(opts []decodeOption) *decodeConfig {
 	cfg := &decodeConfig{}
 	for _, o := range opts {
 		o(cfg)
@@ -119,18 +120,18 @@ func buildDecodeConfig(opts []DecodeOption) *decodeConfig {
 	return cfg
 }
 
-// DecodeCompiledRules converts wire-format CompiledRules into StaticRules
-// that can be loaded into a StaticEvaluator.
-func DecodeCompiledRules(compiled []CompiledRule, opts ...DecodeOption) ([]StaticRule, error) {
+// decodeCompiledRules converts wire-format CompiledRules into evaluator
+// StaticRules that can be loaded into the host StaticEvaluator.
+func decodeCompiledRules(compiled []CompiledRule, opts ...decodeOption) ([]evaluator.StaticRule, error) {
 	sorted := make([]CompiledRule, len(compiled))
 	copy(sorted, compiled)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		return sorted[i].Priority > sorted[j].Priority
 	})
 
-	rules := make([]StaticRule, 0, len(sorted))
+	rules := make([]evaluator.StaticRule, 0, len(sorted))
 	for _, cr := range sorted {
-		sr, err := DecodeCompiledRule(cr, opts...)
+		sr, err := decodeCompiledRule(cr, opts...)
 		if err != nil {
 			return nil, fmt.Errorf("rule %q: %w", cr.Name, err)
 		}
@@ -139,11 +140,11 @@ func DecodeCompiledRules(compiled []CompiledRule, opts ...DecodeOption) ([]Stati
 	return rules, nil
 }
 
-// DecodeCompiledRule converts a single CompiledRule into a StaticRule.
-func DecodeCompiledRule(cr CompiledRule, opts ...DecodeOption) (StaticRule, error) {
+// decodeCompiledRule converts a single CompiledRule into a StaticRule.
+func decodeCompiledRule(cr CompiledRule, opts ...decodeOption) (evaluator.StaticRule, error) {
 	cfg := buildDecodeConfig(opts)
 
-	sr := StaticRule{
+	sr := evaluator.StaticRule{
 		Name:   cr.Name,
 		Point:  parseInjectionPoint(cr.InjectionPoint),
 		Labels: cr.Labels,
@@ -157,7 +158,7 @@ func DecodeCompiledRule(cr CompiledRule, opts ...DecodeOption) (StaticRule, erro
 	if cr.Fault != nil {
 		f, err := decodeFault(cr.Fault, cfg)
 		if err != nil {
-			return StaticRule{}, err
+			return evaluator.StaticRule{}, err
 		}
 		sr.Decision.Fault = f
 	}
@@ -166,7 +167,7 @@ func DecodeCompiledRule(cr CompiledRule, opts ...DecodeOption) (StaticRule, erro
 		// v6 work: SDK-side composition execution (parallel/sequential
 		// fault dispatch with direction inheritance). Today manteion can
 		// compose and validate, but the SDK can't run them.
-		return StaticRule{}, fmt.Errorf(
+		return evaluator.StaticRule{}, fmt.Errorf(
 			"composition rules are not yet supported by the SDK evaluator (v6)",
 		)
 	}
@@ -180,42 +181,42 @@ func DecodeCompiledRule(cr CompiledRule, opts ...DecodeOption) (StaticRule, erro
 	return sr, nil
 }
 
-func parseInjectionPoint(s string) InjectionPoint {
+func parseInjectionPoint(s string) evaluator.InjectionPoint {
 	switch s {
 	case "ingress":
-		return Ingress
+		return evaluator.Ingress
 	case "egress":
-		return Egress
+		return evaluator.Egress
 	case "transient":
-		return Transient
+		return evaluator.Transient
 	case "custom":
-		return Custom
+		return evaluator.Custom
 	default:
-		return Ingress
+		return evaluator.Ingress
 	}
 }
 
-func parseMode(s string) Mode {
+func parseMode(s string) evaluator.Mode {
 	switch s {
 	case "background":
-		return Background
+		return evaluator.Background
 	case "inline":
-		return Inline
+		return evaluator.Inline
 	default:
-		return Inline
+		return evaluator.Inline
 	}
 }
 
-func parseStartPolicy(s string) StartPolicy {
+func parseStartPolicy(s string) evaluator.StartPolicy {
 	switch s {
 	case "always_start":
-		return AlwaysStart
+		return evaluator.AlwaysStart
 	default:
-		return DeduplicateByRule
+		return evaluator.DeduplicateByRule
 	}
 }
 
-func decodeFault(f *CompiledFault, cfg *decodeConfig) (Fault, error) {
+func decodeFault(f *CompiledFault, cfg *decodeConfig) (fault.Fault, error) {
 	baseCfg := fault.FaultConfig{
 		Duration: time.Duration(f.DurationMs) * time.Millisecond,
 		RampUp:   time.Duration(f.RampUpMs) * time.Millisecond,
@@ -252,7 +253,7 @@ func decodeFault(f *CompiledFault, cfg *decodeConfig) (Fault, error) {
 // decodeInlineFault dispatches by fault_type within the "inline" category.
 // Param shapes are the exported faultparams structs — the decode contract
 // and the control-plane validation schema are the same types by construction.
-func decodeInlineFault(faultType string, params json.RawMessage, baseCfg fault.FaultConfig) (Fault, error) {
+func decodeInlineFault(faultType string, params json.RawMessage, baseCfg fault.FaultConfig) (fault.Fault, error) {
 	switch faultType {
 	case "latency":
 		var p faultparams.InlineLatency
@@ -322,7 +323,7 @@ func decodeInlineFault(faultType string, params json.RawMessage, baseCfg fault.F
 	}
 }
 
-func decodeResourceFault(faultType string, params json.RawMessage, baseCfg fault.FaultConfig) (Fault, error) {
+func decodeResourceFault(faultType string, params json.RawMessage, baseCfg fault.FaultConfig) (fault.Fault, error) {
 	switch faultType {
 	case "cpu":
 		var p faultparams.ResourceCPU
@@ -417,7 +418,7 @@ func decodeResourceFault(faultType string, params json.RawMessage, baseCfg fault
 	}
 }
 
-func decodeNetworkFault(faultType string, env *NetworkEnvelope, params json.RawMessage, baseCfg fault.FaultConfig, resolve NetworkResolver) (Fault, error) {
+func decodeNetworkFault(faultType string, env *NetworkEnvelope, params json.RawMessage, baseCfg fault.FaultConfig, resolve NetworkResolver) (fault.Fault, error) {
 	host := env.Host
 	if host == "" {
 		host = "proxy"
@@ -439,9 +440,9 @@ func decodeNetworkFault(faultType string, env *NetworkEnvelope, params json.RawM
 	}
 }
 
-func decodeNetworkProxyFault(faultType string, env *NetworkEnvelope, params json.RawMessage, baseCfg fault.FaultConfig, resolve NetworkResolver) (Fault, error) {
+func decodeNetworkProxyFault(faultType string, env *NetworkEnvelope, params json.RawMessage, baseCfg fault.FaultConfig, resolve NetworkResolver) (fault.Fault, error) {
 	if resolve == nil {
-		return nil, fmt.Errorf("network fault %q with host=proxy requires a NetworkResolver (use WithNetworkResolver)", faultType)
+		return nil, fmt.Errorf("network fault %q with host=proxy requires a NetworkResolver (use withNetworkResolver)", faultType)
 	}
 	if env.Target == "" {
 		return nil, fmt.Errorf("network fault %q with host=proxy requires network.target", faultType)
@@ -551,15 +552,15 @@ func decodeNetworkToxic(faultType string, params json.RawMessage) (network.Toxic
 	}
 }
 
-func parseCacheBoxMode(s string) CacheBoxAction {
+func parseCacheBoxMode(s string) evaluator.CacheBoxAction {
 	switch s {
 	case "passthrough":
-		return CacheBoxPassthrough
+		return evaluator.CacheBoxPassthrough
 	case "replay":
-		return CacheBoxReplay
+		return evaluator.CacheBoxReplay
 	case "replay_with_delay":
-		return CacheBoxReplayDelay
+		return evaluator.CacheBoxReplayDelay
 	default:
-		return CacheBoxNone
+		return evaluator.CacheBoxNone
 	}
 }

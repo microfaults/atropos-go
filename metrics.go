@@ -76,9 +76,9 @@ func recordFaultInjection(faultType, injectionPoint string) {
 	faultInjectionsTotal.WithLabelValues(faultType, injectionPoint).Inc()
 }
 
-// MetricsHandler returns an http.Handler that serves Prometheus metrics.
-// It merges atropos-specific metrics with the default Go runtime/process metrics.
-func MetricsHandler() http.Handler {
+// metricsHandler serves Prometheus metrics (mounted at /metrics). It merges
+// atropos-specific metrics with the default Go runtime/process metrics.
+func metricsHandler() http.Handler {
 	return promhttp.HandlerFor(
 		prometheus.Gatherers{atroposRegistry, prometheus.DefaultGatherer},
 		promhttp.HandlerOpts{},

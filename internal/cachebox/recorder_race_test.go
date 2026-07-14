@@ -30,7 +30,7 @@ func TestRecorder_RecordFlushRaceWithStop(t *testing.T) {
 
 	for it := 0; it < iterations; it++ {
 		r := NewRecorder(RecorderConfig{
-			Store:   NewMemStore(MemStoreConfig{}),
+			Store:   NewRecordBuffer(RecordBufferConfig{}),
 			KeyFunc: KeyFuncFor(KeyStrategyExact),
 			BufSize: 8,
 		})

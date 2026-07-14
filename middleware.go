@@ -5,44 +5,17 @@ import (
 	"strconv"
 	"time"
 
+	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
+
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
-// MiddlewareOption configures IngressMiddleware or EgressTransport.
-type MiddlewareOption interface {
-	applyMiddleware(*middlewareConfig)
-}
-
-type middlewareConfig struct {
-	interceptor *Interceptor
-}
-
-func defaultMiddlewareConfig() middlewareConfig {
-	return middlewareConfig{
-		interceptor: defaultInterceptor,
-	}
-}
-
-type middlewareOptionFunc func(*middlewareConfig)
-
-func (f middlewareOptionFunc) applyMiddleware(c *middlewareConfig) { f(c) }
-
-// WithInterceptor overrides the default package-level interceptor
-// for this middleware instance.
-func WithInterceptor(i *Interceptor) MiddlewareOption {
-	return middlewareOptionFunc(func(c *middlewareConfig) { c.interceptor = i })
-}
-
-// IngressMiddleware composes otelhttp request spans with fault injection and
-// records Prometheus metrics (request count, duration histogram).
-func IngressMiddleware(next http.Handler, serviceName string, opts ...MiddlewareOption) http.Handler {
-	cfg := defaultMiddlewareConfig()
-	for _, o := range opts {
-		o.applyMiddleware(&cfg)
-	}
-
+// ingressMiddleware composes otelhttp request spans with fault injection and
+// records Prometheus metrics (request count, duration histogram). Serve
+// wraps the business handler with it; control paths are mounted beside it.
+func ingressMiddleware(next http.Handler, serviceName string, i *interceptor.Interceptor) http.Handler {
 	// Inner: fault injection check (creates fault span as child).
-	faulted := cfg.interceptor.IngressMiddleware(next)
+	faulted := i.IngressMiddleware(next)
 	// Middle: otelhttp request span (becomes parent of fault span).
 	traced := otelhttp.NewHandler(faulted, serviceName)
 	// Outer: metrics recording.
@@ -59,19 +32,30 @@ func IngressMiddleware(next http.Handler, serviceName string, opts ...Middleware
 	})
 }
 
-// EgressTransport composes otelhttp client spans with fault injection.
-func EgressTransport(base http.RoundTripper, opts ...MiddlewareOption) http.RoundTripper {
-	cfg := defaultMiddlewareConfig()
-	for _, o := range opts {
-		o.applyMiddleware(&cfg)
-	}
+// EgressTransport composes otelhttp client spans with fault injection and
+// cache-box dispatch for a service's own outbound calls:
+//
+//	client := &http.Client{Transport: atropos.EgressTransport(nil)}
+//
+// A nil base uses http.DefaultTransport. The interceptor is resolved per
+// round-trip, so a client built before Serve runs still picks up the
+// evaluator and cache-box Serve installs.
+func EgressTransport(base http.RoundTripper) http.RoundTripper {
+	return egressTransport(base, currentInterceptor)
+}
 
+// egressTransport is EgressTransport with an explicit interceptor resolver —
+// the seam tests use to pin a private interceptor.
+func egressTransport(base http.RoundTripper, resolve func() *interceptor.Interceptor) http.RoundTripper {
 	if base == nil {
 		base = http.DefaultTransport
 	}
 
-	// Inner: fault injection check (creates fault span as child).
-	faulted := cfg.interceptor.EgressTransport(base)
+	// Inner: fault injection check, resolved per call (creates fault span
+	// as child of the otelhttp client span).
+	faulted := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		return resolve().EgressTransport(base).RoundTrip(r)
+	})
 	// Middle: otelhttp client span (becomes parent of fault span).
 	traced := otelhttp.NewTransport(faulted)
 	// Outer: metrics recording.
@@ -91,10 +75,16 @@ func EgressTransport(base http.RoundTripper, opts ...MiddlewareOption) http.Roun
 		httpClientRequestDuration.WithLabelValues(r.Method, status, target).Observe(duration)
 		httpClientRequestsTotal.WithLabelValues(r.Method, status, target).Inc()
 
+		// Classification order matters: a fail-closed miss carries BOTH the
+		// miss marker and the mode header, so the miss check must run first
+		// or every counted-503 miss inflates the hit counter.
 		if resp != nil {
-			if mode := resp.Header.Get("X-Atropos-Cache-Mode"); mode != "" {
+			switch {
+			case resp.Header.Get(interceptor.HeaderCacheMiss) != "":
+				cacheBoxMissesTotal.Inc()
+			case resp.Header.Get(interceptor.HeaderCacheMode) != "":
 				cacheBoxHitsTotal.Inc()
-			} else if resp.Header.Get("X-Atropos-Cache-Key") != "" {
+			case resp.Header.Get(interceptor.HeaderCacheKey) != "":
 				cacheBoxRecordsTotal.Inc()
 			}
 		}

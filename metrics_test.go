@@ -73,7 +73,7 @@ func TestIngressMetrics(t *testing.T) {
 			beforeCount := gatherCounter("http_server_requests_total", labels)
 			beforeHist := gatherHistogramCount("http_server_request_duration_seconds", labels)
 
-			mw := IngressMiddleware(handler, tt.service)
+			mw := ingressMiddleware(handler, tt.service, currentInterceptor())
 			mw.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(tt.method, "/test", nil))
 
 			if delta := gatherCounter("http_server_requests_total", labels) - beforeCount; delta != 1 {
@@ -145,15 +145,76 @@ func TestEgressMetrics_TransportError(t *testing.T) {
 	}
 }
 
+// TestEgressMetrics_CacheBoxClassification pins the miss/hit/record
+// classification: a fail-closed miss response carries BOTH X-Atropos-Cache-Miss
+// and X-Atropos-Cache-Mode, and must count as a miss — not a hit.
+func TestEgressMetrics_CacheBoxClassification(t *testing.T) {
+	synthetic := func(h http.Header) *http.Response {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     h,
+			Body:       http.NoBody,
+		}
+	}
+	cases := []struct {
+		name    string
+		header  http.Header
+		counter string
+	}{
+		{"fail-closed miss counts as miss", http.Header{
+			"X-Atropos-Cache-Miss": {"1"},
+			"X-Atropos-Cache-Mode": {"replay"},
+			"X-Atropos-Cache-Key":  {"k"},
+		}, "atropos_cachebox_misses_total"},
+		{"replay hit counts as hit", http.Header{
+			"X-Atropos-Cache-Mode": {"replay"},
+			"X-Atropos-Cache-Key":  {"k"},
+		}, "atropos_cachebox_hits_total"},
+		{"passthrough record counts as record", http.Header{
+			"X-Atropos-Cache-Key": {"k"},
+		}, "atropos_cachebox_records_total"},
+	}
+	all := []string{"atropos_cachebox_misses_total", "atropos_cachebox_hits_total", "atropos_cachebox_records_total"}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := map[string]float64{}
+			for _, c := range all {
+				before[c] = gatherCounter(c, nil)
+			}
+
+			base := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+				return synthetic(tc.header), nil
+			})
+			client := &http.Client{Transport: EgressTransport(base)}
+			resp, err := client.Get("http://cachebox.test/x")
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+
+			for _, c := range all {
+				want := float64(0)
+				if c == tc.counter {
+					want = 1
+				}
+				if delta := gatherCounter(c, nil) - before[c]; delta != want {
+					t.Errorf("%s delta = %v, want %v", c, delta, want)
+				}
+			}
+		})
+	}
+}
+
 func TestMetricsHandler_ServesMetrics(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	mw := IngressMiddleware(handler, "handler-test")
+	mw := ingressMiddleware(handler, "handler-test", currentInterceptor())
 	mw.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil))
 
 	rec := httptest.NewRecorder()
-	MetricsHandler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	metricsHandler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
 
 	body, _ := io.ReadAll(rec.Body)
 	text := string(body)

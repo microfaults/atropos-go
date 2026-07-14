@@ -44,7 +44,7 @@ func newTestInterceptor(t *testing.T, rules ...evaluator.StaticRule) (*Intercept
 	t.Helper()
 	eval := evaluator.NewStaticEvaluator(rules...)
 	cb := cachebox.New(cachebox.Config{
-		Store:       cachebox.NewMemStore(cachebox.MemStoreConfig{MaxEntries: 100}),
+		Store:       cachebox.NewRecordBuffer(cachebox.RecordBufferConfig{MaxEntries: 100}),
 		KeyStrategy: cachebox.KeyStrategyExactWithHost,
 	})
 	t.Cleanup(func() { cb.Stop() })
@@ -330,7 +330,7 @@ func TestHandleCacheBox_UnknownActionFailsClosed(t *testing.T) {
 
 func TestHandleCacheBox_BodyBufferErrorUnderReplayFailsClosed(t *testing.T) {
 	cb := cachebox.New(cachebox.Config{
-		Store:       cachebox.NewMemStore(cachebox.MemStoreConfig{MaxEntries: 10}),
+		Store:       cachebox.NewRecordBuffer(cachebox.RecordBufferConfig{MaxEntries: 10}),
 		KeyStrategy: cachebox.KeyStrategyExactWithBody,
 	})
 	t.Cleanup(func() { cb.Stop() })
@@ -466,7 +466,7 @@ func TestHandleCacheBox_ReplayDelayCancellable(t *testing.T) {
 
 	u, _ := url.Parse(srv.URL)
 	cb := cachebox.New(cachebox.Config{
-		Store:       cachebox.NewMemStore(cachebox.MemStoreConfig{MaxEntries: 10}),
+		Store:       cachebox.NewRecordBuffer(cachebox.RecordBufferConfig{MaxEntries: 10}),
 		KeyStrategy: cachebox.KeyStrategyExactWithHost,
 	})
 	t.Cleanup(func() { cb.Stop() })
@@ -519,7 +519,7 @@ func TestHandleCacheBox_OversizeNotCached(t *testing.T) {
 
 	u, _ := url.Parse(srv.URL)
 	cb := cachebox.New(cachebox.Config{
-		Store:        cachebox.NewMemStore(cachebox.MemStoreConfig{MaxEntries: 10}),
+		Store:        cachebox.NewRecordBuffer(cachebox.RecordBufferConfig{MaxEntries: 10}),
 		KeyStrategy:  cachebox.KeyStrategyExactWithHost,
 		MaxBodyBytes: 100, // tiny cap so the 2KB response is oversize
 	})

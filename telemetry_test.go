@@ -10,14 +10,14 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
-func TestInit_SetsGlobalTracerProvider(t *testing.T) {
+func TestInitTelemetry_SetsGlobalTracerProvider(t *testing.T) {
 	exporter := tracetest.NewInMemoryExporter()
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithSyncer(exporter),
 		sdktrace.WithSampler(sdktrace.AlwaysSample()),
 	)
 
-	shutdown, err := Init(context.Background(), WithTracerProvider(tp))
+	shutdown, err := initTelemetry(context.Background(), telemetryConfig{tracerProvider: tp})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,11 +30,11 @@ func TestInit_SetsGlobalTracerProvider(t *testing.T) {
 	}
 }
 
-func TestInit_BYOProviderNoShutdownPanic(t *testing.T) {
+func TestInitTelemetry_BYOProviderNoShutdownPanic(t *testing.T) {
 	exporter := tracetest.NewInMemoryExporter()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
 
-	shutdown, err := Init(context.Background(), WithTracerProvider(tp))
+	shutdown, err := initTelemetry(context.Background(), telemetryConfig{tracerProvider: tp})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,14 +44,14 @@ func TestInit_BYOProviderNoShutdownPanic(t *testing.T) {
 	}
 }
 
-func TestInit_ProducesSpans(t *testing.T) {
+func TestInitTelemetry_ProducesSpans(t *testing.T) {
 	exporter := tracetest.NewInMemoryExporter()
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithSyncer(exporter),
 		sdktrace.WithSampler(sdktrace.AlwaysSample()),
 	)
 
-	shutdown, err := Init(context.Background(), WithTracerProvider(tp))
+	shutdown, err := initTelemetry(context.Background(), telemetryConfig{tracerProvider: tp})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,11 +71,11 @@ func TestInit_ProducesSpans(t *testing.T) {
 	}
 }
 
-func TestInit_PropagatorHasTraceContextAndBaggage(t *testing.T) {
+func TestInitTelemetry_PropagatorHasTraceContextAndBaggage(t *testing.T) {
 	exporter := tracetest.NewInMemoryExporter()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
 
-	shutdown, err := Init(context.Background(), WithTracerProvider(tp))
+	shutdown, err := initTelemetry(context.Background(), telemetryConfig{tracerProvider: tp})
 	if err != nil {
 		t.Fatal(err)
 	}

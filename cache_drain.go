@@ -3,22 +3,24 @@ package atropos
 import (
 	"log/slog"
 	"sync"
+
+	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 )
 
-// RecordingPhaseKey identifies one (experiment_id, phase_id) pair a
+// recordingPhaseKey identifies one (experiment_id, phase_id) pair a
 // compiled rule set is authorizing recording for.
-type RecordingPhaseKey struct {
+type recordingPhaseKey struct {
 	ExperimentID string
 	PhaseID      string
 }
 
-// ActiveRecordingPhases scans rules for cache-box passthrough actions
+// activeRecordingPhases scans rules for cache-box passthrough actions
 // carrying a CacheBoxContext and returns the set of (experiment_id,
 // phase_id) pairs they authorize recording for. Used to detect phase
 // transitions across a rule update (design doc Q2/Q5): a pair present in
 // an older call but absent from a newer one has stopped recording.
-func ActiveRecordingPhases(rules []CompiledRule) map[RecordingPhaseKey]bool {
-	active := make(map[RecordingPhaseKey]bool)
+func activeRecordingPhases(rules []CompiledRule) map[recordingPhaseKey]bool {
+	active := make(map[recordingPhaseKey]bool)
 	for _, r := range rules {
 		if r.CacheBox == nil || r.CacheBox.Mode != "passthrough" || r.CacheBox.Context == nil {
 			continue
@@ -27,15 +29,15 @@ func ActiveRecordingPhases(rules []CompiledRule) map[RecordingPhaseKey]bool {
 		if ctx.ExperimentID == "" || ctx.PhaseID == "" {
 			continue
 		}
-		active[RecordingPhaseKey{ExperimentID: ctx.ExperimentID, PhaseID: ctx.PhaseID}] = true
+		active[recordingPhaseKey{ExperimentID: ctx.ExperimentID, PhaseID: ctx.PhaseID}] = true
 	}
 	return active
 }
 
-// EndedRecordingPhases returns the keys present in prev but absent from
+// endedRecordingPhases returns the keys present in prev but absent from
 // curr -- phases whose recording stopped as of this rule update.
-func EndedRecordingPhases(prev, curr map[RecordingPhaseKey]bool) []RecordingPhaseKey {
-	var ended []RecordingPhaseKey
+func endedRecordingPhases(prev, curr map[recordingPhaseKey]bool) []recordingPhaseKey {
+	var ended []recordingPhaseKey
 	for k := range prev {
 		if !curr[k] {
 			ended = append(ended, k)
@@ -44,7 +46,7 @@ func EndedRecordingPhases(prev, curr map[RecordingPhaseKey]bool) []RecordingPhas
 	return ended
 }
 
-// CacheDrainTracker watches successive rule syncs for cache-box recording
+// cacheDrainTracker watches successive rule syncs for cache-box recording
 // phases that have ended and triggers a flush + W3 drain report for each
 // (design doc Q2: "the poll-driven bump manteion issues at drain start"
 // removes the phase's CacheBoxContext from the rule set). Wire it via
@@ -52,23 +54,23 @@ func EndedRecordingPhases(prev, curr map[RecordingPhaseKey]bool) []RecordingPhas
 // (non-nil, including empty) rule set it applies -- the empty set is the
 // common drain trigger, since a baseline-recorded service usually has no
 // rules besides the synthesized recording rule.
-type CacheDrainTracker struct {
-	cb     *CacheBox
-	pusher *CachePushClient
+type cacheDrainTracker struct {
+	cb     *cachebox.CacheBox
+	pusher *cachePushClient
 	logger *slog.Logger
 
 	mu     sync.Mutex
-	active map[RecordingPhaseKey]bool
+	active map[recordingPhaseKey]bool
 }
 
-// NewCacheDrainTracker builds a tracker that flushes cb and reports through
+// newCacheDrainTracker builds a tracker that flushes cb and reports through
 // pusher whenever Observe sees a previously-active recording phase drop
 // out of the rule set. logger defaults to slog.Default() if nil.
-func NewCacheDrainTracker(cb *CacheBox, pusher *CachePushClient, logger *slog.Logger) *CacheDrainTracker {
+func newCacheDrainTracker(cb *cachebox.CacheBox, pusher *cachePushClient, logger *slog.Logger) *cacheDrainTracker {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &CacheDrainTracker{cb: cb, pusher: pusher, logger: logger, active: map[RecordingPhaseKey]bool{}}
+	return &cacheDrainTracker{cb: cb, pusher: pusher, logger: logger, active: map[recordingPhaseKey]bool{}}
 }
 
 // Observe diffs rules' active recording phases against the previous call
@@ -76,14 +78,14 @@ func NewCacheDrainTracker(cb *CacheBox, pusher *CachePushClient, logger *slog.Lo
 // a drain report via pusher. Best-effort: a drain failure is logged, never
 // returned, so it never blocks rule application. Nil-safe (a nil tracker's
 // Observe is a no-op), so ApplyTargets.CacheDrain is a true optional.
-func (t *CacheDrainTracker) Observe(rules []CompiledRule) {
+func (t *cacheDrainTracker) Observe(rules []CompiledRule) {
 	if t == nil {
 		return
 	}
-	curr := ActiveRecordingPhases(rules)
+	curr := activeRecordingPhases(rules)
 
 	t.mu.Lock()
-	ended := EndedRecordingPhases(t.active, curr)
+	ended := endedRecordingPhases(t.active, curr)
 	t.active = curr
 	t.mu.Unlock()
 

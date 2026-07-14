@@ -14,8 +14,8 @@ import (
 )
 
 func TestFaultAdmin_PostCPUStress(t *testing.T) {
-	eval := &DemoEvaluator{}
-	handler := FaultAdminHandlerWith(eval, nil)
+	eval := &demoEvaluator{}
+	handler := faultAdminHandler(eval, nil)
 
 	body := `{"category":"resource","fault_type":"cpu","duration_ms":5000,"params":{"target_load":0.7}}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
@@ -31,11 +31,11 @@ func TestFaultAdmin_PostCPUStress(t *testing.T) {
 }
 
 func TestFaultAdmin_PostNetworkLatency(t *testing.T) {
-	eval := &DemoEvaluator{}
+	eval := &demoEvaluator{}
 	resolver := func(target string) (string, string, error) {
 		return ":19099", "localhost:6379", nil
 	}
-	handler := FaultAdminHandlerWith(eval, resolver)
+	handler := faultAdminHandler(eval, resolver)
 
 	body := `{"category":"network","fault_type":"latency","duration_ms":5000,"network":{"target":"redis"},"params":{"delay":"100ms"}}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
@@ -48,8 +48,8 @@ func TestFaultAdmin_PostNetworkLatency(t *testing.T) {
 }
 
 func TestFaultAdmin_PostLatency(t *testing.T) {
-	eval := &DemoEvaluator{}
-	handler := FaultAdminHandlerWith(eval, nil)
+	eval := &demoEvaluator{}
+	handler := faultAdminHandler(eval, nil)
 
 	// POST latency fault
 	body := `{"fault_type":"latency","params":{"delay":"200ms","jitter":"50ms"}}`
@@ -102,8 +102,8 @@ func TestFaultAdmin_PostLatency(t *testing.T) {
 }
 
 func TestFaultAdmin_PostError(t *testing.T) {
-	eval := &DemoEvaluator{}
-	handler := FaultAdminHandlerWith(eval, nil)
+	eval := &demoEvaluator{}
+	handler := faultAdminHandler(eval, nil)
 
 	body := `{"fault_type":"error","params":{"status_code":503,"message":"service down"}}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
@@ -122,8 +122,8 @@ func TestFaultAdmin_PostError(t *testing.T) {
 }
 
 func TestFaultAdmin_PostHang(t *testing.T) {
-	eval := &DemoEvaluator{}
-	handler := FaultAdminHandlerWith(eval, nil)
+	eval := &demoEvaluator{}
+	handler := faultAdminHandler(eval, nil)
 
 	body := `{"fault_type":"hang","params":{"duration":"2s"}}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
@@ -136,8 +136,8 @@ func TestFaultAdmin_PostHang(t *testing.T) {
 }
 
 func TestFaultAdmin_InvalidType(t *testing.T) {
-	eval := &DemoEvaluator{}
-	handler := FaultAdminHandlerWith(eval, nil)
+	eval := &demoEvaluator{}
+	handler := faultAdminHandler(eval, nil)
 
 	body := `{"fault_type":"explode"}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
@@ -150,8 +150,8 @@ func TestFaultAdmin_InvalidType(t *testing.T) {
 }
 
 func TestFaultAdmin_MissingDelay(t *testing.T) {
-	eval := &DemoEvaluator{}
-	handler := FaultAdminHandlerWith(eval, nil)
+	eval := &demoEvaluator{}
+	handler := faultAdminHandler(eval, nil)
 
 	body := `{"fault_type":"latency"}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
@@ -164,8 +164,8 @@ func TestFaultAdmin_MissingDelay(t *testing.T) {
 }
 
 func TestFaultAdmin_InvalidJSON(t *testing.T) {
-	eval := &DemoEvaluator{}
-	handler := FaultAdminHandlerWith(eval, nil)
+	eval := &demoEvaluator{}
+	handler := faultAdminHandler(eval, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader("{bad"))
 	rec := httptest.NewRecorder()
@@ -177,8 +177,8 @@ func TestFaultAdmin_InvalidJSON(t *testing.T) {
 }
 
 func TestFaultAdmin_MethodNotAllowed(t *testing.T) {
-	eval := &DemoEvaluator{}
-	handler := FaultAdminHandlerWith(eval, nil)
+	eval := &demoEvaluator{}
+	handler := faultAdminHandler(eval, nil)
 
 	req := httptest.NewRequest(http.MethodPut, "/admin/fault", nil)
 	rec := httptest.NewRecorder()
@@ -202,119 +202,84 @@ func seedLongFault(ctx context.Context) (*fault.Handle, error) {
 	return h, nil
 }
 
-// TestFaultAdminHandler_HostConfigured_Returns409 pins the A1 fix: once a
-// host has called Configure, a stray request to the zero-arg admin handler
-// (even a GET) must NOT lazily reconfigure the SDK onto the demo evaluator.
-// Doing so previously closed the shared fault registry mid-experiment,
-// cancelling running background faults and orphaning the live middleware's
-// interceptor. The handler must return 409 and leave the registry untouched.
-func TestFaultAdminHandler_HostConfigured_Returns409(t *testing.T) {
-	// Host configures the SDK with its own evaluator + cache-box (the
-	// manteion-driven path). The live middleware captures this interceptor.
-	eval := NewStaticEvaluator(StaticRule{Name: "r1", Point: Egress})
-	cb := NewCacheBox(CacheBoxConfig{})
-	Configure(WithEvaluator(eval), WithCacheBoxCoordinator(cb))
-	defer Configure() // reset the package interceptor for later tests
+// TestAdminFault_ComposesWithHostEvaluator_RegistryUntouched pins the A1
+// successor guarantee, now structural: the admin fault slot is a SECOND
+// evaluator composed after the host's — arming and clearing admin faults can
+// neither replace the host evaluator (host rules keep winning where they
+// match) nor swap/close the process-lifetime fault registry. The lazily
+// reconfiguring zero-arg handler this used to guard against no longer
+// exists.
+func TestAdminFault_ComposesWithHostEvaluator_RegistryUntouched(t *testing.T) {
+	host := evaluator.NewStaticEvaluator(StaticRule{
+		Name:  "host-egress-rule",
+		Point: evaluator.Egress,
+		Decision: evaluator.Decision{
+			Name:     "host-egress-rule",
+			CacheBox: evaluator.CacheBoxReplay,
+			Reason:   "compiled",
+		},
+	})
+	demo := &demoEvaluator{}
+	configure(evaluator.NewMultiEvaluator(host, demo), nil)
+	defer configure(nil, nil) // reset the package interceptor for later tests
 
 	regBefore := defaultRegistry
 
-	mwCalled := false
-	mw := IngressMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		mwCalled = true
-		w.WriteHeader(http.StatusOK)
-	}), "a1-svc")
-
-	// Seed a running background fault through the shared registry.
-	h, deduped, err := defaultRegistry.StartOrJoin("a1-bg", evaluator.DeduplicateByRule, seedLongFault)
+	// Seed a running background fault through the shared registry, as a
+	// rule-attached fault would.
+	h, deduped, err := defaultRegistry.StartOrJoin("host-bg", evaluator.DeduplicateByRule, seedLongFault)
 	if err != nil || deduped {
 		t.Fatalf("seed fault: err=%v deduped=%v", err, deduped)
 	}
 
-	// A stray GET to the zero-arg admin handler must be refused, not honored.
+	// Arm an admin fault through the handler.
+	handler := faultAdminHandler(demo, nil)
 	rec := httptest.NewRecorder()
-	FaultAdminHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/admin/fault", nil))
-
-	// (a) 409 with a JSON error envelope.
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("GET on host-configured SDK: status = %d, want 409; body = %s", rec.Code, rec.Body.String())
-	}
-	var er ErrorResponse
-	if uerr := json.Unmarshal(rec.Body.Bytes(), &er); uerr != nil || er.Error == "" {
-		t.Fatalf("expected JSON error body, got %q (unmarshal err=%v)", rec.Body.String(), uerr)
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/fault",
+		strings.NewReader(`{"fault_type":"latency","params":{"delay":"50ms"}}`)))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("arm admin fault: %d %s", rec.Code, rec.Body.String())
 	}
 
-	// (b) the registry was neither swapped nor closed: same pointer, and the
-	// previously-started fault is still live (not cancelled by a reconfigure).
+	// (a) Where a host rule matches, it wins: the armed admin latency must
+	// not shadow the host's egress replay rule mid-experiment.
+	d := currentInterceptor().Evaluate(context.Background(), evaluator.Request{Point: evaluator.Egress})
+	if d == nil || d.Name != "host-egress-rule" {
+		t.Fatalf("egress decision = %+v, want the host rule to win over the admin slot", d)
+	}
+
+	// (b) Where no host rule matches, the admin slot fills the gap.
+	d = currentInterceptor().Evaluate(context.Background(), evaluator.Request{Point: evaluator.Ingress})
+	if d == nil || d.Reason != "admin" {
+		t.Fatalf("ingress decision = %+v, want the admin fault", d)
+	}
+
+	// (c) Arm + clear left the registry alone: same pointer, seeded fault
+	// still running, and still stoppable through the same registry.
+	recD := httptest.NewRecorder()
+	handler.ServeHTTP(recD, httptest.NewRequest(http.MethodDelete, "/admin/fault", nil))
+	if recD.Code != http.StatusOK {
+		t.Fatalf("clear admin faults: %d", recD.Code)
+	}
 	if defaultRegistry != regBefore {
-		t.Fatal("defaultRegistry pointer changed after a host-configured GET")
+		t.Fatal("defaultRegistry pointer changed across admin arm/clear")
 	}
 	select {
 	case <-h.Done():
-		t.Fatal("host-configured GET closed the registry and cancelled a running background fault")
+		t.Fatal("admin arm/clear cancelled a host background fault")
 	case <-time.After(100 * time.Millisecond):
 	}
-
-	// (c) a fresh StartOrJoin on the same registry still succeeds (not closed).
-	h2, _, err := defaultRegistry.StartOrJoin("a1-probe", evaluator.DeduplicateByRule, seedLongFault)
-	if err != nil {
-		t.Fatalf("registry refused a new fault after the GET (closed?): %v", err)
-	}
-
-	// The live middleware still routes through its captured interceptor.
-	mwRec := httptest.NewRecorder()
-	mw.ServeHTTP(mwRec, httptest.NewRequest(http.MethodGet, "/", nil))
-	if mwRec.Code != http.StatusOK || !mwCalled {
-		t.Fatalf("live middleware broken after GET: code=%d called=%v", mwRec.Code, mwCalled)
-	}
-
-	// The seeded fault remains stoppable through the same registry.
-	defaultRegistry.Stop("a1-bg")
+	defaultRegistry.Stop("host-bg")
 	select {
 	case <-h.Done():
 	case <-time.After(2 * time.Second):
 		t.Fatal("seeded fault did not stop through the registry")
 	}
-
-	// Clean up so the shared registry returns empty for later tests.
-	defaultRegistry.Stop("a1-probe")
-	<-h2.Done()
-}
-
-// TestFaultAdminHandlerWith_ExplicitMountUnaffected proves the 409 guard is
-// scoped to the zero-arg handler: the explicit mount-your-own constructor
-// keeps serving normally even when the SDK is host-configured.
-func TestFaultAdminHandlerWith_ExplicitMountUnaffected(t *testing.T) {
-	Configure(WithEvaluator(NewStaticEvaluator()))
-	defer Configure()
-	if !hostConfigured.Load() {
-		t.Fatal("precondition: expected hostConfigured after Configure")
-	}
-
-	eval := &DemoEvaluator{}
-	handler := FaultAdminHandlerWith(eval, nil)
-
-	rec := httptest.NewRecorder()
-	body := `{"fault_type":"latency","params":{"delay":"100ms"}}`
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body)))
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("explicit handler POST: status = %d, want 201; body = %s", rec.Code, rec.Body.String())
-	}
-
-	rec = httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/admin/fault", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("explicit handler GET: status = %d, want 200; body = %s", rec.Code, rec.Body.String())
-	}
-	var status FaultStatus
-	json.NewDecoder(rec.Body).Decode(&status)
-	if !status.Active {
-		t.Fatal("expected explicit handler to report the active fault")
-	}
 }
 
 func TestFaultAdmin_MultiSlotIDs(t *testing.T) {
-	eval := &DemoEvaluator{}
-	handler := FaultAdminHandlerWith(eval, nil)
+	eval := &demoEvaluator{}
+	handler := faultAdminHandler(eval, nil)
 
 	// POST first inline latency with ID
 	body1 := `{"id":"f1","fault_type":"latency","params":{"delay":"100ms"}}`

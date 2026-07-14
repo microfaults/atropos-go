@@ -8,15 +8,18 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
 )
 
 type faultSlot struct {
-	decision        *Decision
+	decision        *evaluator.Decision
 	req             *FaultRequest
 	lastConfirmedAt time.Time
 }
 
-type DemoEvaluator struct {
+type demoEvaluator struct {
 	mu    sync.RWMutex
 	slots map[string]*faultSlot // key = ID (service+category:type)
 }
@@ -31,7 +34,7 @@ type DemoEvaluator struct {
 // higher-sorting IDs are inert as long as a winning slot exists. See
 // docs/plans/2026-05-17-concurrent-multi-fault-execution.md for the path to
 // true concurrent multi-fault execution.
-func (d *DemoEvaluator) Evaluate(_ context.Context, _ Request) *Decision {
+func (d *demoEvaluator) Evaluate(_ context.Context, _ evaluator.Request) *evaluator.Decision {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 
@@ -48,7 +51,7 @@ func (d *DemoEvaluator) Evaluate(_ context.Context, _ Request) *Decision {
 }
 
 // sortedIDsLocked returns slot IDs in lexicographic order. Caller must hold d.mu.
-func (d *DemoEvaluator) sortedIDsLocked() []string {
+func (d *demoEvaluator) sortedIDsLocked() []string {
 	ids := make([]string, 0, len(d.slots))
 	for id := range d.slots {
 		ids = append(ids, id)
@@ -59,7 +62,7 @@ func (d *DemoEvaluator) sortedIDsLocked() []string {
 
 // Set installs or replaces the slot for req.ID.
 // If req.ID is empty, it falls back to effectiveCategory.
-func (d *DemoEvaluator) Set(decision *Decision, req *FaultRequest) {
+func (d *demoEvaluator) Set(decision *evaluator.Decision, req *FaultRequest) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.slots == nil {
@@ -80,21 +83,21 @@ func (d *DemoEvaluator) Set(decision *Decision, req *FaultRequest) {
 
 // ClearSlot deletes the fault slot with the given ID. ID matches the key used
 // by Set (req.ID, or effectiveCategory when req.ID is empty).
-func (d *DemoEvaluator) ClearSlot(id string) {
+func (d *demoEvaluator) ClearSlot(id string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	delete(d.slots, id)
 }
 
 // Clear deactivates all faults.
-func (d *DemoEvaluator) Clear() {
+func (d *demoEvaluator) Clear() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.slots = make(map[string]*faultSlot)
 }
 
 // Confirm bumps lastConfirmedAt to now for the given ID.
-func (d *DemoEvaluator) Confirm(id string) {
+func (d *demoEvaluator) Confirm(id string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if s, ok := d.slots[id]; ok {
@@ -103,14 +106,14 @@ func (d *DemoEvaluator) Confirm(id string) {
 }
 
 // ActiveIDs returns the IDs of all currently-armed slots, in lexicographic order.
-func (d *DemoEvaluator) ActiveIDs() []string {
+func (d *demoEvaluator) ActiveIDs() []string {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.sortedIDsLocked()
 }
 
 // StaleSlots returns IDs whose lastConfirmedAt is older than maxAge.
-func (d *DemoEvaluator) StaleSlots(maxAge time.Duration) []string {
+func (d *demoEvaluator) StaleSlots(maxAge time.Duration) []string {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	cutoff := time.Now().Add(-maxAge)
@@ -125,7 +128,7 @@ func (d *DemoEvaluator) StaleSlots(maxAge time.Duration) []string {
 
 // Active returns all active fault requests, grouped by category in
 // inline > network > resource order and lexicographic by ID within each group.
-func (d *DemoEvaluator) Active() []*FaultRequest {
+func (d *demoEvaluator) Active() []*FaultRequest {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	ids := d.sortedIDsLocked()
@@ -180,62 +183,20 @@ type FaultStatus struct {
 	Faults []*FaultRequest `json:"faults,omitempty"` // matches new plan shape {"faults": [...]}
 }
 
-var (
-	demoEval     *DemoEvaluator
-	demoEvalOnce sync.Once
-)
-
-func ensureDemoEval() *DemoEvaluator {
-	demoEvalOnce.Do(func() {
-		demoEval = &DemoEvaluator{}
-		Configure(WithEvaluator(demoEval))
-	})
-	return demoEval
-}
-
-// FaultAdminHandler returns an http.Handler for runtime fault control.
+// faultAdminHandler serves the /admin/fault endpoint against the demo
+// evaluator Serve composed AFTER the host rule evaluator: arming a slot here
+// can never replace or tear down the host's evaluator, cache-box, or the
+// process-lifetime fault registry — the old lazily-configuring zero-arg
+// handler that could is gone.
 //
-// Supported methods:
-//   - POST: activate a fault (JSON body with type, delay, etc.)
-//   - DELETE: deactivate the current fault
-//   - GET: return the current fault status
-//
-// Example:
-//
-//	mux.Handle("/admin/fault", atropos.FaultAdminHandler())
-//	// curl -X POST http://localhost:8080/admin/fault \
-//	//   -d '{"category":"inline","fault_type":"latency","params":{"delay":"500ms"}}'
-//	// curl -X DELETE http://localhost:8080/admin/fault
-//	// curl http://localhost:8080/admin/fault
-func FaultAdminHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// A host-configured SDK already owns its evaluator and cache-box via
-		// Configure. Lazily configuring the demo evaluator here would drop
-		// them and rebuild the interceptor, so a stray request (even a GET)
-		// must not trigger it -- refuse and tell the operator to mount the
-		// explicit handler instead (A1).
-		if hostConfigured.Load() {
-			w.Header().Set("Content-Type", "application/json")
-			jsonError(w, "SDK is host-configured; mount FaultAdminHandlerWith(eval, ...) explicitly", http.StatusConflict)
-			return
-		}
-		eval := ensureDemoEval()
-		FaultAdminHandlerWith(eval, nil).ServeHTTP(w, r)
-	})
-}
-
-// FaultAdminHandlerWith returns an http.Handler wired to the given evaluator
-// and optional NetworkResolver. Use this constructor when the admin endpoint
-// needs to accept network-category faults.
-//
-// Interaction with Manteion: admin POSTs key the slot by req.ID (or the
-// effectiveCategory when ID is empty). When a ManteionClient is also running,
-// every successful poll runs reconciliation in Apply, which drops slot IDs not
-// present in the server's active_faults response. And because admin POST never
-// calls Confirm, the fault watchdog will reap admin slots after the grace
-// period (max(3*pollInterval, 30s)). Treat admin faults as short-lived overrides
-// when connected to Manteion; in offline mode they persist until DELETEd.
-func FaultAdminHandlerWith(eval *DemoEvaluator, resolve NetworkResolver) http.Handler {
+// Interaction with manteion: admin POSTs key the slot by req.ID (or the
+// effectiveCategory when ID is empty). When connected, every successful poll
+// runs reconciliation in apply, which drops slot IDs not present in the
+// server's active_faults response. And because admin POST never calls
+// Confirm, the fault watchdog will reap admin slots after the grace period
+// (max(3*pollInterval, 30s)). Treat admin faults as short-lived overrides
+// when connected to manteion; in offline mode they persist until DELETEd.
+func faultAdminHandler(eval *demoEvaluator, resolve NetworkResolver) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -271,7 +232,7 @@ func FaultAdminHandlerWith(eval *DemoEvaluator, resolve NetworkResolver) http.Ha
 	})
 }
 
-func handleFaultPost(w http.ResponseWriter, r *http.Request, eval *DemoEvaluator, resolve NetworkResolver) {
+func handleFaultPost(w http.ResponseWriter, r *http.Request, eval *demoEvaluator, resolve NetworkResolver) {
 	var req FaultRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, fmt.Sprintf("invalid json: %s", err), http.StatusBadRequest)
@@ -284,9 +245,9 @@ func handleFaultPost(w http.ResponseWriter, r *http.Request, eval *DemoEvaluator
 		return
 	}
 
-	mode := Inline
+	mode := evaluator.Inline
 	if req.effectiveCategory() != "inline" {
-		mode = Background
+		mode = evaluator.Background
 	}
 
 	// Name = slot id, matching Set's key, so DELETE can stop the running
@@ -295,7 +256,7 @@ func handleFaultPost(w http.ResponseWriter, r *http.Request, eval *DemoEvaluator
 	if id == "" {
 		id = req.effectiveCategory()
 	}
-	decision := &Decision{
+	decision := &evaluator.Decision{
 		Name:   id,
 		Fault:  f,
 		Reason: "admin",
@@ -311,7 +272,7 @@ func handleFaultPost(w http.ResponseWriter, r *http.Request, eval *DemoEvaluator
 // path shared with compiled rules. Used by admin.go (handleFaultPost) and
 // register.go (applyActiveFault) — the admin endpoint therefore gets the
 // same envelope validation and ramp support as rule-attached faults.
-func buildFault(req FaultRequest, resolve NetworkResolver) (Fault, error) {
+func buildFault(req FaultRequest, resolve NetworkResolver) (fault.Fault, error) {
 	cfg := &decodeConfig{resolve: resolve}
 	return decodeFault(&req, cfg)
 }

@@ -1,4 +1,4 @@
-package atropos_test
+package atropos
 
 import (
 	"context"
@@ -11,7 +11,8 @@ import (
 	"testing"
 	"time"
 
-	atropos "git.ucsc.edu/microfaults/atropos-go"
+	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
+	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 )
 
 func TestRegister_Success(t *testing.T) {
@@ -23,7 +24,7 @@ func TestRegister_Success(t *testing.T) {
 			t.Errorf("path = %s, want /api/v1/sdk/register", r.URL.Path)
 		}
 		body, _ := io.ReadAll(r.Body)
-		var req atropos.RegisterRequest
+		var req RegisterRequest
 		if err := json.Unmarshal(body, &req); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
@@ -33,14 +34,14 @@ func TestRegister_Success(t *testing.T) {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(atropos.RegisterResponse{
+		_ = json.NewEncoder(w).Encode(RegisterResponse{
 			Status: "registered",
-			RuleSync: atropos.RuleSync{Rules: []atropos.CompiledRule{{
+			RuleSync: RuleSync{Rules: []CompiledRule{{
 				Name:           "freeze-productcatalog",
 				InjectionPoint: "egress",
 				Mode:           "inline",
 				Priority:       10,
-				Fault: &atropos.CompiledFault{
+				Fault: &CompiledFault{
 					Category:  "inline",
 					FaultType: "latency",
 					Params:    json.RawMessage(`{"delay":"200ms"}`),
@@ -50,7 +51,7 @@ func TestRegister_Success(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resp, err := atropos.Register(context.Background(), server.URL, atropos.RegisterRequest{
+	resp, err := registerWith(context.Background(), http.DefaultClient, server.URL, RegisterRequest{
 		ID:      "pod-abc",
 		Service: "productcatalog",
 		Address: "http://10.0.3.4:9090",
@@ -75,7 +76,7 @@ func TestRegister_NonCreatedStatus(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, err := atropos.Register(context.Background(), server.URL, atropos.RegisterRequest{
+	_, err := registerWith(context.Background(), http.DefaultClient, server.URL, RegisterRequest{
 		ID:      "pod-abc",
 		Service: "productcatalog",
 		Address: "http://10.0.3.4:9090",
@@ -93,25 +94,25 @@ func TestRegister_NonCreatedStatus(t *testing.T) {
 func TestRegisterWithClient_UsesSuppliedClient(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(atropos.RegisterResponse{Status: "registered"})
+		_ = json.NewEncoder(w).Encode(RegisterResponse{Status: "registered"})
 	}))
 	defer server.Close()
 
 	custom := &http.Client{Timeout: 3 * time.Second}
-	resp, err := atropos.RegisterWithClient(context.Background(), custom, server.URL, atropos.RegisterRequest{ID: "pod-1", Service: "svc", Address: "http://10.0.0.1:8080"})
+	resp, err := registerWith(context.Background(), custom, server.URL, RegisterRequest{ID: "pod-1", Service: "svc", Address: "http://10.0.0.1:8080"})
 	if err != nil || resp.Status != "registered" {
-		t.Fatalf("RegisterWithClient: err=%v status=%q", err, resp.Status)
+		t.Fatalf("registerWith: err=%v status=%q", err, resp.Status)
 	}
 }
 
 func TestApply_SetsRules(t *testing.T) {
-	eval := atropos.NewStaticEvaluator()
-	resp := atropos.RegisterResponse{
-		RuleSync: atropos.RuleSync{Rules: []atropos.CompiledRule{{
+	eval := evaluator.NewStaticEvaluator()
+	resp := RegisterResponse{
+		RuleSync: RuleSync{Rules: []CompiledRule{{
 			Name:           "r1",
 			InjectionPoint: "egress",
 			Mode:           "inline",
-			Fault: &atropos.CompiledFault{
+			Fault: &CompiledFault{
 				Category:  "inline",
 				FaultType: "latency",
 				Params:    json.RawMessage(`{"delay":"100ms"}`),
@@ -119,7 +120,7 @@ func TestApply_SetsRules(t *testing.T) {
 		}}},
 	}
 
-	if err := atropos.Apply(resp, atropos.ApplyTargets{Evaluator: eval}); err != nil {
+	if err := apply(resp, applyTargets{Evaluator: eval}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	rules := eval.Rules()
@@ -132,9 +133,9 @@ func TestApply_SetsRules(t *testing.T) {
 }
 
 func TestApply_NoRulesIsNoop(t *testing.T) {
-	eval := atropos.NewStaticEvaluator(atropos.StaticRule{Name: "preexisting", Point: atropos.Ingress})
-	resp := atropos.RegisterResponse{Status: "registered"}
-	if err := atropos.Apply(resp, atropos.ApplyTargets{Evaluator: eval}); err != nil {
+	eval := evaluator.NewStaticEvaluator(StaticRule{Name: "preexisting", Point: evaluator.Ingress})
+	resp := RegisterResponse{Status: "registered"}
+	if err := apply(resp, applyTargets{Evaluator: eval}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	rules := eval.Rules()
@@ -144,10 +145,10 @@ func TestApply_NoRulesIsNoop(t *testing.T) {
 }
 
 func TestApply_RulesWithoutEvaluatorErrors(t *testing.T) {
-	resp := atropos.RegisterResponse{
-		RuleSync: atropos.RuleSync{Rules: []atropos.CompiledRule{{Name: "r1", InjectionPoint: "egress", Mode: "inline"}}},
+	resp := RegisterResponse{
+		RuleSync: RuleSync{Rules: []CompiledRule{{Name: "r1", InjectionPoint: "egress", Mode: "inline"}}},
 	}
-	err := atropos.Apply(resp, atropos.ApplyTargets{})
+	err := apply(resp, applyTargets{})
 	if err == nil {
 		t.Fatal("expected error: rules present but no Evaluator target")
 	}
@@ -159,11 +160,11 @@ func TestApply_RulesWithoutEvaluatorErrors(t *testing.T) {
 // surface cleanly when the inner helper rejects a payload.
 
 func TestApply_ActiveFault_InvalidDelay(t *testing.T) {
-	demo := &atropos.DemoEvaluator{}
-	resp := atropos.RegisterResponse{
-		RuleSync: atropos.RuleSync{ActiveFaults: []atropos.FaultRequest{{FaultType: "latency", Params: json.RawMessage(`{"delay":"bogus"}`)}}},
+	demo := &demoEvaluator{}
+	resp := RegisterResponse{
+		RuleSync: RuleSync{ActiveFaults: []FaultRequest{{FaultType: "latency", Params: json.RawMessage(`{"delay":"bogus"}`)}}},
 	}
-	err := atropos.Apply(resp, atropos.ApplyTargets{DemoEval: demo})
+	err := apply(resp, applyTargets{DemoEval: demo})
 	if err == nil {
 		t.Fatal("expected error for invalid delay duration")
 	}
@@ -176,11 +177,11 @@ func TestApply_ActiveFault_InvalidDelay(t *testing.T) {
 }
 
 func TestApply_ActiveFault_UnknownType(t *testing.T) {
-	demo := &atropos.DemoEvaluator{}
-	resp := atropos.RegisterResponse{
-		RuleSync: atropos.RuleSync{ActiveFaults: []atropos.FaultRequest{{FaultType: "quantum"}}},
+	demo := &demoEvaluator{}
+	resp := RegisterResponse{
+		RuleSync: RuleSync{ActiveFaults: []FaultRequest{{FaultType: "quantum"}}},
 	}
-	err := atropos.Apply(resp, atropos.ApplyTargets{DemoEval: demo})
+	err := apply(resp, applyTargets{DemoEval: demo})
 	if err == nil {
 		t.Fatal("expected error for unknown fault type")
 	}
@@ -190,11 +191,11 @@ func TestApply_ActiveFault_UnknownType(t *testing.T) {
 }
 
 func TestApply_FreezeCfg_NegativeMu(t *testing.T) {
-	cb := atropos.NewCacheBox(atropos.CacheBoxConfig{Store: atropos.NewCacheBoxMemStore(16)})
-	resp := atropos.RegisterResponse{
-		RuleSync: atropos.RuleSync{FreezeCfg: &atropos.DelayRequest{Mu: -1}},
+	cb := cachebox.New(cachebox.Config{})
+	resp := RegisterResponse{
+		RuleSync: RuleSync{FreezeCfg: &DelayRequest{Mu: -1}},
 	}
-	err := atropos.Apply(resp, atropos.ApplyTargets{CacheBox: cb})
+	err := apply(resp, applyTargets{CacheBox: cb})
 	if err == nil {
 		t.Fatal("expected error for negative mu")
 	}
@@ -207,16 +208,16 @@ func TestApply_FreezeCfg_NegativeMu(t *testing.T) {
 }
 
 func TestApply_ActiveFault_CPUStress(t *testing.T) {
-	demo := &atropos.DemoEvaluator{}
-	resp := atropos.RegisterResponse{
-		RuleSync: atropos.RuleSync{ActiveFaults: []atropos.FaultRequest{{
+	demo := &demoEvaluator{}
+	resp := RegisterResponse{
+		RuleSync: RuleSync{ActiveFaults: []FaultRequest{{
 			Category:   "resource",
 			FaultType:  "cpu",
 			DurationMs: 5000,
 			Params:     json.RawMessage(`{"target_load":0.7}`),
 		}}},
 	}
-	if err := atropos.Apply(resp, atropos.ApplyTargets{DemoEval: demo}); err != nil {
+	if err := apply(resp, applyTargets{DemoEval: demo}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	if len(demo.Active()) == 0 {
@@ -225,17 +226,17 @@ func TestApply_ActiveFault_CPUStress(t *testing.T) {
 }
 
 func TestApply_ActiveFault_NetworkRequiresResolver(t *testing.T) {
-	demo := &atropos.DemoEvaluator{}
-	resp := atropos.RegisterResponse{
-		RuleSync: atropos.RuleSync{ActiveFaults: []atropos.FaultRequest{{
+	demo := &demoEvaluator{}
+	resp := RegisterResponse{
+		RuleSync: RuleSync{ActiveFaults: []FaultRequest{{
 			Category:   "network",
 			FaultType:  "latency",
 			DurationMs: 5000,
-			Network:    &atropos.NetworkEnvelope{Target: "redis"},
+			Network:    &NetworkEnvelope{Target: "redis"},
 			Params:     json.RawMessage(`{"delay":"100ms"}`),
 		}}},
 	}
-	err := atropos.Apply(resp, atropos.ApplyTargets{DemoEval: demo})
+	err := apply(resp, applyTargets{DemoEval: demo})
 	if err == nil {
 		t.Fatal("expected error: no resolver")
 	}
@@ -244,15 +245,15 @@ func TestApply_ActiveFault_NetworkRequiresResolver(t *testing.T) {
 func TestRegisterAndApply_E2E(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(atropos.RegisterResponse{
+		_ = json.NewEncoder(w).Encode(RegisterResponse{
 			Status: "registered",
-			RuleSync: atropos.RuleSync{Rules: []atropos.CompiledRule{{
+			RuleSync: RuleSync{Rules: []CompiledRule{{
 				Name:           "freeze-productcatalog",
 				InjectionPoint: "egress",
 				Labels:         map[string]string{"target": "productcatalog"},
 				Mode:           "inline",
 				Priority:       10,
-				Fault: &atropos.CompiledFault{
+				Fault: &CompiledFault{
 					Category:  "inline",
 					FaultType: "latency",
 					Params:    json.RawMessage(`{"delay":"50ms"}`),
@@ -262,9 +263,9 @@ func TestRegisterAndApply_E2E(t *testing.T) {
 	}))
 	defer server.Close()
 
-	eval := atropos.NewStaticEvaluator()
+	eval := evaluator.NewStaticEvaluator()
 
-	resp, err := atropos.Register(context.Background(), server.URL, atropos.RegisterRequest{
+	resp, err := registerWith(context.Background(), http.DefaultClient, server.URL, RegisterRequest{
 		ID:      "pod-abc",
 		Service: "productcatalog",
 		Address: "http://10.0.3.4:9090",
@@ -272,7 +273,7 @@ func TestRegisterAndApply_E2E(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if err := atropos.Apply(resp, atropos.ApplyTargets{Evaluator: eval}); err != nil {
+	if err := apply(resp, applyTargets{Evaluator: eval}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 
@@ -289,18 +290,17 @@ func TestRegisterAndApply_E2E(t *testing.T) {
 }
 
 func TestApply_FreezeCfg_SetsDistributionDelay(t *testing.T) {
-	store := atropos.NewCacheBoxMemStore(100)
-	cb := atropos.NewCacheBox(atropos.CacheBoxConfig{Store: store})
+	cb := cachebox.New(cachebox.Config{})
 	defer cb.Stop()
 
-	resp := atropos.RegisterResponse{
-		RuleSync: atropos.RuleSync{FreezeCfg: &atropos.DelayRequest{Mu: 8.5, Sigma: 0.3, Seed: 42}},
+	resp := RegisterResponse{
+		RuleSync: RuleSync{FreezeCfg: &DelayRequest{Mu: 8.5, Sigma: 0.3, Seed: 42}},
 	}
-	if err := atropos.Apply(resp, atropos.ApplyTargets{CacheBox: cb}); err != nil {
+	if err := apply(resp, applyTargets{CacheBox: cb}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 
-	entry := &atropos.CacheBoxEntry{
+	entry := &cachebox.Entry{
 		Key:             "test-key",
 		StatusCode:      200,
 		Body:            []byte("ok"),
@@ -323,9 +323,9 @@ func TestApply_FreezeCfg_SetsDistributionDelay(t *testing.T) {
 // replaying/faulting forever. (A nil list stays a no-op -- see
 // TestApply_NoRulesIsNoop.)
 func TestApply_EmptyRulesClears(t *testing.T) {
-	eval := atropos.NewStaticEvaluator(atropos.StaticRule{Name: "leftover", Point: atropos.Egress})
-	resp := atropos.RegisterResponse{RuleSync: atropos.RuleSync{Rules: []atropos.CompiledRule{}}}
-	if err := atropos.Apply(resp, atropos.ApplyTargets{Evaluator: eval}); err != nil {
+	eval := evaluator.NewStaticEvaluator(StaticRule{Name: "leftover", Point: evaluator.Egress})
+	resp := RegisterResponse{RuleSync: RuleSync{Rules: []CompiledRule{}}}
+	if err := apply(resp, applyTargets{Evaluator: eval}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	if rules := eval.Rules(); len(rules) != 0 {
@@ -346,36 +346,36 @@ func TestApply_EmptyRulesFiresDrainTracker(t *testing.T) {
 			w.WriteHeader(http.StatusCreated)
 		case "/api/v1/sdk/cachebox/drain":
 			drains.Add(1)
-			_ = json.NewEncoder(w).Encode(atropos.DrainReportResponse{Accepted: true})
+			_ = json.NewEncoder(w).Encode(DrainReportResponse{Accepted: true})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
 	defer server.Close()
 
-	pusher := atropos.NewCachePushClient(atropos.CachePushConfig{
+	pusher := newCachePushClient(cachePushConfig{
 		BaseURL: server.URL, Service: "cart", Instance: "pod-1",
 	})
 	defer pusher.Stop()
-	cb := atropos.NewCacheBox(atropos.CacheBoxConfig{Push: pusher.PushFunc()})
+	cb := cachebox.New(cachebox.Config{Push: pusher.PushFunc()})
 	defer cb.Stop()
 	pusher.BindFidelity(cb.Fidelity())
 
-	eval := atropos.NewStaticEvaluator()
-	tracker := atropos.NewCacheDrainTracker(cb, pusher, nil)
-	targets := atropos.ApplyTargets{Evaluator: eval, CacheDrain: tracker}
+	eval := evaluator.NewStaticEvaluator()
+	tracker := newCacheDrainTracker(cb, pusher, nil)
+	targets := applyTargets{Evaluator: eval, CacheDrain: tracker}
 
-	recording := atropos.RegisterResponse{RuleSync: atropos.RuleSync{Rules: []atropos.CompiledRule{{
+	recording := RegisterResponse{RuleSync: RuleSync{Rules: []CompiledRule{{
 		Name: "cachebox:passthrough:phase-1", InjectionPoint: "egress", Mode: "inline",
-		CacheBox: &atropos.CompiledCacheBox{
+		CacheBox: &CompiledCacheBox{
 			Mode: "passthrough",
-			Context: &atropos.CacheBoxContext{
+			Context: &CacheBoxContext{
 				ExperimentID: "exp-1", PhaseID: "phase-1",
 				KeyStrategy: "canonical_v2", StrategyVersion: 2,
 			},
 		},
 	}}}}
-	if err := atropos.Apply(recording, targets); err != nil {
+	if err := apply(recording, targets); err != nil {
 		t.Fatalf("Apply recording rules: %v", err)
 	}
 	if got := drains.Load(); got != 0 {
@@ -384,8 +384,8 @@ func TestApply_EmptyRulesFiresDrainTracker(t *testing.T) {
 
 	// Drain start: the recording rule drops out and, this being the only
 	// rule for the service, the authoritative set is EMPTY.
-	empty := atropos.RegisterResponse{RuleSync: atropos.RuleSync{Rules: []atropos.CompiledRule{}}}
-	if err := atropos.Apply(empty, targets); err != nil {
+	empty := RegisterResponse{RuleSync: RuleSync{Rules: []CompiledRule{}}}
+	if err := apply(empty, targets); err != nil {
 		t.Fatalf("Apply empty rules: %v", err)
 	}
 	if got := drains.Load(); got != 1 {

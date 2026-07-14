@@ -21,24 +21,24 @@ func TestIntegration_IngressMiddleware_WithFault(t *testing.T) {
 		sdktrace.WithSampler(sdktrace.AlwaysSample()),
 	)
 
-	shutdown, err := Init(context.Background(), WithTracerProvider(tp))
+	shutdown, err := initTelemetry(context.Background(), telemetryConfig{tracerProvider: tp})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer shutdown(context.Background())
 
-	Configure(WithEvaluator(&integrationEval{
+	configure(&integrationEval{
 		decision: &evaluator.Decision{
 			Fault:  &inline.Latency{Delay: 50 * time.Millisecond},
 			Reason: "integration test",
 			Mode:   evaluator.Inline,
 		},
-	}))
-	defer Configure()
+	}, nil)
+	defer configure(nil, nil)
 
-	handler := IngressMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := ingressMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-	}), "test-service")
+	}), "test-service", currentInterceptor())
 
 	req := httptest.NewRequest("GET", "/test", nil)
 	rec := httptest.NewRecorder()
@@ -71,70 +71,6 @@ func TestIntegration_IngressMiddleware_WithFault(t *testing.T) {
 			names[i] = s.Name
 		}
 		t.Fatalf("expected 'atropos.fault.inject' span, got: %v", names)
-	}
-}
-
-func TestIntegration_SpanWithFault_ProducesSpans(t *testing.T) {
-	exporter := tracetest.NewInMemoryExporter()
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithSyncer(exporter),
-		sdktrace.WithSampler(sdktrace.AlwaysSample()),
-	)
-
-	shutdown, err := Init(context.Background(), WithTracerProvider(tp))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer shutdown(context.Background())
-
-	Configure(WithEvaluator(&integrationEval{
-		decision: &evaluator.Decision{
-			Fault:  &inline.Latency{Delay: 20 * time.Millisecond},
-			Reason: "span-with-fault test",
-			Mode:   evaluator.Inline,
-		},
-	}))
-	defer Configure()
-
-	ctx, span, cr, err := SpanWithFault(context.Background(), "checkout", map[string]string{"user": "test"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = ctx
-
-	if cr.Handle != nil {
-		<-cr.Handle.Done()
-	}
-	span.End()
-
-	spans := exporter.GetSpans()
-	if len(spans) < 2 {
-		t.Fatalf("expected >= 2 spans (hook + fault), got %d", len(spans))
-	}
-}
-
-func TestIntegration_NoFault_StillCreatesSpan(t *testing.T) {
-	exporter := tracetest.NewInMemoryExporter()
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithSyncer(exporter),
-		sdktrace.WithSampler(sdktrace.AlwaysSample()),
-	)
-
-	shutdown, err := Init(context.Background(), WithTracerProvider(tp))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer shutdown(context.Background())
-
-	Configure()
-
-	ctx, span := Span(context.Background(), "my-operation")
-	_ = ctx
-	span.End()
-
-	spans := exporter.GetSpans()
-	if len(spans) == 0 {
-		t.Fatal("expected at least one span for always-on tracing")
 	}
 }
 

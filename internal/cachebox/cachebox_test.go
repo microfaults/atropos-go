@@ -13,10 +13,11 @@ import (
 	"time"
 )
 
-// --- Store tests ---
+// --- Store conformance tests (RecordBuffer is the only Store implementation
+// left after the split-store design orphaned the LRU MemStore) ---
 
-func TestMemStore_PutGet(t *testing.T) {
-	s := NewMemStore(MemStoreConfig{})
+func TestRecordBuffer_PutGet(t *testing.T) {
+	s := NewRecordBuffer(RecordBufferConfig{})
 	entry := &Entry{
 		Key:             "k",
 		StatusCode:      200,
@@ -34,27 +35,20 @@ func TestMemStore_PutGet(t *testing.T) {
 	if got != entry {
 		t.Fatal("Get should return the exact stored entry pointer")
 	}
-	stats := s.Stats()
-	if stats.Entries != 1 {
-		t.Fatalf("entries = %d, want 1", stats.Entries)
-	}
-	if stats.Hits != 1 {
-		t.Fatalf("hits = %d, want 1", stats.Hits)
+	if s.Stats().Entries != 1 {
+		t.Fatalf("entries = %d, want 1", s.Stats().Entries)
 	}
 }
 
-func TestMemStore_Miss(t *testing.T) {
-	s := NewMemStore(MemStoreConfig{})
+func TestRecordBuffer_Miss(t *testing.T) {
+	s := NewRecordBuffer(RecordBufferConfig{})
 	if _, ok := s.Get("absent"); ok {
 		t.Fatal("expected miss on empty store")
 	}
-	if s.Stats().Misses != 1 {
-		t.Fatalf("expected 1 miss, got %d", s.Stats().Misses)
-	}
 }
 
-func TestMemStore_Replace(t *testing.T) {
-	s := NewMemStore(MemStoreConfig{})
+func TestRecordBuffer_ReplaceLatestWins(t *testing.T) {
+	s := NewRecordBuffer(RecordBufferConfig{})
 	s.Put("k", &Entry{Key: "k", Body: []byte("v1")})
 	s.Put("k", &Entry{Key: "k", Body: []byte("v2-longer")})
 	got, ok := s.Get("k")
@@ -67,14 +61,14 @@ func TestMemStore_Replace(t *testing.T) {
 	if s.Len() != 1 {
 		t.Fatalf("len = %d, want 1", s.Len())
 	}
-	// Byte accounting should reflect the larger entry.
-	if s.Stats().BytesUsed < int64(len("v2-longer")+1) {
-		t.Fatalf("bytes accounting looks wrong after replace: %d", s.Stats().BytesUsed)
+	// Same-key replace with a different body is a divergent collision.
+	if got := s.BufferStats().CollisionsDivergent; got != 1 {
+		t.Fatalf("divergent collisions = %d, want 1", got)
 	}
 }
 
-func TestMemStore_Delete(t *testing.T) {
-	s := NewMemStore(MemStoreConfig{})
+func TestRecordBuffer_Delete(t *testing.T) {
+	s := NewRecordBuffer(RecordBufferConfig{})
 	s.Put("k", &Entry{Key: "k", Body: []byte("v")})
 	s.Delete("k")
 	if _, ok := s.Get("k"); ok {
@@ -85,57 +79,34 @@ func TestMemStore_Delete(t *testing.T) {
 	}
 }
 
-func TestMemStore_LRU_Eviction(t *testing.T) {
-	s := NewMemStore(MemStoreConfig{MaxEntries: 2})
+func TestRecordBuffer_OverflowDropsNewKeyNotOld(t *testing.T) {
+	s := NewRecordBuffer(RecordBufferConfig{MaxEntries: 2})
 	s.Put("a", &Entry{Key: "a", Body: []byte("1")})
 	s.Put("b", &Entry{Key: "b", Body: []byte("2")})
-	// Touch "a" so it becomes the most recent.
-	_, _ = s.Get("a")
 	s.Put("c", &Entry{Key: "c", Body: []byte("3")})
 
-	// "b" should have been evicted (it was the oldest after touching "a").
-	if _, ok := s.Get("b"); ok {
-		t.Fatal("expected b to be evicted")
+	// Unlike an LRU, the record buffer never displaces a not-yet-pushed
+	// entry: the incoming key is dropped and counted.
+	if _, ok := s.Get("c"); ok {
+		t.Fatal("expected overflow key c to be dropped")
 	}
-	if _, ok := s.Get("a"); !ok {
-		t.Fatal("expected a to survive")
+	for _, k := range []string{"a", "b"} {
+		if _, ok := s.Get(k); !ok {
+			t.Fatalf("expected existing key %s to survive overflow", k)
+		}
 	}
-	if _, ok := s.Get("c"); !ok {
-		t.Fatal("expected c to survive")
-	}
-	if s.Stats().Evictions != 1 {
-		t.Fatalf("evictions = %d, want 1", s.Stats().Evictions)
-	}
-}
-
-func TestMemStore_TTL_LazyExpiry(t *testing.T) {
-	s := NewMemStore(MemStoreConfig{TTL: 20 * time.Millisecond})
-	s.Put("k", &Entry{Key: "k", Body: []byte("v"), RecordedAt: time.Now()})
-
-	// Fresh get succeeds.
-	if _, ok := s.Get("k"); !ok {
-		t.Fatal("expected fresh entry to hit")
-	}
-	time.Sleep(30 * time.Millisecond)
-	if _, ok := s.Get("k"); ok {
-		t.Fatal("expected stale entry to miss")
-	}
-	// The expired entry should have been removed as a side effect of Get.
-	if s.Len() != 0 {
-		t.Fatalf("expected empty after lazy eviction, got %d", s.Len())
+	if got := s.BufferStats().OverflowDropped; got != 1 {
+		t.Fatalf("overflow dropped = %d, want 1", got)
 	}
 }
 
-func TestMemStore_Clear(t *testing.T) {
-	s := NewMemStore(MemStoreConfig{})
+func TestRecordBuffer_Clear(t *testing.T) {
+	s := NewRecordBuffer(RecordBufferConfig{})
 	s.Put("a", &Entry{Key: "a", Body: []byte("1")})
 	s.Put("b", &Entry{Key: "b", Body: []byte("2")})
 	s.Clear()
 	if s.Len() != 0 {
 		t.Fatal("expected empty after Clear")
-	}
-	if s.Stats().BytesUsed != 0 {
-		t.Fatal("expected zero bytes after Clear")
 	}
 }
 
@@ -292,7 +263,7 @@ func TestDistributionDelaySource_SetParamsSwitchesMode(t *testing.T) {
 // --- Recorder tests ---
 
 func TestRecorder_BasicFlow(t *testing.T) {
-	s := NewMemStore(MemStoreConfig{})
+	s := NewRecordBuffer(RecordBufferConfig{})
 	r := NewRecorder(RecorderConfig{
 		Store:   s,
 		KeyFunc: KeyFuncFor(KeyStrategyExact),
@@ -363,7 +334,7 @@ func TestRecorder_BackpressureDrops(t *testing.T) {
 }
 
 func TestRecorder_RecordAfterStopIsNoop(t *testing.T) {
-	s := NewMemStore(MemStoreConfig{})
+	s := NewRecordBuffer(RecordBufferConfig{})
 	r := NewRecorder(RecorderConfig{
 		Store:   s,
 		KeyFunc: KeyFuncFor(KeyStrategyExact),
@@ -378,7 +349,7 @@ func TestRecorder_RecordAfterStopIsNoop(t *testing.T) {
 }
 
 func TestRecorder_PushHook(t *testing.T) {
-	s := NewMemStore(MemStoreConfig{})
+	s := NewRecordBuffer(RecordBufferConfig{})
 	var pushed []string
 	var mu sync.Mutex
 	push := func(key string, _ *Entry) {
@@ -516,7 +487,7 @@ func TestBufferRequestBody_Nil(t *testing.T) {
 // for the only path that does make an entry visible.
 func TestCacheBox_RecordDoesNotFeedLookup(t *testing.T) {
 	cb := New(Config{
-		Store:       NewMemStore(MemStoreConfig{}),
+		Store:       NewRecordBuffer(RecordBufferConfig{}),
 		KeyStrategy: KeyStrategyExact,
 	})
 	defer cb.Stop()

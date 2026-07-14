@@ -14,18 +14,27 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
+	oteltrace "go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// Init bootstraps OpenTelemetry for the calling service.
-// Returns a shutdown function that flushes pending spans.
-func Init(ctx context.Context, opts ...Option) (func(context.Context) error, error) {
-	cfg := defaultConfig()
-	for _, o := range opts {
-		o.apply(&cfg)
-	}
+// telemetryConfig is the OTel bootstrap input. Serve fills it from Config;
+// tests fill it directly (tracerProvider is the hermetic seam).
+type telemetryConfig struct {
+	serviceName    string
+	serviceVersion string
+	environment    string // "" = "development"
+	endpoint       string // "" = env (OTEL_EXPORTER_OTLP_ENDPOINT, COLLECTOR_SERVICE_ADDR), then localhost
+	useHTTP        bool   // OTLP over HTTP instead of gRPC
+	secure         bool   // TLS on the exporter; default insecure (lab clusters)
+	sampler        sdktrace.Sampler
+	tracerProvider oteltrace.TracerProvider // BYO: registered globally, caller owns shutdown
+}
 
+// initTelemetry bootstraps OpenTelemetry for the calling service.
+// Returns a shutdown function that flushes pending spans.
+func initTelemetry(ctx context.Context, cfg telemetryConfig) (func(context.Context) error, error) {
 	// Always set propagators regardless of BYO path.
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{},
@@ -68,20 +77,20 @@ func Init(ctx context.Context, opts ...Option) (func(context.Context) error, err
 		} else {
 			exporterOpts = append(exporterOpts, otlptracehttp.WithEndpoint(endpoint))
 		}
-		if cfg.insecure {
+		if !cfg.secure {
 			exporterOpts = append(exporterOpts, otlptracehttp.WithInsecure())
 		}
 		exporter, err = otlptracehttp.New(ctx, exporterOpts...)
 	} else {
 		dialOpts := []grpc.DialOption{}
-		if cfg.insecure {
+		if !cfg.secure {
 			dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		}
 		exporterOpts := []otlptracegrpc.Option{
 			otlptracegrpc.WithEndpoint(endpoint),
 			otlptracegrpc.WithDialOption(dialOpts...),
 		}
-		if cfg.insecure {
+		if !cfg.secure {
 			exporterOpts = append(exporterOpts, otlptracegrpc.WithInsecure())
 		}
 		exporter, err = otlptracegrpc.New(ctx, exporterOpts...)
@@ -91,6 +100,15 @@ func Init(ctx context.Context, opts ...Option) (func(context.Context) error, err
 		return nil, fmt.Errorf("atropos: init otlp exporter: %w", err)
 	}
 
+	serviceName := cfg.serviceName
+	if serviceName == "" {
+		serviceName = "unknown"
+	}
+	environment := cfg.environment
+	if environment == "" {
+		environment = "development"
+	}
+
 	// Build resource with service metadata.
 	// Use NewSchemaless to avoid schema URL conflicts between
 	// resource.Default() (which tracks the SDK's semconv version)
@@ -98,9 +116,9 @@ func Init(ctx context.Context, opts ...Option) (func(context.Context) error, err
 	res, err := resource.Merge(
 		resource.Default(),
 		resource.NewSchemaless(
-			semconv.ServiceName(cfg.serviceName),
+			semconv.ServiceName(serviceName),
 			semconv.ServiceVersion(cfg.serviceVersion),
-			semconv.DeploymentEnvironmentName(cfg.environment),
+			semconv.DeploymentEnvironmentName(environment),
 		),
 	)
 	if err != nil {

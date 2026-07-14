@@ -33,12 +33,12 @@ func TestApplyRuleSetStopsRemovedRuleFaults(t *testing.T) {
 		t.Fatalf("seed survivor fault: %v", err)
 	}
 
-	eval := NewStaticEvaluator(
-		StaticRule{Name: "r1", Point: Egress},
-		StaticRule{Name: "r2", Point: Egress},
+	eval := evaluator.NewStaticEvaluator(
+		StaticRule{Name: "r1", Point: evaluator.Egress},
+		StaticRule{Name: "r2", Point: evaluator.Egress},
 	)
 	// r1 drops out of the set; r2 stays.
-	applyRuleSet(eval, []StaticRule{{Name: "r2", Point: Egress}})
+	applyRuleSet(eval, []StaticRule{{Name: "r2", Point: evaluator.Egress}})
 
 	select {
 	case <-h.Done():

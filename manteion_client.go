@@ -3,15 +3,12 @@ package atropos
 import (
 	"bufio"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,22 +16,22 @@ import (
 	"time"
 )
 
-// ManteionStatus represents the SDK's connectivity state with manteion.
-type ManteionStatus int32
+// manteionStatus represents the SDK's connectivity state with manteion.
+type manteionStatus int32
 
 const (
-	ManteionDisconnected ManteionStatus = iota // never connected (or offline)
-	ManteionConnected                          // poll succeeding normally
-	ManteionDegraded                           // recent poll failures; using stale rules
+	manteionDisconnected manteionStatus = iota // never connected (or offline)
+	manteionConnected                          // poll succeeding normally
+	manteionDegraded                           // recent poll failures; using stale rules
 )
 
-// ManteionClient manages the lifecycle of the SDK's connection to manteion:
+// manteionClient manages the lifecycle of the SDK's connection to manteion:
 // startup polling, registration, rule sync, and graceful shutdown.
-type ManteionClient struct {
+type manteionClient struct {
 	cfg        manteionConfig
 	httpClient *http.Client // used for all short-lived calls (poll, register, init)
 	sseClient  *http.Client // no Timeout — SSE connections are indefinitely long-lived
-	targets    ApplyTargets
+	targets    applyTargets
 	logger     *slog.Logger
 
 	ruleVersion atomic.Uint64
@@ -48,7 +45,7 @@ type ManteionClient struct {
 
 // newReq builds a manteion-bound request with auth applied.
 // Single chokepoint for all outgoing manteion requests in this client.
-func (c *ManteionClient) newReq(ctx context.Context, method, url string, body io.Reader) (*http.Request, error) {
+func (c *manteionClient) newReq(ctx context.Context, method, url string, body io.Reader) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, err
@@ -62,17 +59,17 @@ func (c *ManteionClient) newReq(ctx context.Context, method, url string, body io
 }
 
 // Status returns the current connectivity status.
-func (c *ManteionClient) Status() ManteionStatus {
+func (c *manteionClient) Status() manteionStatus {
 	if c == nil {
-		return ManteionDisconnected
+		return manteionDisconnected
 	}
-	return ManteionStatus(c.status.Load())
+	return manteionStatus(c.status.Load())
 }
 
 // Close cancels the poll loop, waits for it to exit, and sends a best-effort
 // deregister to manteion. Safe to call on a nil receiver (offline mode).
 // Always returns nil today (best-effort); reserved for future fatal-error reporting.
-func (c *ManteionClient) Close(ctx context.Context) error {
+func (c *manteionClient) Close(ctx context.Context) error {
 	if c == nil {
 		return nil
 	}
@@ -105,7 +102,7 @@ func (c *ManteionClient) Close(ctx context.Context) error {
 
 // waitForReady polls GET /api/v1/sdk/init with exponential backoff until it
 // returns 200 or the context deadline is reached.
-func (c *ManteionClient) waitForReady(ctx context.Context) error {
+func (c *manteionClient) waitForReady(ctx context.Context) error {
 	deadline := time.Now().Add(c.cfg.initTimeout)
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
@@ -140,26 +137,31 @@ func (c *ManteionClient) waitForReady(ctx context.Context) error {
 	}
 }
 
-// register calls RegisterWithClient then Apply to configure the evaluator.
-func (c *ManteionClient) register(ctx context.Context) error {
-	resp, err := RegisterWithClient(ctx, c.httpClient, c.cfg.url, RegisterRequest{
+// register POSTs the registration then applies the piggybacked intent to
+// configure the evaluator.
+func (c *manteionClient) register(ctx context.Context) error {
+	routes := c.cfg.routes
+	if len(routes) == 0 {
+		routes = nil // omit the field entirely from the payload
+	}
+	resp, err := registerWith(ctx, c.httpClient, c.cfg.url, RegisterRequest{
 		ID:             c.cfg.instanceID,
 		Service:        c.cfg.serviceName,
 		Version:        c.cfg.serviceVersion,
 		Address:        c.cfg.address,
 		PollIntervalMs: c.cfg.pollInterval.Milliseconds(),
-		Routes:         publishedRoutes(),
+		Routes:         routes,
 	})
 	if err != nil {
 		return err
 	}
-	return Apply(resp, c.targets)
+	return apply(resp, c.targets)
 }
 
 // pollLoopWithTrigger runs until ctx is cancelled. It fetches rules every
 // pollInterval or immediately when the SSE listener sends a trigger signal.
 // Applies exponential backoff on failures and re-registers on recovery.
-func (c *ManteionClient) pollLoopWithTrigger(ctx context.Context, trigger <-chan struct{}) {
+func (c *manteionClient) pollLoopWithTrigger(ctx context.Context, trigger <-chan struct{}) {
 	ticker := time.NewTicker(c.cfg.pollInterval)
 	defer ticker.Stop()
 
@@ -169,7 +171,7 @@ func (c *ManteionClient) pollLoopWithTrigger(ctx context.Context, trigger <-chan
 		err := c.fetchRules(ctx)
 		if err != nil {
 			consecutiveFailures++
-			c.status.Store(int32(ManteionDegraded))
+			c.status.Store(int32(manteionDegraded))
 
 			backoff := c.cfg.pollInterval * time.Duration(1<<min(consecutiveFailures, 6))
 			backoff = min(backoff, 60*time.Second)
@@ -200,7 +202,7 @@ func (c *ManteionClient) pollLoopWithTrigger(ctx context.Context, trigger <-chan
 		}
 		consecutiveFailures = 0
 		c.lastPollAt.Store(time.Now().UnixNano())
-		c.status.Store(int32(ManteionConnected))
+		c.status.Store(int32(manteionConnected))
 		ticker.Reset(c.cfg.pollInterval)
 	}
 
@@ -217,7 +219,7 @@ func (c *ManteionClient) pollLoopWithTrigger(ctx context.Context, trigger <-chan
 }
 
 // fetchRules calls GET /api/v1/sdk/rules and applies any updated rules.
-func (c *ManteionClient) fetchRules(ctx context.Context) error {
+func (c *manteionClient) fetchRules(ctx context.Context) error {
 	q := url.Values{
 		"service":     {c.cfg.serviceName},
 		"version":     {strconv.FormatUint(c.ruleVersion.Load(), 10)},
@@ -249,11 +251,11 @@ func (c *ManteionClient) fetchRules(ctx context.Context) error {
 			return fmt.Errorf("decode rules: %w", err)
 		}
 
-		// Single application path: Apply decodes rules with the configured
+		// Single application path: apply decodes rules with the configured
 		// NetworkResolver, reconciles active faults, and installs freeze config.
 		// On error we keep stale state — manteion is alive, the issue is data.
 		applyResp := RegisterResponse{Status: "poll", RuleSync: payload}
-		if err := Apply(applyResp, c.targets); err != nil {
+		if err := apply(applyResp, c.targets); err != nil {
 			c.logger.Error("apply failed, keeping stale state", "error", err)
 			return nil
 		}
@@ -278,7 +280,7 @@ func (c *ManteionClient) fetchRules(ctx context.Context) error {
 // whenever a "rules_changed" event arrives. Reconnects silently on disconnect —
 // the poll loop already handles degraded state logging, so SSE errors are only
 // logged on the first failure per connection to avoid noise during outages.
-func (c *ManteionClient) listenSSE(ctx context.Context, triggerPoll func()) {
+func (c *manteionClient) listenSSE(ctx context.Context, triggerPoll func()) {
 	sseURL := c.cfg.url + "/api/v1/sdk/events?service=" + url.QueryEscape(c.cfg.serviceName)
 	firstFailure := true
 	for {
@@ -305,7 +307,7 @@ func (c *ManteionClient) listenSSE(ctx context.Context, triggerPoll func()) {
 	}
 }
 
-func (c *ManteionClient) sseStream(ctx context.Context, sseURL string, triggerPoll func()) error {
+func (c *manteionClient) sseStream(ctx context.Context, sseURL string, triggerPoll func()) error {
 	req, err := c.newReq(ctx, http.MethodGet, sseURL, nil)
 	if err != nil {
 		return err
@@ -346,17 +348,4 @@ func (c *ManteionClient) sseStream(ctx context.Context, sseURL string, triggerPo
 		}
 	}
 	return sc.Err()
-}
-
-// generateInstanceID returns "${hostname}-${random8hex}".
-func generateInstanceID() string {
-	host, _ := os.Hostname()
-	if host == "" {
-		host = "unknown"
-	}
-	b := make([]byte, 4)
-	if _, err := rand.Read(b); err != nil {
-		return host + "-" + strconv.FormatInt(time.Now().UnixNano(), 16)
-	}
-	return host + "-" + hex.EncodeToString(b)
 }

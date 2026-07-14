@@ -1,4 +1,4 @@
-package atropos_test
+package atropos
 
 import (
 	"encoding/json"
@@ -10,8 +10,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	atropos "git.ucsc.edu/microfaults/atropos-go"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 )
@@ -31,7 +29,7 @@ func TestCachePushClient_BatchByCount(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := atropos.NewCachePushClient(atropos.CachePushConfig{
+	client := newCachePushClient(cachePushConfig{
 		BaseURL:  server.URL,
 		Service:  "cart",
 		Instance: "pod-1",
@@ -81,7 +79,7 @@ func TestCachePushClient_BatchByTime(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := atropos.NewCachePushClient(atropos.CachePushConfig{
+	client := newCachePushClient(cachePushConfig{
 		BaseURL:  server.URL,
 		Service:  "cart",
 		Instance: "pod-1",
@@ -108,7 +106,7 @@ func TestCachePushClient_StopFlushes(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := atropos.NewCachePushClient(atropos.CachePushConfig{
+	client := newCachePushClient(cachePushConfig{
 		BaseURL:  server.URL,
 		Service:  "cart",
 		Instance: "pod-1",
@@ -130,7 +128,7 @@ func TestCachePushClient_DropOnFailure(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := atropos.NewCachePushClient(atropos.CachePushConfig{
+	client := newCachePushClient(cachePushConfig{
 		BaseURL:  server.URL,
 		Service:  "cart",
 		Instance: "pod-1",
@@ -189,7 +187,7 @@ func TestPush_RetriesThenDelivers(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := atropos.NewCachePushClient(atropos.CachePushConfig{
+	client := newCachePushClient(cachePushConfig{
 		BaseURL: server.URL, Service: "cart", Instance: "pod-1",
 		MaxBatch: 1, MaxWait: 10 * time.Second,
 	})
@@ -236,7 +234,7 @@ func TestPush_TerminalRejectStopsRetry(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := atropos.NewCachePushClient(atropos.CachePushConfig{
+	client := newCachePushClient(cachePushConfig{
 		BaseURL: server.URL, Service: "cart", Instance: "pod-1",
 		MaxBatch: 1, MaxWait: 10 * time.Second,
 	})
@@ -266,20 +264,20 @@ func TestPush_TerminalRejectStopsRetry(t *testing.T) {
 // many records the test actually enqueued.
 func TestPush_DrainReportCountsMatchEnqueued(t *testing.T) {
 	var mu sync.Mutex
-	var drainReports []atropos.DrainReport
+	var drainReports []DrainReport
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/cache/ingest":
 			w.WriteHeader(http.StatusCreated)
 		case "/api/v1/sdk/cachebox/drain":
-			var report atropos.DrainReport
+			var report DrainReport
 			b, _ := io.ReadAll(r.Body)
 			json.Unmarshal(b, &report)
 			mu.Lock()
 			drainReports = append(drainReports, report)
 			mu.Unlock()
-			_ = json.NewEncoder(w).Encode(atropos.DrainReportResponse{Accepted: true})
+			_ = json.NewEncoder(w).Encode(DrainReportResponse{Accepted: true})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -289,14 +287,14 @@ func TestPush_DrainReportCountsMatchEnqueued(t *testing.T) {
 	// Canonical external-host wiring: the push client and CacheBox need ONE
 	// shared fidelity registry (the drain report snapshots it), but the
 	// construction is circular -- so bind after building the CacheBox.
-	pusher := atropos.NewCachePushClient(atropos.CachePushConfig{
+	pusher := newCachePushClient(cachePushConfig{
 		BaseURL: server.URL, Service: "cart", Instance: "pod-1",
 		MaxBatch: 100, MaxWait: 10 * time.Second,
 	})
 	defer pusher.Stop()
 
-	cb := atropos.NewCacheBox(atropos.CacheBoxConfig{
-		KeyStrategy: atropos.KeyStrategyExact,
+	cb := cachebox.New(cachebox.Config{
+		KeyStrategy: cachebox.KeyStrategyExact,
 		Push:        pusher.PushFunc(),
 	})
 	defer cb.Stop()
@@ -343,32 +341,32 @@ func TestPush_DrainReportCountsMatchEnqueued(t *testing.T) {
 // any phase after the first.
 func TestPush_DrainReportIsPerPhase(t *testing.T) {
 	var mu sync.Mutex
-	var drainReports []atropos.DrainReport
+	var drainReports []DrainReport
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/cache/ingest":
 			w.WriteHeader(http.StatusCreated)
 		case "/api/v1/sdk/cachebox/drain":
-			var report atropos.DrainReport
+			var report DrainReport
 			b, _ := io.ReadAll(r.Body)
 			json.Unmarshal(b, &report)
 			mu.Lock()
 			drainReports = append(drainReports, report)
 			mu.Unlock()
-			_ = json.NewEncoder(w).Encode(atropos.DrainReportResponse{Accepted: true})
+			_ = json.NewEncoder(w).Encode(DrainReportResponse{Accepted: true})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
 	defer server.Close()
 
-	pusher := atropos.NewCachePushClient(atropos.CachePushConfig{
+	pusher := newCachePushClient(cachePushConfig{
 		BaseURL: server.URL, Service: "cart", Instance: "pod-1",
 		MaxBatch: 100, MaxWait: 10 * time.Second,
 	})
 	defer pusher.Stop()
-	cb := atropos.NewCacheBox(atropos.CacheBoxConfig{
-		KeyStrategy: atropos.KeyStrategyExact,
+	cb := cachebox.New(cachebox.Config{
+		KeyStrategy: cachebox.KeyStrategyExact,
 		Push:        pusher.PushFunc(),
 	})
 	defer cb.Stop()
