@@ -9,10 +9,11 @@ import (
 // preload begin may declare (design doc Q4: "validates strategy
 // supported"). Kept in sync with key.go's KeyStrategy consts.
 var supportedKeyStrategies = map[string]bool{
-	string(KeyStrategyExact):         true,
-	string(KeyStrategyExactWithHost): true,
-	string(KeyStrategyExactWithBody): true,
-	string(KeyStrategyCanonicalV2):   true,
+	string(KeyStrategyExact):             true,
+	string(KeyStrategyExactWithHost):     true,
+	string(KeyStrategyExactWithBody):     true,
+	string(KeyStrategyCanonicalV2):       true,
+	string(KeyStrategyExactWithHostNorm): true,
 }
 
 // BeginResult reports the outcome of PreloadStore.Begin. There is no

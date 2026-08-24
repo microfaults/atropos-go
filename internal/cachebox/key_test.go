@@ -183,3 +183,19 @@ func TestExactWithHostNorm_NeedsNoBody(t *testing.T) {
 		t.Fatal("exact_with_host_norm must not force hot-path body buffering")
 	}
 }
+
+// Guards the "kept in sync with key.go" promise on supportedKeyStrategies:
+// every named KeyStrategy const must be accepted by preload begin. exp9
+// (2026-08-24) failed its preload gate because exact_with_host_norm was
+// added to KeyFuncFor but not to this set.
+func TestSupportedKeyStrategies_CoversAllConsts(t *testing.T) {
+	all := []KeyStrategy{
+		KeyStrategyExact, KeyStrategyExactWithHost, KeyStrategyExactWithBody,
+		KeyStrategyCanonicalV2, KeyStrategyExactWithHostNorm,
+	}
+	for _, s := range all {
+		if !supportedKeyStrategies[string(s)] {
+			t.Errorf("strategy %q missing from supportedKeyStrategies", s)
+		}
+	}
+}
