@@ -135,3 +135,51 @@ func TestDerive_CanonicalV2MatchesKeyFuncForWithSameHeaders(t *testing.T) {
 		t.Fatalf("Derive and KeyFuncFor should agree when there are no extra key_headers: %q vs %q", a, b)
 	}
 }
+
+// --- exact_with_host_norm: id-shaped path segments collapse, real segments survive ---
+
+func TestExactWithHostNorm_SegmentClasses(t *testing.T) {
+	cases := []struct{ path, want string }{
+		// the exp8 killer: frontend-minted session UUIDs in cart paths
+		{"/cart/f45b8237-15aa-45c9-ad90-2ac5f331c7a4", "/cart/{id}"},
+		{"/cart/F45B8237-15AA-45C9-AD90-2AC5F331C7A4", "/cart/{id}"},
+		// long hex and long decimal runs
+		{"/orders/1234567890abcdef1234", "/orders/{id}"},
+		{"/track/12345678", "/track/{id}"},
+		// survivors: catalog codes, API versions, short numerics, words
+		{"/products/OLJCESPC7Z", "/products/OLJCESPC7Z"},
+		{"/api/v1/products", "/api/v1/products"},
+		{"/page/7", "/page/7"},
+		{"/cart", "/cart"},
+		// non-hex 36-char segment is not a UUID
+		{"/x/zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz", "/x/zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"},
+	}
+	for _, c := range cases {
+		if got := normalizePathIDs(c.path); got != c.want {
+			t.Errorf("normalizePathIDs(%q) = %q, want %q", c.path, got, c.want)
+		}
+	}
+}
+
+func TestExactWithHostNorm_ByteStable(t *testing.T) {
+	r := mustRequest(t, "GET", "http://cartservice:7070/cart/f45b8237-15aa-45c9-ad90-2ac5f331c7a4?b=2&a=1")
+	want := "exact_with_host_norm:GET|cartservice:7070|/cart/{id}?a=1&b=2"
+	if got := KeyFuncFor(KeyStrategyExactWithHostNorm)(r, nil); got != want {
+		t.Errorf("exact_with_host_norm key: got %q, want %q", got, want)
+	}
+	// Distinct sessions, one key (the point of the strategy).
+	r2 := mustRequest(t, "GET", "http://cartservice:7070/cart/00000000-0000-4000-8000-000000000000?a=1&b=2")
+	if got := KeyFuncFor(KeyStrategyExactWithHostNorm)(r2, nil); got != want {
+		t.Errorf("distinct sessions produced distinct keys: %q vs %q", got, want)
+	}
+	// Derive dispatches to the same keyer.
+	if got := Derive(KeyStrategyExactWithHostNorm, nil, r, nil); got != want {
+		t.Errorf("Derive(exact_with_host_norm): got %q, want %q", got, want)
+	}
+}
+
+func TestExactWithHostNorm_NeedsNoBody(t *testing.T) {
+	if KeyStrategyExactWithHostNorm.NeedsBody() {
+		t.Fatal("exact_with_host_norm must not force hot-path body buffering")
+	}
+}

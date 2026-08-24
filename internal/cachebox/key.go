@@ -45,6 +45,17 @@ const (
 	// hash; wire spec §W7). It is the authoritative default for new rules;
 	// the keying itself is implemented in ATRO-3.
 	KeyStrategyCanonicalV2 KeyStrategy = "canonical_v2"
+
+	// KeyStrategyExactWithHostNorm is ExactWithHost with id-shaped path
+	// segments replaced by "{id}" before keying: UUIDs, hex runs of >= 16
+	// chars, and decimal runs of >= 8 digits. Built for egress whose paths
+	// embed load-time-minted identifiers (per-session carts, per-order
+	// resources) that can never be covered by a baseline recording — the
+	// exp8 finding. Short numeric or alphanumeric segments (API versions,
+	// page numbers, catalog codes like "OLJCESPC7Z") survive untouched.
+	// Opt-in per rule: only choose it where collapsing id-distinct
+	// resources to one representative response is semantically acceptable.
+	KeyStrategyExactWithHostNorm KeyStrategy = "exact_with_host_norm"
 )
 
 // NeedsBody reports whether the strategy requires the request body for
@@ -68,6 +79,8 @@ func KeyFuncFor(s KeyStrategy) KeyFunc {
 		return exactWithHostKey
 	case KeyStrategyExactWithBody:
 		return exactWithBodyKey
+	case KeyStrategyExactWithHostNorm:
+		return exactWithHostNormKey
 	case KeyStrategyCanonicalV2:
 		return func(r *http.Request, body []byte) string {
 			return canonicalV2Key(r, body, nil)
@@ -116,6 +129,88 @@ func exactWithHostKey(r *http.Request, _ []byte) string {
 	writeQueryPart(&b, r.URL.RawQuery)
 	return b.String()
 }
+
+func exactWithHostNormKey(r *http.Request, _ []byte) string {
+	path := normalizePathIDs(r.URL.Path)
+	var b strings.Builder
+	b.Grow(len(r.Method) + len(r.Host) + len(path) + len(r.URL.RawQuery) + len(KeyStrategyExactWithHostNorm) + 6)
+	b.WriteString(string(KeyStrategyExactWithHostNorm))
+	b.WriteByte(':')
+	b.WriteString(r.Method)
+	b.WriteByte('|')
+	b.WriteString(r.Host)
+	b.WriteByte('|')
+	b.WriteString(path)
+	writeQueryPart(&b, r.URL.RawQuery)
+	return b.String()
+}
+
+// normalizePathIDs replaces id-shaped path segments with "{id}". A segment
+// is id-shaped when it is a UUID (8-4-4-4-12 hex), a hex run of >= 16
+// chars, or a decimal run of >= 8 digits. The query string is deliberately
+// left alone: query ids are already visible in the key and per-rule query
+// handling belongs to the projection design, not this strategy.
+func normalizePathIDs(path string) string {
+	if !strings.ContainsRune(path, '/') {
+		return path
+	}
+	segs := strings.Split(path, "/")
+	changed := false
+	for i, s := range segs {
+		if idShapedSegment(s) {
+			segs[i] = "{id}"
+			changed = true
+		}
+	}
+	if !changed {
+		return path
+	}
+	return strings.Join(segs, "/")
+}
+
+func idShapedSegment(s string) bool {
+	switch n := len(s); {
+	case n == 36:
+		return isUUIDSegment(s)
+	case n >= 16:
+		return isRunOf(s, isHexByte)
+	case n >= 8:
+		return isRunOf(s, isDigitByte)
+	default:
+		return false
+	}
+}
+
+func isUUIDSegment(s string) bool {
+	for i := 0; i < len(s); i++ {
+		switch i {
+		case 8, 13, 18, 23:
+			if s[i] != '-' {
+				return false
+			}
+		default:
+			if !isHexByte(s[i]) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isRunOf(s string, ok func(byte) bool) bool {
+	for i := 0; i < len(s); i++ {
+		if !ok(s[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isHexByte(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+func isDigitByte(c byte) bool { return c >= '0' && c <= '9' }
 
 func exactWithBodyKey(r *http.Request, body []byte) string {
 	h := fnv.New64a()
