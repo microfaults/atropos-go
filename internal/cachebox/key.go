@@ -141,15 +141,41 @@ func exactWithHostNormKey(r *http.Request, _ []byte) string {
 	b.WriteString(r.Host)
 	b.WriteByte('|')
 	b.WriteString(path)
-	writeQueryPart(&b, r.URL.RawQuery)
+	writeQueryPart(&b, normalizeQueryIDs(r.URL.RawQuery))
 	return b.String()
+}
+
+// normalizeQueryIDs replaces id-shaped query param VALUES with "{id}",
+// leaving param names and non-id values intact (v0.1.3: exp10 found
+// frontend's rec call carries the session in the QUERY —
+// /recommendations?user_id={uuid} — the same load-time entropy _norm
+// removes from paths). Same id-shape rule as segments. Operates on the raw
+// (pre-sort) string; writeQueryPart's normalizeQuery still sorts after.
+func normalizeQueryIDs(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	parts := strings.Split(raw, "&")
+	changed := false
+	for i, p := range parts {
+		eq := strings.IndexByte(p, '=')
+		if eq < 0 {
+			continue
+		}
+		if idShapedSegment(p[eq+1:]) {
+			parts[i] = p[:eq+1] + "{id}"
+			changed = true
+		}
+	}
+	if !changed {
+		return raw
+	}
+	return strings.Join(parts, "&")
 }
 
 // normalizePathIDs replaces id-shaped path segments with "{id}". A segment
 // is id-shaped when it is a UUID (8-4-4-4-12 hex), a hex run of >= 16
-// chars, or a decimal run of >= 8 digits. The query string is deliberately
-// left alone: query ids are already visible in the key and per-rule query
-// handling belongs to the projection design, not this strategy.
+// chars, or a decimal run of >= 8 digits.
 func normalizePathIDs(path string) string {
 	if !strings.ContainsRune(path, '/') {
 		return path

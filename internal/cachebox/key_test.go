@@ -199,3 +199,25 @@ func TestSupportedKeyStrategies_CoversAllConsts(t *testing.T) {
 		}
 	}
 }
+
+// v0.1.3: id-shaped query VALUES normalize too (exp10: frontend's rec call
+// carries the session in the query — user_id={uuid}).
+func TestExactWithHostNorm_QueryValues(t *testing.T) {
+	r := mustRequest(t, "GET",
+		"http://recommendationservice:8080/recommendations?user_id=f45b8237-15aa-45c9-ad90-2ac5f331c7a4&product_ids=OLJCESPC7Z")
+	want := "exact_with_host_norm:GET|recommendationservice:8080|/recommendations?product_ids=OLJCESPC7Z&user_id={id}"
+	if got := KeyFuncFor(KeyStrategyExactWithHostNorm)(r, nil); got != want {
+		t.Errorf("query-value normalization: got %q, want %q", got, want)
+	}
+	// Distinct sessions in the query — one key.
+	r2 := mustRequest(t, "GET",
+		"http://recommendationservice:8080/recommendations?user_id=00000000-0000-4000-8000-000000000000&product_ids=OLJCESPC7Z")
+	if got := KeyFuncFor(KeyStrategyExactWithHostNorm)(r2, nil); got != want {
+		t.Errorf("distinct query sessions produced distinct keys: %q", got)
+	}
+	// Param without '=' and short values survive untouched.
+	r3 := mustRequest(t, "GET", "http://x/a?flag&page=7")
+	if got := KeyFuncFor(KeyStrategyExactWithHostNorm)(r3, nil); got != "exact_with_host_norm:GET|x|/a?flag&page=7" {
+		t.Errorf("non-id query mangled: %q", got)
+	}
+}
