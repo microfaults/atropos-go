@@ -380,3 +380,11 @@ The public API is intentionally minimal so language bindings can stay thin. For 
 - **`manteion-ui`** — React admin UI on top of manteion
 - **`zeus-go`** — execution plane: k6 workflow-run launcher + vegeta attacks, driven by manteion
 - **`service-beds`** — Online Boutique microservices in Go, the instrumented target mesh
+
+## Project report
+
+This component is documented in the UCSC master's project report
+*Safe Evolution and Interventional Fault Attribution in Microservice
+Meshes* (Pranay Mundra, 2026) — Part II, as the in-process SDK of the
+faults-lab instrument (cache-box freeze primitive, fault taxonomy,
+fidelity counters).
