@@ -149,3 +149,18 @@ type origDstConn struct { net.Conn; dst string }
 **Placeholder scan:** none.
 
 **Type consistency:** `OriginalDstFunc` (Task 3) is what `atroposd.Config.OriginalDst` (Task 4) injects; `WithCapabilities`/`AllCapabilities` (Task 1) are what `Serve` and `Run` pass; `HealthHandler(c, host, capture)` (Task 2) is what `ControlSurface` calls with `ControlConfig.Host/Capture`.
+
+---
+
+## Execution notes (2026-09-24)
+
+- Commits: `c239c60` (Tasks 1–2), `5f1d850` (Task 3), Tasks 4–5 and docs in the following commits.
+- Task 3 correction to the plan: the transparent egress keeps `URL.Host` = the app's `Host` header
+  (the name it dialed) and dials the original destination through `NewTransparentTransport`
+  (context-aware `DialContext`), because `canonical_v2` folds `URL.Host` and a ClusterIP there would
+  break key identity with the in-process host. The cross-mode golden test pins this.
+- Raw-TCP relays have no Host header, so `PolicyTable.matchAddr` resolves a policy's target name
+  (cached 30 s) and compares addresses; tests inject the resolver.
+- The transparent ingress routes by original-destination port and rejects ports outside the declared
+  inbound set; the loop guard rejects an original destination that is the listener itself.
+- Deploy assets are untested against a cluster from this session; `init.sh` is syntax-checked only.

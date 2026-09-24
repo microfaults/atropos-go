@@ -47,8 +47,8 @@ A snapshot of what's shipped on `main`. For the research vision (cache-box primi
 | Prometheus metrics for HTTP ingress/egress + cache-box | Shipped |
 | Cache-box on ingress + gRPC | Not yet implemented |
 | OPA-backed evaluator | Not yet implemented |
-| Out-of-process host — `atroposd` sidecar, explicit capture mode (per-dependency egress ports, optional ingress port), inline network toxics, eager arming | Shipped (M1) |
-| Transparent capture (iptables), node agent for resource faults, gRPC cache-box | Not yet implemented (M2, M4, deferred; see `docs/plans/2026-09-08-atropos-daemon-design.md`) |
+| Out-of-process host — `atroposd` sidecar: explicit capture (per-dependency egress ports) and transparent capture (iptables REDIRECT + `SO_ORIGINAL_DST`, raw-TCP relay for non-HTTP dependencies), inline network toxics, eager arming, `host`/`capabilities` at registration, `ATROPOS_HOST=sidecar` passive guard, deploy assets under `deploy/sidecar/` | Shipped (M1, M2) |
+| Node agent for resource faults (cgroup placement), manteion capability filter, gRPC cache-box | Not yet implemented (M4, M3, deferred; see `docs/plans/2026-09-08-atropos-daemon-design.md`) |
 | Polyglot bindings (DeathStarBench target) | Superseded by `atroposd` (the 2026-04 sidecar plan is critiqued in the design doc above) |
 
 ## Architecture
@@ -321,10 +321,28 @@ first matching request. The in-process host keeps rejecting `host: inline`
 and arming lazily. Proxy overhead per request (total minus upstream) is
 exported as `atropos_proxy_overhead_seconds{point}` for the G-proxy gate.
 
-Not in this release: transparent capture (iptables redirect, M2), the
-`ATROPOS_HOST=sidecar` guard that makes an embedded `Serve` passive next to
-a sidecar (M2), resource faults (delegated to the node agent, M4), gRPC and
-the thin-client hook API (deferred). Design and milestones:
+**Transparent capture** (`ATROPOSD_CAPTURE=transparent`) removes the
+per-dependency ports: the `atropos-init` container (NET_ADMIN, see
+`deploy/sidecar/init.sh`) REDIRECTs the app's outbound TCP to the sidecar's
+egress port and the declared `ATROPOSD_INBOUND_PORTS` to its ingress port,
+excluding the sidecar's own uid, loopback, and the OTel collector ports.
+The sidecar recovers each connection's original destination
+(`SO_ORIGINAL_DST`), keeps the app's `Host` header as the key's host (so
+keys match the in-process host by construction), dials the original
+destination, and relays `ATROPOSD_RAW_TCP_PORTS` (redis, kafka, postgres)
+at L4 with armed toxics applied. It refuses to start — and therefore to
+register — unless the init container's capture marker exists. The app
+container carries `ATROPOS_HOST=sidecar`, which makes an embedded `Serve`
+passive (tracing only), so a pod is instrumented by exactly one host.
+Registration advertises `host` and `capabilities`; rules a host cannot
+execute are skipped per rule and counted in
+`atropos_rules_unsupported_total` instead of wedging the sync.
+`deploy/sidecar/` holds the images, the init script and a kustomize patch
+for one boutique service.
+
+Not in this release: resource faults (delegated to the node agent, M4),
+the manteion-side capability filter (M3), gRPC and the thin-client hook
+API (deferred), IPv6 original destinations. Design and milestones:
 `docs/plans/2026-09-08-atropos-daemon-design.md`.
 
 ---

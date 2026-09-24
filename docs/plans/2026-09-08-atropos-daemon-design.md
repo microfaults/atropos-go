@@ -608,6 +608,11 @@ fail-closed, preload, drain) is validated before iptables enters the picture.
 short-circuited a response in either host (fixed in the shared middleware), and network toxics for
 `host=inline` landed as a request-level `ToxicTransport` with hijack-based client-leg reproduction
 rather than a per-connection dialer wrapper (§5.6 semantics kept: the app observes a reset or a hang).
+M2 done (`c239c60`..HEAD, plan `2026-09-24-atroposd-m2-transparent-capture.md`): transparent capture keeps
+`URL.Host` = the name the app dialed and dials the original destination through the transport (the
+ClusterIP must not enter the key); raw-TCP relays match toxic targets by resolving the target name;
+IPv6 original destinations and an app-uid capture probe are named follow-ups. VM1 preconditions remain
+unverified from this session (listed in `deploy/sidecar/README.md`).
 
 ---
 
