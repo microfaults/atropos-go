@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
+	"git.ucsc.edu/microfaults/atropos-go/internal/metrics"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
@@ -27,8 +28,8 @@ func ingressMiddleware(next http.Handler, serviceName string, i *interceptor.Int
 
 		duration := time.Since(start).Seconds()
 		status := strconv.Itoa(rec.statusCode)
-		httpServerRequestDuration.WithLabelValues(r.Method, status, serviceName).Observe(duration)
-		httpServerRequestsTotal.WithLabelValues(r.Method, status, serviceName).Inc()
+		metrics.HTTPServerRequestDuration.WithLabelValues(r.Method, status, serviceName).Observe(duration)
+		metrics.HTTPServerRequestsTotal.WithLabelValues(r.Method, status, serviceName).Inc()
 	})
 }
 
@@ -72,8 +73,8 @@ func egressTransport(base http.RoundTripper, resolve func() *interceptor.Interce
 		if target == "" {
 			target = r.Host
 		}
-		httpClientRequestDuration.WithLabelValues(r.Method, status, target).Observe(duration)
-		httpClientRequestsTotal.WithLabelValues(r.Method, status, target).Inc()
+		metrics.HTTPClientRequestDuration.WithLabelValues(r.Method, status, target).Observe(duration)
+		metrics.HTTPClientRequestsTotal.WithLabelValues(r.Method, status, target).Inc()
 
 		// Classification order matters: a fail-closed miss carries BOTH the
 		// miss marker and the mode header, so the miss check must run first
@@ -81,11 +82,11 @@ func egressTransport(base http.RoundTripper, resolve func() *interceptor.Interce
 		if resp != nil {
 			switch {
 			case resp.Header.Get(interceptor.HeaderCacheMiss) != "":
-				cacheBoxMissesTotal.Inc()
+				metrics.CacheBoxMissesTotal.Inc()
 			case resp.Header.Get(interceptor.HeaderCacheMode) != "":
-				cacheBoxHitsTotal.Inc()
+				metrics.CacheBoxHitsTotal.Inc()
 			case resp.Header.Get(interceptor.HeaderCacheKey) != "":
-				cacheBoxRecordsTotal.Inc()
+				metrics.CacheBoxRecordsTotal.Inc()
 			}
 		}
 

@@ -20,6 +20,7 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
+	"git.ucsc.edu/microfaults/atropos-go/internal/metrics"
 	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 )
 
@@ -44,7 +45,7 @@ func init() {
 	defaultRegistry = interceptor.NewFaultRegistry()
 	defaultInterceptor.Store(interceptor.New(nil, trace.NewOTelTracer(),
 		interceptor.WithRegistry(defaultRegistry),
-		interceptor.WithInjectionHook(recordFaultInjection)))
+		interceptor.WithInjectionHook(metrics.RecordFaultInjection)))
 }
 
 // currentInterceptor returns the live package interceptor.
@@ -85,7 +86,7 @@ func stopBackgroundFaults(keys ...string) {
 // running faults (A1).
 func configure(eval evaluator.Evaluator, cb *cachebox.CacheBox) {
 	opts := []interceptor.Option{
-		interceptor.WithInjectionHook(recordFaultInjection),
+		interceptor.WithInjectionHook(metrics.RecordFaultInjection),
 		interceptor.WithRegistry(defaultRegistry),
 	}
 	if cb != nil {

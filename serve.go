@@ -11,6 +11,7 @@ import (
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/metrics"
 
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
@@ -250,7 +251,7 @@ func resolveInstanceID(cfg Config) string {
 func controlMux(cfg Config, host *evaluator.StaticEvaluator, demo *demoEvaluator, cb *cachebox.CacheBox, instanceID string) http.Handler {
 	mux := http.NewServeMux()
 
-	mux.Handle("GET /metrics", metricsHandler())
+	mux.Handle("GET /metrics", metrics.Handler())
 	mux.Handle("/atropos/health", healthHandler())
 
 	// Bare path and subtree both: the subtree pattern alone would

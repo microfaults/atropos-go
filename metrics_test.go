@@ -9,10 +9,12 @@ import (
 	"testing"
 
 	dto "github.com/prometheus/client_model/go"
+
+	"git.ucsc.edu/microfaults/atropos-go/internal/metrics"
 )
 
 func gatherCounter(name string, labels map[string]string) float64 {
-	families, _ := atroposRegistry.Gather()
+	families, _ := metrics.Registry.Gather()
 	for _, f := range families {
 		if f.GetName() != name {
 			continue
@@ -27,7 +29,7 @@ func gatherCounter(name string, labels map[string]string) float64 {
 }
 
 func gatherHistogramCount(name string, labels map[string]string) uint64 {
-	families, _ := atroposRegistry.Gather()
+	families, _ := metrics.Registry.Gather()
 	for _, f := range families {
 		if f.GetName() != name {
 			continue
@@ -214,7 +216,7 @@ func TestMetricsHandler_ServesMetrics(t *testing.T) {
 	mw.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil))
 
 	rec := httptest.NewRecorder()
-	metricsHandler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	metrics.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
 
 	body, _ := io.ReadAll(rec.Body)
 	text := string(body)
