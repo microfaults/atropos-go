@@ -62,6 +62,28 @@ var (
 		Name: "atropos_fault_injections_total",
 		Help: "Total faults started by the interceptor, by type and injection point.",
 	}, []string{"fault_type", "injection_point"})
+
+	// ProxyOverhead is the time a request spends inside the atroposd proxy
+	// excluding the upstream round trip: evaluation, keying, buffering and
+	// copying. The G-proxy validity gate (design doc §5.13) reads its p99.
+	ProxyOverhead = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "atropos_proxy_overhead_seconds",
+		Help:    "Time spent inside the atroposd proxy, excluding the upstream round trip.",
+		Buckets: []float64{.0001, .00025, .0005, .001, .0025, .005, .01, .025, .05, .1, .25},
+	}, []string{"point"})
+
+	// ProxyInflight is the number of requests currently inside the proxy.
+	ProxyInflight = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "atropos_proxy_inflight",
+		Help: "Requests currently inside the atroposd proxy.",
+	}, []string{"point"})
+
+	// RulesUnsupportedTotal counts rules a host skipped because it cannot
+	// execute their fault category (design doc §5.3, D7: no silent drops).
+	RulesUnsupportedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "atropos_rules_unsupported_total",
+		Help: "Rules skipped because this host cannot execute their fault category.",
+	}, []string{"category"})
 )
 
 func init() {
@@ -74,6 +96,9 @@ func init() {
 		CacheBoxMissesTotal,
 		CacheBoxRecordsTotal,
 		FaultInjectionsTotal,
+		ProxyOverhead,
+		ProxyInflight,
+		RulesUnsupportedTotal,
 	)
 }
 
