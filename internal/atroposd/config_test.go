@@ -1,0 +1,98 @@
+package atroposd
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func writeYAML(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "atroposd.yaml")
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func clearEnv(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{"ATROPOS_SERVICE", "MANTEION_SERVICE_VERSION", "MANTEION_URL", "MANTEION_ADVERTISE_ADDR",
+		"MANTEION_INSTANCE_ID", "ATROPOSD_CONTROL_ADDR", "ATROPOSD_INGRESS_ADDR", "ATROPOSD_INBOUND_UPSTREAM",
+		"ATROPOSD_CAPTURE", "ATROPOSD_EGRESS"} {
+		t.Setenv(k, "")
+	}
+}
+
+func TestLoad_YAMLThenEnvThenDefaults(t *testing.T) {
+	clearEnv(t)
+	p := writeYAML(t, `
+service: productcatalogservice
+manteion_url: http://manteion:8080
+egress:
+  - listen: ":19090"
+    upstream: currencyservice:7000
+routes:
+  - method: GET
+    path: /products/{id}
+    depends_on: ["GET /products"]
+`)
+	t.Setenv("MANTEION_URL", "http://override:9090")
+	t.Setenv("ATROPOSD_EGRESS", ":19090=productcatalogservice:3550, :19091=currencyservice:7000")
+
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Service != "productcatalogservice" {
+		t.Fatalf("service = %q (from yaml)", cfg.Service)
+	}
+	if cfg.ManteionURL != "http://override:9090" {
+		t.Fatalf("manteion_url = %q, want the environment to win", cfg.ManteionURL)
+	}
+	if len(cfg.Egress) != 2 || cfg.Egress[0] != (EgressRoute{":19090", "productcatalogservice:3550"}) || cfg.Egress[1] != (EgressRoute{":19091", "currencyservice:7000"}) {
+		t.Fatalf("egress = %+v, want the ATROPOSD_EGRESS pairs", cfg.Egress)
+	}
+	if cfg.ControlListen != DefaultControlListen || cfg.InboundUpstream != DefaultInboundUpstream || cfg.Capture != CaptureExplicit {
+		t.Fatalf("defaults not applied: %+v", cfg)
+	}
+	if rs := cfg.wireRoutes(); len(rs) != 1 || rs[0].Path != "/products/{id}" || len(rs[0].DependsOn) != 1 {
+		t.Fatalf("routes = %+v", rs)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+}
+
+func TestValidate_ReportsEveryProblem(t *testing.T) {
+	clearEnv(t)
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = cfg.Validate()
+	if err == nil {
+		t.Fatal("empty config must not validate")
+	}
+	for _, want := range []string{"service is required", "at least one egress listener"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q lacks %q", err, want)
+		}
+	}
+
+	cfg.Service = "svc"
+	cfg.Capture = CaptureTransparent
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "M2") {
+		t.Fatalf("transparent capture must be rejected until M2, got %v", err)
+	}
+	cfg.Capture = "magic"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "unknown capture mode") {
+		t.Fatalf("unknown capture must be rejected, got %v", err)
+	}
+	cfg.Capture = CaptureExplicit
+	cfg.Egress = []EgressRoute{{Listen: ":1"}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "egress[0]") {
+		t.Fatalf("half-specified egress must be rejected, got %v", err)
+	}
+}

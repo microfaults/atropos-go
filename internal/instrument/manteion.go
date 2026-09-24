@@ -211,6 +211,10 @@ type ConnectConfig struct {
 	ServiceVersion string
 	// Routes is the HTTP route inventory published at registration.
 	Routes []wire.Route
+	// Address overrides the advertised address manteion fans out to
+	// (default: MANTEION_ADVERTISE_ADDR, else the first non-loopback IPv4
+	// with no port). Out-of-process hosts pass their bound control address.
+	Address string
 	// NetworkResolver maps network-fault targets to (listen, upstream)
 	// pairs; nil rejects network-category faults at decode time.
 	NetworkResolver wire.NetworkResolver
@@ -226,9 +230,29 @@ func ConnectManteion(ctx context.Context, c ConnectConfig) (*ManteionClient, err
 	cfg.instanceID = c.Core.instance
 	cfg.serviceVersion = c.ServiceVersion
 	cfg.routes = c.Routes
+	if c.Address != "" {
+		cfg.address = c.Address
+	}
 	cfg.targets = c.Core.targets(c.NetworkResolver)
 	if c.Logger != nil {
 		cfg.logger = c.Logger
 	}
 	return connectManteion(ctx, cfg)
+}
+
+// DefaultAdvertiseAddr is the address an out-of-process host registers
+// under: MANTEION_ADVERTISE_ADDR verbatim, else the first non-loopback IPv4
+// joined with the port of controlAddr (a bound "host:port"), so manteion's
+// fanout reaches the control surface without the pod manifest spelling
+// the port out (design §5.3; D1(b)).
+func DefaultAdvertiseAddr(controlAddr string) string {
+	if v := os.Getenv("MANTEION_ADVERTISE_ADDR"); v != "" {
+		return v
+	}
+	ip := localIPv4()
+	_, port, err := net.SplitHostPort(controlAddr)
+	if err != nil || port == "" || ip == "" {
+		return ip
+	}
+	return net.JoinHostPort(ip, port)
 }
