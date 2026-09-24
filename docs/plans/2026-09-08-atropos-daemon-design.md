@@ -611,8 +611,14 @@ rather than a per-connection dialer wrapper (§5.6 semantics kept: the app obser
 M2 done (`c239c60`..HEAD, plan `2026-09-24-atroposd-m2-transparent-capture.md`): transparent capture keeps
 `URL.Host` = the name the app dialed and dials the original destination through the transport (the
 ClusterIP must not enter the key); raw-TCP relays match toxic targets by resolving the target name;
-IPv6 original destinations and an app-uid capture probe are named follow-ups. VM1 preconditions remain
-unverified from this session (listed in `deploy/sidecar/README.md`).
+IPv6 original destinations and an app-uid capture probe are named follow-ups. M4 done (`9b7a9eb`..HEAD,
+plan `2026-09-24-atroposd-m4-node-agent.md`): the agent resolves a pod's container from containerd's OCI
+runtime specs and the host cgroupfs (no CRI client, no new dependencies); a fault's lifetime is the
+sidecar's streaming request rather than a heartbeat (the sidecar disconnecting stops the burn or
+restores the quota; the journal covers an agent crash; a burn child carries a parent-death signal);
+`quota` covers cpu and memory, not io/disk. M3 (manteion-go) is not started: until it lands, every
+instance receives every rule and relies on the per-rule capability skip. VM1 preconditions remain
+unverified from this session (listed in `deploy/sidecar/README.md` and `deploy/agent/README.md`).
 
 ---
 

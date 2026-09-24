@@ -72,7 +72,11 @@ whose schema per `(category, fault_type)` is defined by the exported
 `network` is required for (and exclusive to) the `network` category.
 Common `params` examples: inline latency `{"delay","jitter"}`; inline error
 `{"status_code","message"}` (defaults 500 / `"injected fault"`); inline hang
-`{"duration"}`; resource cpu `{"target_load","window"}`. See
+`{"duration"}`; resource cpu `{"target_load","window","mechanism"}`. On
+resource faults `mechanism` is `burn` (default: the stress code runs in the
+target's cgroup, via the node agent in sidecar mode) or `quota` (the node
+agent lowers the target cgroup's `cpu.max`/`memory.high` instead); the
+in-process host has no cgroup authority and rejects `quota` at decode. See
 `faultparams/params.go` for the full catalogue.
 
 ### /admin/cachebox

@@ -82,3 +82,22 @@ deploy/agent/{Dockerfile,daemonset.yaml,README.md}
 ## Self-review
 
 **Spec coverage (§5.14):** shape (DaemonSet, hostPID, cgroupfs, socket) — Task 4; mechanisms burn/quota with the `mechanism` param — Tasks 1–3; child placement before it starts, explicit CPU count — Task 2; quota restore on stop/restart/heartbeat loss — Tasks 2–3; local API and the own-pod peer check — Task 3; cgroup resolution — Task 2 (OCI specs + cgroupfs scan instead of a CRI client: same inputs, no gRPC dependency); telemetry via the sidecar's fault span and registry — Task 3 (`AgentFault` is a normal background fault); `disk` stays unadvertised. **Placeholder scan:** none. **Type consistency:** `ResourceHost`/`WithResourceHost` (Task 1) is what `ResourceFactory` (Task 3) returns and `Run` (Task 4) installs.
+
+## Execution notes (2026-09-24)
+
+- Commits: `24e9bc2` (Task 1), `04cc46c` (Tasks 2–3), Task 4 and the docs in the following commits.
+- No heartbeat endpoint: a fault lives exactly as long as the sidecar's streaming `POST /v1/faults`.
+  The sidecar cancelling (rule removed, fault stopped, sidecar gone) ends the burn or restores the
+  quota; there is no `Grace`/watchdog to tune. Agent crash: the journal restores quotas at the next
+  start and the burn child carries `Pdeathsig=SIGTERM` (Linux) so it ends with the agent.
+- `stressrun.go` was folded into `burn.go`: the child decodes through the exported
+  `instrument.DecodeResourceFault` and overrides `AvailableCPUs`/`AvailableBytes` from the config the
+  parent sends (the target cgroup's `cpu.max`/`memory.max`, falling back to `agent.HostCapacity`,
+  which reads `/proc/meminfo` and `runtime.NumCPU()` rather than the agent container's own cgroup).
+- `quota` is implemented for cpu (`cpu.max`) and memory (`memory.high`); `io.max` needs per-device
+  tuples and is rejected at the agent, as is `disk`. Ramps are not applied to a quota (step function).
+- Container resolution reads `<task root>/k8s.io/<id>/config.json` annotations for both upstream
+  containerd and k3s roots and scans the cgroup v2 hierarchy for `*<id>*`; unverified against VM1's
+  layout from this session (`deploy/agent/README.md` lists the checks).
+- The DaemonSet sets no resource limits on the agent container on purpose (an OOM kill would orphan
+  the journal until restart; burn children are charged to the target once placed).

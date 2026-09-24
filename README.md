@@ -48,7 +48,8 @@ A snapshot of what's shipped on `main`. For the research vision (cache-box primi
 | Cache-box on ingress + gRPC | Not yet implemented |
 | OPA-backed evaluator | Not yet implemented |
 | Out-of-process host — `atroposd` sidecar: explicit capture (per-dependency egress ports) and transparent capture (iptables REDIRECT + `SO_ORIGINAL_DST`, raw-TCP relay for non-HTTP dependencies), inline network toxics, eager arming, `host`/`capabilities` at registration, `ATROPOS_HOST=sidecar` passive guard, deploy assets under `deploy/sidecar/` | Shipped (M1, M2) |
-| Node agent for resource faults (cgroup placement), manteion capability filter, gRPC cache-box | Not yet implemented (M4, M3, deferred; see `docs/plans/2026-09-08-atropos-daemon-design.md`) |
+| Node agent for resource faults — `atropos-agent` DaemonSet: `burn` placed in the target container's cgroup, `quota` on its `cpu.max`/`memory.high` with a restore journal, own-pod peer check, deploy assets under `deploy/agent/` | Shipped (M4) |
+| manteion capability filter (M3), gRPC cache-box, thin-client hook API | Not yet implemented (M3 lives in manteion-go; the rest is deferred; see `docs/plans/2026-09-08-atropos-daemon-design.md`) |
 | Polyglot bindings (DeathStarBench target) | Superseded by `atroposd` (the 2026-04 sidecar plan is critiqued in the design doc above) |
 
 ## Architecture
@@ -340,9 +341,27 @@ execute are skipped per rule and counted in
 `deploy/sidecar/` holds the images, the init script and a kustomize patch
 for one boutique service.
 
-Not in this release: resource faults (delegated to the node agent, M4),
-the manteion-side capability filter (M3), gRPC and the thin-client hook
-API (deferred), IPv6 original destinations. Design and milestones:
+**Resource faults** never run in the sidecar: a per-node `atropos-agent`
+(privileged DaemonSet, `deploy/agent/`) runs them inside the *app
+container's* cgroup. When the agent's socket
+(`ATROPOSD_AGENT_SOCKET`, default `/var/run/atropos/agent.sock`) answers
+at sidecar start, the sidecar advertises `resource` and delegates every
+resource rule for `ATROPOSD_APP_CONTAINER` (default `server`) of its pod
+(`ATROPOS_POD_UID` from the downward API; the agent verifies the caller's
+pod from the socket peer regardless). Resource params gain
+`mechanism`: `burn` (default) re-executes the existing stress code as a
+child placed in the target cgroup before it starts, sized by the target's
+own limits, so semantics and ramps are the in-process ones; `quota`
+lowers the target's `cpu.max` (cpu) or `memory.high` (memory) by
+`target_load` of its capacity, journaled before it is written and restored
+on stop, when the sidecar disconnects, and at agent boot. The in-process
+host runs `burn` natively and rejects `quota` at decode (no cgroup
+authority). A fault lives as long as the sidecar's streaming request to
+the agent; its result lands on the sidecar's fault span as usual.
+
+Not in this release: the manteion-side capability filter (M3), gRPC and
+the thin-client hook API (deferred), IPv6 original destinations, `quota`
+for `io`/`disk`. Design and milestones:
 `docs/plans/2026-09-08-atropos-daemon-design.md`.
 
 ---
