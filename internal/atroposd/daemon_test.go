@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -240,5 +243,90 @@ func TestRun_RejectsBadConfig(t *testing.T) {
 	err := Run(context.Background(), Config{Service: "", Capture: "explicit"}, slog.New(slog.DiscardHandler))
 	if err == nil || !strings.Contains(err.Error(), "service is required") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestRun_TransparentRequiresCaptureMarker(t *testing.T) {
+	t.Setenv("MANTEION_URL", "")
+	err := Run(context.Background(), Config{
+		Service: "svc", Capture: CaptureTransparent, ControlListen: "127.0.0.1:0", EgressListen: "127.0.0.1:0",
+		CaptureMarker: filepath.Join(t.TempDir(), "capture.ok"), TracerProvider: noop.NewTracerProvider(),
+	}, slog.New(slog.DiscardHandler))
+	if err == nil {
+		t.Fatal("a transparent sidecar without the capture marker must not start")
+	}
+	if runtime.GOOS == "linux" && !strings.Contains(err.Error(), "marker") {
+		t.Fatalf("got %v, want the missing-marker error", err)
+	}
+	if runtime.GOOS != "linux" && !strings.Contains(err.Error(), "requires linux") {
+		t.Fatalf("got %v, want the platform error", err)
+	}
+}
+
+// TestRun_TransparentRecordThenReplay drives the sidecar in transparent
+// mode with an injected original destination: the app "dials"
+// productcatalogservice:3550 (its Host header), the redirect lands on the
+// sidecar, the recording is keyed on that name, and the replay set built
+// for the same client-side request serves the frozen call.
+func TestRun_TransparentRecordThenReplay(t *testing.T) {
+	var liveCalls atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		liveCalls.Add(1)
+		w.Write([]byte(`{"live":true}`))
+	}))
+	t.Cleanup(up.Close)
+	upstream := strings.TrimPrefix(up.URL, "http://")
+
+	addrs := runDaemon(t, Config{
+		Service: "frontend", Capture: CaptureTransparent, EgressListen: "127.0.0.1:0",
+		OriginalDst: func(net.Conn) (string, error) { return upstream, nil },
+	})
+	control := "http://" + addrs.Control
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	call := func() *http.Response {
+		req, _ := http.NewRequest("GET", "http://"+addrs.TransparentEgress+"/api/items", nil)
+		req.Host = "productcatalogservice:3550"
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return resp
+	}
+
+	if code, body := postJSON(t, control+"/admin/rules", cacheBoxRule("passthrough")); code != http.StatusNoContent {
+		t.Fatalf("install passthrough rule: code=%d body=%s", code, body)
+	}
+	if resp := call(); resp.StatusCode != 200 || resp.Header.Get("X-Atropos-Cache-Key") == "" {
+		t.Fatalf("passthrough: status=%d", resp.StatusCode)
+	}
+	if liveCalls.Load() != 1 {
+		t.Fatalf("live calls = %d", liveCalls.Load())
+	}
+
+	u, _ := url.Parse("http://productcatalogservice:3550/api/items")
+	key := cachebox.Derive(cachebox.KeyStrategyCanonicalV2, nil, &http.Request{Method: "GET", URL: u, Header: http.Header{}}, nil)
+	entry := &cachebox.Entry{Key: key, StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}},
+		Body: []byte(`{"replayed":true}`), ObservedLatency: time.Millisecond, RecordedAt: time.Now().UTC(),
+		ExperimentID: "exp-1", PhaseID: "phase-1", KeyStrategy: "canonical_v2", StrategyVersion: 2}
+	checksum := cachebox.SetChecksum([]*cachebox.Entry{entry})
+	postJSON(t, control+"/cachebox/preload/begin", `{"experiment_id":"exp-1","phase_id":"phase-1","source_phase_id":"phase-0","total_entries":1,"total_chunks":1,"key_strategy":"canonical_v2","strategy_version":2}`)
+	chunk, _ := json.Marshal(map[string]any{"experiment_id": "exp-1", "phase_id": "phase-1", "chunk_seq": 1, "entries": []wire.CacheBoxWireEntry{cachebox.EntryToWire(entry)}})
+	postJSON(t, control+"/cachebox/preload/chunk", string(chunk))
+	if code, body := postJSON(t, control+"/cachebox/preload/commit", fmt.Sprintf(`{"experiment_id":"exp-1","phase_id":"phase-1","total_entries":1,"checksum":%q}`, checksum)); code != 200 {
+		t.Fatalf("commit: code=%d body=%s", code, body)
+	}
+	if code, body := postJSON(t, control+"/admin/rules", cacheBoxRule("replay")); code != http.StatusNoContent {
+		t.Fatalf("install replay rule: code=%d body=%s", code, body)
+	}
+	if resp := call(); resp.StatusCode != 200 || resp.Header.Get("X-Atropos-Cache-Mode") != "replay" {
+		t.Fatalf("replay hit: status=%d mode=%q", resp.StatusCode, resp.Header.Get("X-Atropos-Cache-Mode"))
+	}
+	if liveCalls.Load() != 1 {
+		t.Fatalf("live calls under replay = %d, want 1", liveCalls.Load())
+	}
+	if code, body := getJSON(t, control+"/atropos/health"); code != 200 || !strings.Contains(body, `"capture":"transparent"`) || !strings.Contains(body, `"host":"sidecar"`) {
+		t.Fatalf("health: code=%d body=%s", code, body)
 	}
 }

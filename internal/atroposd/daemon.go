@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"runtime"
 	"time"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/instrument"
@@ -16,8 +18,28 @@ import (
 // Addrs are the bound addresses Run reports through Config.OnReady.
 type Addrs struct {
 	Control string
-	Ingress string   // "" when no ingress listener is configured
-	Egress  []string // Config.Egress order
+	Ingress string   // explicit ingress listener, "" when none
+	Egress  []string // explicit egress listeners, Config.Egress order
+
+	TransparentEgress  string // "" unless capture is transparent
+	TransparentIngress string // "" unless transparent with inbound ports
+}
+
+// checkCapture refuses to start a transparent sidecar whose redirect is not
+// in place (design §5.2, "no capture, no instance"): the init container
+// writes the marker after installing the iptables rules. A test hook for
+// the original-destination lookup stands in for the redirect.
+func checkCapture(cfg Config) error {
+	if cfg.Capture != CaptureTransparent || cfg.OriginalDst != nil {
+		return nil
+	}
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("transparent capture requires linux (SO_ORIGINAL_DST), running on %s", runtime.GOOS)
+	}
+	if _, err := os.Stat(cfg.CaptureMarker); err != nil {
+		return fmt.Errorf("transparent capture is not in place: marker %s: %w (the init container writes it after installing the iptables REDIRECT; refusing to register a half-instrumented pod)", cfg.CaptureMarker, err)
+	}
+	return nil
 }
 
 // Run hosts the instrument out of process until ctx is cancelled, then
@@ -38,6 +60,9 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	cfg.applyDefaults()
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("atroposd: config: %w", err)
+	}
+	if err := checkCapture(cfg); err != nil {
+		return fmt.Errorf("atroposd: %w", err)
 	}
 	instanceID := instrument.ResolveInstanceID(cfg.InstanceID, cfg.Service)
 
@@ -76,16 +101,27 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	}
 
 	pcfg := proxy.Config{
-		Service: cfg.Service,
-		Resolve: core.Interceptor,
-		Base:    &proxy.ToxicTransport{Table: table},
-		Logger:  logger,
+		Service:  cfg.Service,
+		Resolve:  core.Interceptor,
+		Base:     &proxy.ToxicTransport{Table: table},
+		Policies: table,
+		Logger:   logger,
 	}
-	for _, e := range cfg.Egress {
-		pcfg.Egress = append(pcfg.Egress, proxy.EgressListener{Listen: e.Listen, Upstream: e.Upstream})
-	}
-	if cfg.IngressListen != "" {
-		pcfg.Ingress = &proxy.IngressListener{Listen: cfg.IngressListen, Upstream: cfg.InboundUpstream}
+	switch cfg.Capture {
+	case CaptureTransparent:
+		pcfg.Base = &proxy.ToxicTransport{Table: table, Base: proxy.NewTransparentTransport()}
+		pcfg.OriginalDst = cfg.OriginalDst
+		pcfg.TransparentEgress = &proxy.TransparentEgress{Listen: cfg.EgressListen, RawTCPPorts: cfg.RawTCPPorts}
+		if len(cfg.InboundPorts) > 0 {
+			pcfg.TransparentIngress = &proxy.TransparentIngress{Listen: cfg.IngressListen, AppHost: cfg.AppHost, AllowedPorts: cfg.InboundPorts}
+		}
+	default:
+		for _, e := range cfg.Egress {
+			pcfg.Egress = append(pcfg.Egress, proxy.EgressListener{Listen: e.Listen, Upstream: e.Upstream})
+		}
+		if cfg.IngressListen != "" {
+			pcfg.Ingress = &proxy.IngressListener{Listen: cfg.IngressListen, Upstream: cfg.InboundUpstream}
+		}
 	}
 	p := proxy.New(pcfg)
 	if err := p.Start(ctx); err != nil {
@@ -127,10 +163,14 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 		}
 	}()
 
-	addrs := Addrs{Control: controlLn.Addr().String(), Ingress: p.IngressAddr(), Egress: p.EgressAddrs()}
+	addrs := Addrs{
+		Control: controlLn.Addr().String(), Ingress: p.IngressAddr(), Egress: p.EgressAddrs(),
+		TransparentEgress: p.TransparentEgressAddr(), TransparentIngress: p.TransparentIngressAddr(),
+	}
 	logger.Info("atroposd ready",
 		"service", cfg.Service, "instance", instanceID, "capture", cfg.Capture,
 		"control", addrs.Control, "ingress", addrs.Ingress, "egress", addrs.Egress,
+		"transparent_egress", addrs.TransparentEgress, "transparent_ingress", addrs.TransparentIngress,
 		"manteion", cfg.ManteionURL, "advertise", advertise)
 	if cfg.OnReady != nil {
 		cfg.OnReady(addrs)

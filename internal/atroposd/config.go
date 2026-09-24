@@ -9,8 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
+	"git.ucsc.edu/microfaults/atropos-go/internal/proxy"
 	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 
 	oteltrace "go.opentelemetry.io/otel/trace"
@@ -31,6 +33,10 @@ const (
 const (
 	DefaultControlListen   = ":16020"
 	DefaultInboundUpstream = "127.0.0.1:8080"
+	DefaultEgressListen    = ":16001"
+	DefaultIngressListen   = ":16006"
+	DefaultAppHost         = "127.0.0.1"
+	DefaultCaptureMarker   = "/var/run/atropos/capture.ok"
 )
 
 // EgressRoute is one explicit-mode egress listener.
@@ -61,12 +67,23 @@ type Config struct {
 	IngressListen   string        `yaml:"ingress_listen"` // "" disables the ingress listener
 	InboundUpstream string        `yaml:"inbound_upstream"`
 	Capture         string        `yaml:"capture"`
-	Egress          []EgressRoute `yaml:"egress"`
+	Egress          []EgressRoute `yaml:"egress"` // explicit mode
 	Routes          []RouteConfig `yaml:"routes"`
+
+	// Transparent mode (design §5.2): the init container REDIRECTs the
+	// app's outbound TCP to EgressListen and InboundPorts to IngressListen.
+	EgressListen  string `yaml:"egress_listen"`  // default ":16001"
+	InboundPorts  []int  `yaml:"inbound_ports"`  // app ports captured at ingress; empty = none
+	RawTCPPorts   []int  `yaml:"raw_tcp_ports"`  // non-HTTP dependencies relayed at L4
+	AppHost       string `yaml:"app_host"`       // where the app listens; default 127.0.0.1
+	CaptureMarker string `yaml:"capture_marker"` // written by the init container; default /var/run/atropos/capture.ok
 
 	// TracerProvider, if set, replaces the OTLP exporter (tests, or hosts
 	// that own their OTel setup).
 	TracerProvider oteltrace.TracerProvider `yaml:"-"`
+	// OriginalDst overrides the original-destination lookup (tests). When
+	// set, the capture marker is not required.
+	OriginalDst proxy.OriginalDstFunc `yaml:"-"`
 	// OnReady is called once every listener is bound and the control plane
 	// is connected, with the bound addresses.
 	OnReady func(Addrs) `yaml:"-"`
@@ -112,6 +129,15 @@ func (c *Config) overlayEnv() {
 	set(&c.IngressListen, "ATROPOSD_INGRESS_ADDR")
 	set(&c.InboundUpstream, "ATROPOSD_INBOUND_UPSTREAM")
 	set(&c.Capture, "ATROPOSD_CAPTURE")
+	set(&c.EgressListen, "ATROPOSD_EGRESS_ADDR")
+	set(&c.AppHost, "ATROPOSD_APP_HOST")
+	set(&c.CaptureMarker, "ATROPOSD_CAPTURE_MARKER")
+	if v := os.Getenv("ATROPOSD_INBOUND_PORTS"); v != "" {
+		c.InboundPorts = parsePorts(v)
+	}
+	if v := os.Getenv("ATROPOSD_RAW_TCP_PORTS"); v != "" {
+		c.RawTCPPorts = parsePorts(v)
+	}
 	if v := os.Getenv("ATROPOSD_EGRESS"); v != "" {
 		c.Egress = nil
 		for _, item := range strings.Split(v, ",") {
@@ -125,6 +151,24 @@ func (c *Config) overlayEnv() {
 	}
 }
 
+// parsePorts parses a comma-separated port list; junk entries become -1 so
+// Validate reports them.
+func parsePorts(v string) []int {
+	var out []int
+	for _, item := range strings.Split(v, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		p, err := strconv.Atoi(item)
+		if err != nil {
+			p = -1
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
 func (c *Config) applyDefaults() {
 	if c.ControlListen == "" {
 		c.ControlListen = DefaultControlListen
@@ -134,6 +178,20 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Capture == "" {
 		c.Capture = CaptureExplicit
+	}
+	if c.Capture == CaptureTransparent {
+		if c.EgressListen == "" {
+			c.EgressListen = DefaultEgressListen
+		}
+		if len(c.InboundPorts) > 0 && c.IngressListen == "" {
+			c.IngressListen = DefaultIngressListen
+		}
+		if c.AppHost == "" {
+			c.AppHost = DefaultAppHost
+		}
+		if c.CaptureMarker == "" {
+			c.CaptureMarker = DefaultCaptureMarker
+		}
 	}
 }
 
@@ -154,7 +212,14 @@ func (c Config) Validate() error {
 			}
 		}
 	case CaptureTransparent:
-		errs = append(errs, errors.New("transparent capture is not available yet (M2); use capture: explicit"))
+		if c.EgressListen == "" {
+			errs = append(errs, errors.New("transparent capture needs egress_listen"))
+		}
+		for _, p := range append(append([]int(nil), c.InboundPorts...), c.RawTCPPorts...) {
+			if p <= 0 || p > 65535 {
+				errs = append(errs, fmt.Errorf("port %d is not a valid TCP port", p))
+			}
+		}
 	default:
 		errs = append(errs, fmt.Errorf("unknown capture mode %q (explicit|transparent)", c.Capture))
 	}

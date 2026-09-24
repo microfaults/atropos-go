@@ -82,9 +82,9 @@ func TestValidate_ReportsEveryProblem(t *testing.T) {
 	}
 
 	cfg.Service = "svc"
-	cfg.Capture = CaptureTransparent
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "M2") {
-		t.Fatalf("transparent capture must be rejected until M2, got %v", err)
+	cfg.Capture = CaptureTransparent // set after Load: no egress_listen default applied
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "egress_listen") {
+		t.Fatalf("transparent capture without egress_listen must be rejected, got %v", err)
 	}
 	cfg.Capture = "magic"
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "unknown capture mode") {
@@ -94,5 +94,31 @@ func TestValidate_ReportsEveryProblem(t *testing.T) {
 	cfg.Egress = []EgressRoute{{Listen: ":1"}}
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "egress[0]") {
 		t.Fatalf("half-specified egress must be rejected, got %v", err)
+	}
+}
+
+func TestLoad_TransparentDefaultsAndPortLists(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("ATROPOS_SERVICE", "cartservice")
+	t.Setenv("ATROPOSD_CAPTURE", "transparent")
+	t.Setenv("ATROPOSD_INBOUND_PORTS", "7070")
+	t.Setenv("ATROPOSD_RAW_TCP_PORTS", "6379, 9092")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.EgressListen != DefaultEgressListen || cfg.IngressListen != DefaultIngressListen || cfg.AppHost != DefaultAppHost || cfg.CaptureMarker != DefaultCaptureMarker {
+		t.Fatalf("transparent defaults not applied: %+v", cfg)
+	}
+	if len(cfg.InboundPorts) != 1 || cfg.InboundPorts[0] != 7070 || len(cfg.RawTCPPorts) != 2 || cfg.RawTCPPorts[1] != 9092 {
+		t.Fatalf("ports = %v / %v", cfg.InboundPorts, cfg.RawTCPPorts)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	t.Setenv("ATROPOSD_RAW_TCP_PORTS", "redis")
+	cfg, _ = Load("")
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "not a valid TCP port") {
+		t.Fatalf("junk port list must be rejected, got %v", err)
 	}
 }
