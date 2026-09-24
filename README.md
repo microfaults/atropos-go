@@ -47,7 +47,9 @@ A snapshot of what's shipped on `main`. For the research vision (cache-box primi
 | Prometheus metrics for HTTP ingress/egress + cache-box | Shipped |
 | Cache-box on ingress + gRPC | Not yet implemented |
 | OPA-backed evaluator | Not yet implemented |
-| Polyglot bindings (DeathStarBench target) | Design only (branch `chore/polyglot-bindings`) |
+| Out-of-process host — `atroposd` sidecar, explicit capture mode (per-dependency egress ports, optional ingress port), inline network toxics, eager arming | Shipped (M1) |
+| Transparent capture (iptables), node agent for resource faults, gRPC cache-box | Not yet implemented (M2, M4, deferred; see `docs/plans/2026-09-08-atropos-daemon-design.md`) |
+| Polyglot bindings (DeathStarBench target) | Superseded by `atroposd` (the 2026-04 sidecar plan is critiqued in the design doc above) |
 
 ## Architecture
 
@@ -269,6 +271,61 @@ Cache-box covers **egress HTTP only**. Ingress and gRPC are tracked in Ongoing D
 `http_server_requests_total`, `http_server_request_duration_seconds`,
 `http_client_requests_total`, `http_client_request_duration_seconds`, the
 cache-box hit/miss/record counters, and `atropos_fault_injections_total`.
+
+### 7. atroposd: the out-of-process host
+
+`atroposd` hosts the same instrument core as `Serve`, one sidecar per pod,
+for services that cannot embed the Go SDK (or a Go service you want to
+measure without touching its code). It registers with manteion as one SDK
+instance, mounts the control surface above on its own port (`:16020`), and
+puts two listeners around the app:
+
+- **egress** (explicit capture mode): the app dials the sidecar's port
+  instead of its dependency; the sidecar rewrites `Host` to the real
+  upstream and forwards through the exact `EgressTransport` composition, so
+  cache keys, `X-Atropos-*` headers, fail-closed replay and metrics are the
+  ones the in-process host produces (a golden test pins key identity);
+- **ingress** (optional): callers reach the sidecar's port; it wraps a
+  reverse proxy to the app in the ingress composition and hands the app a
+  `traceparent` under its own server span.
+
+```bash
+ATROPOS_SERVICE=recommendationservice \
+MANTEION_URL=http://manteion:8080 \
+ATROPOSD_EGRESS=":19090=productcatalogservice:3550" \
+atroposd                                   # or: atroposd -config /etc/atropos/atroposd.yaml
+# the app then uses PRODUCT_CATALOG_SERVICE_ADDR=127.0.0.1:19090
+```
+
+YAML form (`-config`; the environment overrides it):
+
+```yaml
+service: recommendationservice
+manteion_url: http://manteion:8080
+control_listen: ":16020"
+egress:
+  - listen: ":19090"
+    upstream: productcatalogservice:3550
+ingress_listen: ":16006"          # optional
+inbound_upstream: 127.0.0.1:8080
+routes:
+  - {method: GET, path: /recommendations}
+```
+
+Two behaviours are sidecar-only: network faults with `network.host: inline`
+run as **armed policies** on the sidecar's upstream calls (stream toxics
+shape request or response bytes; `rst` and `blackhole` are reproduced on
+the app-facing connection, so the app sees a reset or a hang, not a 502),
+and background faults **arm when their rule applies** rather than on the
+first matching request. The in-process host keeps rejecting `host: inline`
+and arming lazily. Proxy overhead per request (total minus upstream) is
+exported as `atropos_proxy_overhead_seconds{point}` for the G-proxy gate.
+
+Not in this release: transparent capture (iptables redirect, M2), the
+`ATROPOS_HOST=sidecar` guard that makes an embedded `Serve` passive next to
+a sidecar (M2), resource faults (delegated to the node agent, M4), gRPC and
+the thin-client hook API (deferred). Design and milestones:
+`docs/plans/2026-09-08-atropos-daemon-design.md`.
 
 ---
 

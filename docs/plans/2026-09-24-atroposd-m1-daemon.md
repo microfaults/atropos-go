@@ -351,3 +351,23 @@ Also register-time: `ConnectConfig` gains `Address` so the daemon can advertise 
 **Placeholder scan:** none.
 
 **Type consistency:** `instrument.EgressTransport(base, resolve)` and `IngressMiddleware(next, service, ic)` (Task 1) are what Tasks 3–4 call; `PolicyTable`/`Policy`/`PolicyFault`/`InlineToxicFactory`/`ToxicTransport`/`HijackError` (Task 5) are what Task 6's `Run` wires; `CoreConfig.EagerArm`/`DecodeOptions` (Task 5) are what `Run` sets.
+
+---
+
+## Execution notes (2026-09-24)
+
+- Commits: `39ac174` (Task 1), `8419e57` (Task 2), `985bfc7` (Tasks 3–4), `db477ea` (Task 5), `97aaf88`
+  (Task 6), docs in the following commit.
+- Task 3 surfaced a key-identity hazard the golden test caught by construction: Go's transport adds
+  `Accept-Encoding: gzip` on the wire, which canonical_v2 folds into the key at the sidecar but never
+  in-process. The egress rewrite drops exactly that auto-added value (§5.2 note in code).
+- Task 3 also surfaced a shared-transport gap: otelhttp takes the tracer provider of the span in the
+  context, and an extracted remote span resolves to the no-op provider, so no child span was minted
+  and the caller's span id was re-emitted. `instrument.EgressTransport` now pins the global provider.
+- Task 5 changed the toxic mechanism from the planned dialer wrapper to a request-level
+  `ToxicTransport` (stream toxics through `Pipe` on request/response bodies; rst and blackhole as
+  `HijackError` reproduced on the client connection). Scope is therefore per request, which is what
+  the wire format documents for `host=inline`. Direction defaults to downstream for inline toxics.
+- The daemon config uses an `egress:` list (`listen`/`upstream`) instead of the planned port map so
+  bind addresses are explicit and tests can use `:0`; `ATROPOSD_EGRESS` carries `listen=upstream`
+  pairs.

@@ -602,6 +602,13 @@ it learns it.
 M1 before M2 is deliberate: explicit mode needs no cluster privileges, so the proxy's correctness (keys,
 fail-closed, preload, drain) is validated before iptables enters the picture.
 
+**Status (2026-09-24, branch `feat/atroposd`):** M0 done (`86c40a9`..`220b48d`, plan
+`2026-09-24-atroposd-m0-core-extraction.md`); M1 done (`39ac174`..`97aaf88`, plan
+`2026-09-24-atroposd-m1-daemon.md`). Two findings changed the M1 shape: the inline `error` fault had never
+short-circuited a response in either host (fixed in the shared middleware), and network toxics for
+`host=inline` landed as a request-level `ToxicTransport` with hijack-based client-leg reproduction
+rather than a per-connection dialer wrapper (§5.6 semantics kept: the app observes a reset or a hang).
+
 ---
 
 ## 7. Decisions (taken 2026-09-24)

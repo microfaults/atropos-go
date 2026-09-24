@@ -136,3 +136,15 @@ and the fidelity endpoint alike.
 - The `host=inline` path on network faults (per-request response shaping via RoundTripper) is recognized by the wire format but rejected with a v6 deferral error until `ToxicTransport` is implemented.
 - Composition rules are rejected on decode with a v6 deferral error — the SDK has no composition evaluator yet (parallel/sequential fault dispatch with direction inheritance is future work).
 - `DecodeCompiledRules` sorts decoded rules by `Priority` descending (higher = evaluated first). Equal-priority rules preserve input order.
+
+## atroposd (sidecar host)
+
+`cmd/atroposd` hosts the same core out of process (`internal/atroposd`,
+`internal/proxy`). It mounts the admin endpoints above on its own control
+port (`ATROPOSD_CONTROL_ADDR`, default `:16020`) and registers under
+`ATROPOS_SERVICE`; explicit capture mode takes `ATROPOSD_EGRESS` as
+comma-separated `listen=upstream` pairs and an optional
+`ATROPOSD_INGRESS_ADDR`/`ATROPOSD_INBOUND_UPSTREAM`. Sidecar-only
+behaviours: `network.host: inline` faults become armed proxy policies
+(`internal/proxy.PolicyTable`), and background faults arm when their rule
+applies (`CoreConfig.EagerArm`).
