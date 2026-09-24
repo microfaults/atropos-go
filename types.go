@@ -1,27 +1,68 @@
-// types.go declares the wire-shape aliases shared with manteion. Everything
-// here is either decoded from / encoded to one of the SDK's HTTP endpoints
-// or embedded in the manteion sync protocol — the shapes are pinned by the
-// cross-repo wire contract (wire_compat_test.go, wire_fidelity_test.go) and
-// must not drift. Host-side wiring types live behind Serve.
+// types.go re-exports, as transparent type aliases, every wire shape the
+// root package has always exported. Declarations live in internal/wire
+// (and internal/cachebox, internal/evaluator, internal/interceptor); the
+// names, fields and json tags here are pinned by the cross-repo wire tests
+// and must not drift: manteion imports them as atroposdk.X.
 package atropos
 
 import (
-	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
-	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
+	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
+
+// Interceptor ties the evaluator, fault execution, and OTel together. It is
+// exported only as the currency between DefaultInterceptor and the grpc
+// subpackage's interceptor constructors.
+type Interceptor = interceptor.Interceptor
 
 // NetworkResolver resolves a target into listen and upstream addresses for
 // network fault proxies. Supplied via Config.NetworkResolver.
-type NetworkResolver func(target string) (listen, upstream string, err error)
+type NetworkResolver = wire.NetworkResolver
 
-// StaticRule is the JSON shape GET /admin/rules serves (one element per
-// installed rule). Manteion's SDK client decodes into it.
-type StaticRule = evaluator.StaticRule
+// Faults and rules.
+type (
+	FaultRequest              = wire.FaultRequest
+	FaultStatus               = wire.FaultStatus
+	NetworkEnvelope           = wire.NetworkEnvelope
+	CompiledRule              = wire.CompiledRule
+	CompiledCacheBox          = wire.CompiledCacheBox
+	CompiledFault             = wire.CompiledFault
+	CompiledComposition       = wire.CompiledComposition
+	CompiledCompositionMember = wire.CompiledCompositionMember
+	RuleSync                  = wire.RuleSync
+	StaticRule                = wire.StaticRule
+)
 
-// CacheBoxWireEntry is the JSON-serializable transfer format for cache
-// entries. Used for all SDK <-> manteion communication (ingest and preload).
-type CacheBoxWireEntry = cachebox.WireEntry
+// Registration.
+type (
+	RegisterRequest  = wire.RegisterRequest
+	RegisterResponse = wire.RegisterResponse
+	Route            = wire.Route
+)
 
-// CacheBoxStats is the GET /admin/cachebox response: combined store,
-// recorder, and record-buffer counters.
-type CacheBoxStats = cachebox.Stats
+// Cache-box control, preload (W4/W5), drain (W3), fidelity (W6).
+type (
+	CacheBoxContext       = wire.CacheBoxContext
+	CacheBoxWireEntry     = wire.CacheBoxWireEntry
+	CacheBoxStats         = wire.CacheBoxStats
+	DelayRequest          = wire.DelayRequest
+	DrainReport           = wire.DrainReport
+	DrainReportResponse   = wire.DrainReportResponse
+	PreloadBeginRequest   = wire.PreloadBeginRequest
+	PreloadBeginResponse  = wire.PreloadBeginResponse
+	PreloadChunkRequest   = wire.PreloadChunkRequest
+	PreloadChunkResponse  = wire.PreloadChunkResponse
+	PreloadCommitRequest  = wire.PreloadCommitRequest
+	PreloadCommitResponse = wire.PreloadCommitResponse
+	PreloadAbortRequest   = wire.PreloadAbortRequest
+	FidelityMissReasons   = wire.FidelityMissReasons
+	FidelityReplayAge     = wire.FidelityReplayAge
+	FidelityPreloadState  = wire.FidelityPreloadState
+	FidelitySnapshot      = wire.FidelitySnapshot
+)
+
+// Health and errors.
+type (
+	HealthStatus  = wire.HealthStatus
+	ErrorResponse = wire.ErrorResponse
+)

@@ -1,4 +1,4 @@
-package atropos
+package wire
 
 import (
 	"time"
@@ -13,9 +13,29 @@ import (
 //   - the freeze command body (DelayRequest.Context)
 //   - a preload begin request (PreloadBeginRequest, flattened)
 //
-// The type itself lives in internal/cachebox (see that package for why);
-// this is a transparent alias so the wire shape here is unchanged.
+// The type itself lives in internal/cachebox (so the evaluator and the
+// interceptor can reference it without an import cycle); this is a
+// transparent alias so the wire shape is unchanged.
 type CacheBoxContext = cachebox.CacheBoxContext
+
+// CacheBoxWireEntry is the JSON-serializable transfer format for cache
+// entries. Used for all SDK <-> manteion communication (ingest and preload).
+type CacheBoxWireEntry = cachebox.WireEntry
+
+// CacheBoxStats is the GET /admin/cachebox response: combined store,
+// recorder, and record-buffer counters.
+type CacheBoxStats = cachebox.Stats
+
+// DelayRequest is the JSON body for POST /admin/cachebox/delay -- the freeze
+// command manteion sends at freezeServices time. Context, when present,
+// carries the (experiment_id, phase_id, key_strategy, ...) that authorizes
+// and scopes the freeze (wire spec §W1).
+type DelayRequest struct {
+	Mu      float64          `json:"mu"`
+	Sigma   float64          `json:"sigma"`
+	Seed    uint64           `json:"seed"`
+	Context *CacheBoxContext `json:"context,omitempty"`
+}
 
 // DrainReport (wire spec §W3) is the SDK's POST body to
 // /api/v1/sdk/cachebox/drain at recording-phase end, confirming every

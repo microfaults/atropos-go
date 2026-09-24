@@ -13,29 +13,6 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 )
 
-// RegisterRequest is the POST body for /api/v1/sdk/register.
-type RegisterRequest struct {
-	ID             string `json:"id"`
-	Service        string `json:"service"`
-	Version        string `json:"version,omitempty"`
-	Address        string `json:"address"`
-	PollIntervalMs int64  `json:"poll_interval_ms,omitempty"` // SDK's poll cadence; manteion uses it for liveness detection
-	// Routes is the HTTP route inventory for manteion's workflow-builder
-	// catalog. Optional — gRPC services register without routes.
-	// ManteionClient fills this from RegisterRoutes; direct Register callers
-	// may set it themselves.
-	Routes []Route `json:"routes,omitempty"`
-}
-
-// RegisterResponse is the JSON manteion returns from /api/v1/sdk/register:
-// a status string plus the same RuleSync desired-state payload the poll
-// endpoint serves, so the SDK converges before its first poll — e.g. during
-// a rolling deploy while an experiment is in progress.
-type RegisterResponse struct {
-	Status string `json:"status"`
-	RuleSync
-}
-
 // registerTimeout is the default per-call deadline for Register.
 const registerTimeout = 5 * time.Second
 
@@ -156,7 +133,7 @@ func apply(resp RegisterResponse, targets applyTargets) error {
 		for _, req := range resp.ActiveFaults {
 			id := req.ID
 			if id == "" {
-				id = req.effectiveCategory()
+				id = req.EffectiveCategory()
 			}
 			activeIDs[id] = true
 		}
@@ -175,7 +152,7 @@ func apply(resp RegisterResponse, targets applyTargets) error {
 		for _, req := range resp.ActiveFaults {
 			id := req.ID
 			if id == "" {
-				id = req.effectiveCategory()
+				id = req.EffectiveCategory()
 			}
 			if err := applyActiveFault(req, targets.DemoEval, targets.NetworkResolver); err != nil {
 				return fmt.Errorf("apply active_faults[%s]: %w", id, err)
@@ -211,13 +188,13 @@ func applyActiveFault(req FaultRequest, eval *demoEvaluator, resolve NetworkReso
 	}
 
 	mode := evaluator.Inline
-	if req.effectiveCategory() != "inline" {
+	if req.EffectiveCategory() != "inline" {
 		mode = evaluator.Background
 	}
 
 	id := req.ID
 	if id == "" {
-		id = req.effectiveCategory()
+		id = req.EffectiveCategory()
 	}
 	eval.Set(&evaluator.Decision{
 		Name:   id,

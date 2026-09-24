@@ -19,85 +19,6 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault/resource/memory"
 )
 
-// CompiledRule is the wire format received from manteion's poll/register
-// endpoints. Manteion resolves FaultSpec references and inlines config;
-// the SDK decodes and constructs evaluator rules locally.
-//
-// Exactly one of Fault, Composition, or CacheBox must be set.
-type CompiledRule struct {
-	Name           string               `json:"name"`
-	InjectionPoint string               `json:"injection_point,omitempty"`
-	Labels         map[string]string    `json:"labels,omitempty"`
-	Mode           string               `json:"mode"`
-	Priority       int                  `json:"priority"`
-	StartPolicy    string               `json:"start_policy,omitempty"`
-	Fault          *CompiledFault       `json:"fault,omitempty"`
-	Composition    *CompiledComposition `json:"composition,omitempty"`
-	CacheBox       *CompiledCacheBox    `json:"cachebox,omitempty"`
-}
-
-// CompiledCacheBox is a resolved cache-box action for a rule.
-//
-// KeyStrategy is the legacy, construction-time-only strategy hint and is
-// kept for backward compatibility. Context, when present, is authoritative
-// end-to-end (design doc Q3): its own KeyStrategy/StrategyVersion/KeyHeaders
-// take precedence over the sibling KeyStrategy field above.
-type CompiledCacheBox struct {
-	Mode        string           `json:"mode"`         // "passthrough" | "replay" | "replay_with_delay"
-	KeyStrategy string           `json:"key_strategy"` // "exact" | "exact_with_host" | "exact_with_body"
-	Context     *CacheBoxContext `json:"context,omitempty"`
-}
-
-// CompiledFault is a resolved fault spec on the wire. It is the same struct
-// as FaultRequest (admin.go) — the platform's single fault wire shape — with
-// ID simply unused in the compiled-rule context (manteion inlines specs, so
-// rule-attached faults need no slot identity).
-type CompiledFault = FaultRequest
-
-// NetworkEnvelope is the network-category-only envelope. It separates the
-// "where does the toxic live and to which traffic does it apply" question
-// from the toxic-specific params (delay, rate, etc.).
-type NetworkEnvelope struct {
-	// Host selects where the toxic runs.
-	//   "proxy"  → TCP proxy sidecar (current behaviour; requires NetworkResolver)
-	//   "inline" → in-process RoundTripper wrapping response.Body (not yet supported)
-	Host string `json:"host"`
-
-	// Target is the logical name of the upstream service, resolved by
-	// NetworkResolver into a (listen, upstream) address pair.
-	// Required when Host=="proxy"; ignored when Host=="inline".
-	Target string `json:"target,omitempty"`
-
-	// Direction selects which half of a proxied connection to apply the
-	// toxic to. Required when Host=="proxy". For Host=="inline" only
-	// "downstream" (response body) is meaningful.
-	Direction string `json:"direction,omitempty"`
-
-	// Scope is the fraction of connections (proxy) or requests (inline)
-	// to which the toxic applies. Zero means 1.0 (all).
-	Scope float64 `json:"scope,omitempty"`
-}
-
-// CompiledComposition is a resolved FaultComposition tree with all specs
-// inlined. Composition execution is not yet supported by the SDK evaluator
-// (deferred to v6); decodeCompiledRule errors if a rule references one.
-type CompiledComposition struct {
-	Name          string                      `json:"name"`
-	ExecutionMode string                      `json:"execution_mode"`
-	DurationMs    int64                       `json:"duration_ms,omitempty"`
-	RampUpMs      int64                       `json:"ramp_up_ms,omitempty"`
-	RampDownMs    int64                       `json:"ramp_down_ms,omitempty"`
-	Members       []CompiledCompositionMember `json:"members"`
-}
-
-// CompiledCompositionMember is a resolved member — either a leaf fault or a
-// nested composition.
-type CompiledCompositionMember struct {
-	Direction   string               `json:"direction,omitempty"`
-	Fault       *CompiledFault       `json:"fault,omitempty"`
-	Composition *CompiledComposition `json:"composition,omitempty"`
-}
-
 type decodeConfig struct {
 	resolve NetworkResolver
 }
@@ -231,11 +152,11 @@ func decodeFault(f *CompiledFault, cfg *decodeConfig) (fault.Fault, error) {
 	}
 
 	// Cross-category envelope checks.
-	if f.Network != nil && f.effectiveCategory() != "network" {
-		return nil, fmt.Errorf("category %q must not carry a network envelope", f.effectiveCategory())
+	if f.Network != nil && f.EffectiveCategory() != "network" {
+		return nil, fmt.Errorf("category %q must not carry a network envelope", f.EffectiveCategory())
 	}
 
-	switch f.effectiveCategory() {
+	switch f.EffectiveCategory() {
 	case "inline":
 		return decodeInlineFault(f.FaultType, params, baseCfg)
 	case "network":

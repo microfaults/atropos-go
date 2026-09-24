@@ -53,11 +53,6 @@ func currentInterceptor() *interceptor.Interceptor {
 	return defaultInterceptor.Load()
 }
 
-// Interceptor ties the evaluator, fault execution, and OTel together. It is
-// exported only as the currency between DefaultInterceptor and the grpc
-// subpackage's interceptor constructors.
-type Interceptor = interceptor.Interceptor
-
 // DefaultInterceptor returns the package-level interceptor installed by
 // Serve (or the tracing-only baseline before Serve runs). It exists for the
 // grpc subpackage's constructors, which take one explicitly:

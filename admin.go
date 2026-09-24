@@ -42,7 +42,7 @@ func (d *demoEvaluator) Evaluate(_ context.Context, _ evaluator.Request) *evalua
 	for _, cat := range []string{"inline", "network", "resource"} {
 		for _, id := range ids {
 			slot := d.slots[id]
-			if slot.req.effectiveCategory() == cat && slot.decision != nil {
+			if slot.req.EffectiveCategory() == cat && slot.decision != nil {
 				return slot.decision
 			}
 		}
@@ -71,7 +71,7 @@ func (d *demoEvaluator) Set(decision *evaluator.Decision, req *FaultRequest) {
 
 	id := req.ID
 	if id == "" {
-		id = req.effectiveCategory()
+		id = req.EffectiveCategory()
 	}
 
 	d.slots[id] = &faultSlot{
@@ -137,50 +137,12 @@ func (d *demoEvaluator) Active() []*FaultRequest {
 	for _, cat := range []string{"inline", "network", "resource"} {
 		for _, id := range ids {
 			slot := d.slots[id]
-			if slot.req != nil && slot.req.effectiveCategory() == cat {
+			if slot.req != nil && slot.req.EffectiveCategory() == cat {
 				out = append(out, slot.req)
 			}
 		}
 	}
 	return out
-}
-
-// FaultRequest is the platform's single fault wire shape, shared by the
-// admin endpoint (POST /admin/fault), manteion's active_faults set, and —
-// via the CompiledFault alias — the fault carried inside a CompiledRule.
-//
-// The category determines which sibling field is populated:
-//   - "inline"   → Params holds the type-specific params; no envelope.
-//   - "network"  → Network envelope holds host/target/direction/scope;
-//     Params holds the toxic-specific params.
-//   - "resource" → Params holds the type-specific params; no envelope.
-//
-// Network is forbidden for non-network categories and required for network.
-// Params shapes are the exported faultparams.* structs (one per
-// (category, fault_type) pair); absent params decode as all-defaults.
-type FaultRequest struct {
-	ID         string `json:"id,omitempty"` // slot identity (service+category:type); unused on compiled rules
-	Category   string `json:"category"`     // "inline" (default), "network", "resource"
-	FaultType  string `json:"fault_type"`   // fault type within category
-	DurationMs int64  `json:"duration_ms,omitempty"`
-	RampUpMs   int64  `json:"ramp_up_ms,omitempty"`
-	RampDownMs int64  `json:"ramp_down_ms,omitempty"`
-
-	Network *NetworkEnvelope `json:"network,omitempty"`
-	Params  json.RawMessage  `json:"params,omitempty"`
-}
-
-func (r *FaultRequest) effectiveCategory() string {
-	if r.Category == "" {
-		return "inline"
-	}
-	return r.Category
-}
-
-// FaultStatus is the JSON response for GET /admin/fault.
-type FaultStatus struct {
-	Active bool            `json:"active"`
-	Faults []*FaultRequest `json:"faults,omitempty"` // matches new plan shape {"faults": [...]}
 }
 
 // faultAdminHandler serves the /admin/fault endpoint against the demo
@@ -246,7 +208,7 @@ func handleFaultPost(w http.ResponseWriter, r *http.Request, eval *demoEvaluator
 	}
 
 	mode := evaluator.Inline
-	if req.effectiveCategory() != "inline" {
+	if req.EffectiveCategory() != "inline" {
 		mode = evaluator.Background
 	}
 
@@ -254,7 +216,7 @@ func handleFaultPost(w http.ResponseWriter, r *http.Request, eval *demoEvaluator
 	// fault through the registry under the same name (see applyActiveFault).
 	id := req.ID
 	if id == "" {
-		id = req.effectiveCategory()
+		id = req.EffectiveCategory()
 	}
 	decision := &evaluator.Decision{
 		Name:   id,
