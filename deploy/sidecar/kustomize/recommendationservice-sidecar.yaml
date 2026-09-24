@@ -1,0 +1,91 @@
+# Strategic-merge patch: run recommendationservice behind the atroposd
+# sidecar with transparent capture. Reference in an overlay:
+#
+#   # kustomization.yaml
+#   resources: [../../base]          # the service-beds manifests
+#   patches:
+#     - path: recommendationservice-sidecar.yaml
+#
+# What it adds: the init container (NET_ADMIN) that installs the REDIRECT
+# and writes the capture marker; the atroposd container (uid 1337) that
+# registers with manteion as this pod's SDK instance; a shared emptyDir for
+# the marker; and ATROPOS_HOST=sidecar on the app so its embedded Serve
+# stays passive (one instrument per pod). Scrape atropos metrics from the
+# sidecar's :16020; the app's own port serves only business traffic.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: recommendationservice
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: atropos-init
+          image: atropos-init:dev
+          securityContext:
+            runAsUser: 0
+            capabilities:
+              add: ["NET_ADMIN"]
+          env:
+            - name: ATROPOSD_INBOUND_PORTS
+              value: "8080"
+            - name: ATROPOSD_EXCLUDE_OUTBOUND_PORTS
+              value: "4317,4318"
+          volumeMounts:
+            - name: atropos-run
+              mountPath: /var/run/atropos
+      containers:
+        - name: server
+          env:
+            - name: ATROPOS_HOST
+              value: sidecar
+        - name: atroposd
+          image: atroposd:dev
+          securityContext:
+            runAsUser: 1337
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          env:
+            - name: ATROPOS_SERVICE
+              value: recommendationservice
+            - name: MANTEION_URL
+              value: http://manteion:8080
+            - name: MANTEION_SERVICE_VERSION
+              value: "1.0.0"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: MANTEION_ADVERTISE_ADDR
+              value: "$(POD_IP):16020"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: otel-collector:4317
+            - name: ATROPOSD_CAPTURE
+              value: transparent
+            - name: ATROPOSD_INBOUND_PORTS
+              value: "8080"
+            # Non-HTTP dependencies relayed at L4 (redis for cartservice,
+            # kafka for checkoutservice); none for recommendationservice.
+            - name: ATROPOSD_RAW_TCP_PORTS
+              value: ""
+          ports:
+            - containerPort: 16020
+              name: atropos
+          readinessProbe:
+            httpGet:
+              path: /atropos/health
+              port: 16020
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          volumeMounts:
+            - name: atropos-run
+              mountPath: /var/run/atropos
+      volumes:
+        - name: atropos-run
+          emptyDir: {}
