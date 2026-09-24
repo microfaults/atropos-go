@@ -36,6 +36,14 @@ type CoreConfig struct {
 	// instead of on the first matching request. The sidecar sets it: a
 	// network toxic must be in force from the moment the rule lands.
 	EagerArm bool
+	// Host names the instrument host ("in-process" | "sidecar"); it is
+	// advertised at registration and stamped on health.
+	Host string
+	// Capabilities lists the fault categories this host executes. It is
+	// advertised at registration and enforced at decode: rules outside it
+	// are skipped per rule and counted. Nil advertises nothing and enforces
+	// nothing (every category decodes).
+	Capabilities []string
 }
 
 // Core is the instrument: one shared fidelity registry, the cache-box and
@@ -58,8 +66,10 @@ type Core struct {
 	drain    *cacheDrainTracker // nil when offline
 	logger   *slog.Logger
 
-	decodeOpts []decodeOption
-	eagerArm   bool
+	decodeOpts   []decodeOption
+	eagerArm     bool
+	hostName     string
+	capabilities []string
 }
 
 // NewCore wires the instrument. The construction order is what the
@@ -110,8 +120,13 @@ func NewCore(cfg CoreConfig) *Core {
 		service: cfg.Service, instance: cfg.Instance,
 		fidelity: fidelity, cacheBox: cb, push: push,
 		host: host, demo: demo, registry: reg, ic: ic, logger: logger,
-		decodeOpts: append([]decodeOption(nil), cfg.DecodeOptions...),
-		eagerArm:   cfg.EagerArm,
+		decodeOpts:   append([]decodeOption(nil), cfg.DecodeOptions...),
+		eagerArm:     cfg.EagerArm,
+		hostName:     cfg.Host,
+		capabilities: append([]string(nil), cfg.Capabilities...),
+	}
+	if len(cfg.Capabilities) > 0 {
+		c.decodeOpts = append(c.decodeOpts, WithCapabilities(cfg.Capabilities...))
 	}
 	if push != nil {
 		c.drain = newCacheDrainTracker(cb, push, logger)

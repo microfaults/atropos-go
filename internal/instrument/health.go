@@ -9,10 +9,13 @@ import (
 )
 
 // HealthHandler reports SDK health as JSON (mounted at /atropos/health).
-// c is the connected control-plane client, or nil in offline mode.
-func HealthHandler(c *ManteionClient) http.Handler {
+// c is the connected control-plane client, or nil in offline mode; host and
+// capture are stamped on every answer so an operator can tell which
+// instrument host is answering and how traffic reaches it.
+func HealthHandler(c *ManteionClient, host, capture string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := healthFrom(c)
+		h.Host, h.Capture = host, capture
 		code := http.StatusOK
 		if h.Status == "disconnected" {
 			code = http.StatusServiceUnavailable

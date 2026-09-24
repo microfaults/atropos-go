@@ -555,3 +555,42 @@ func TestServe_ManteionConfiguredButUnreachableFails(t *testing.T) {
 		t.Fatal("expected Serve to fail when MANTEION_URL is set but unreachable")
 	}
 }
+
+// TestServe_SidecarModeIsPassive pins the mixed-fleet guard (design §5.12):
+// when the pod's atroposd owns the instrument, the embed serves business
+// traffic with tracing only — no registration (an unreachable MANTEION_URL
+// is not even contacted), no rules, no control surface.
+func TestServe_SidecarModeIsPassive(t *testing.T) {
+	t.Setenv("ATROPOS_HOST", "sidecar")
+	t.Setenv("MANTEION_URL", "http://127.0.0.1:9") // closed port: must not be dialed
+	t.Setenv("MANTEION_INIT_TIMEOUT", "100ms")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/work", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("done")) })
+	exporter := tracetest.NewInMemoryExporter()
+	h, shutdown, err := Serve(context.Background(), Config{
+		Service: "passive-test", Handler: mux,
+		TracerProvider: sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter), sdktrace.WithSampler(sdktrace.AlwaysSample())),
+	})
+	if err != nil {
+		t.Fatalf("Serve in sidecar mode must not fail on an unreachable control plane: %v", err)
+	}
+	t.Cleanup(func() { _ = shutdown(context.Background()) })
+	ts := httptest.NewServer(h)
+	t.Cleanup(ts.Close)
+
+	if code, body := mustGet(t, ts.URL+"/work"); code != 200 || body != "done" {
+		t.Fatalf("business handler: code=%d body=%q", code, body)
+	}
+	if len(exporter.GetSpans()) == 0 {
+		t.Fatal("passive mode must still trace")
+	}
+	for _, p := range []string{"/admin/fault", "/admin/rules", "/admin/cachebox", "/cachebox/fidelity?experiment_id=e&phase_id=p", "/atropos/health"} {
+		if code, _ := mustGet(t, ts.URL+p); code != 404 {
+			t.Fatalf("%s = %d, want 404: the sidecar serves the control surface, not the embed", p, code)
+		}
+	}
+	if hs := Health(); hs.Status != "offline" || hs.Host != "in-process" {
+		t.Fatalf("Health() = %+v", hs)
+	}
+}

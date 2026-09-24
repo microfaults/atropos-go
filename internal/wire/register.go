@@ -10,6 +10,13 @@ type RegisterRequest struct {
 	// Routes is the HTTP route inventory for manteion's workflow-builder
 	// catalog. Optional — gRPC services register without routes.
 	Routes []Route `json:"routes,omitempty"`
+	// Host names the instrument host: "in-process" (the Serve embed) or
+	// "sidecar" (atroposd). Additive; absent from older SDKs.
+	Host string `json:"host,omitempty"`
+	// Capabilities lists the fault categories this host can execute
+	// ("inline", "network", "resource", "cachebox"), so the control plane
+	// can filter delivery (design §5.3, M3). Additive; absent = all.
+	Capabilities []string `json:"capabilities,omitempty"`
 } //@name atropos.RegisterRequest
 
 // RegisterResponse is the JSON manteion returns from /api/v1/sdk/register:

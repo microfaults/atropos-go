@@ -2,7 +2,9 @@ package instrument
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sort"
 	"time"
@@ -17,12 +19,14 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault/resource/disk"
 	iostress "git.ucsc.edu/microfaults/atropos-go/internal/fault/resource/io"
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault/resource/memory"
+	"git.ucsc.edu/microfaults/atropos-go/internal/metrics"
 	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
 type decodeConfig struct {
-	resolve     wire.NetworkResolver
-	inlineToxic InlineToxicHost
+	resolve      wire.NetworkResolver
+	inlineToxic  InlineToxicHost
+	capabilities map[string]bool // nil = everything
 }
 
 // InlineToxicHost builds the fault that hosts a network toxic whose
@@ -72,6 +76,15 @@ func decodeCompiledRules(compiled []wire.CompiledRule, opts ...decodeOption) ([]
 	for _, cr := range sorted {
 		sr, err := decodeCompiledRule(cr, opts...)
 		if err != nil {
+			var unsup *UnsupportedFaultError
+			if errors.As(err, &unsup) {
+				// Skip this rule only: one rule this host cannot execute must
+				// not wedge the whole desired state (D7: counted + logged).
+				metrics.RulesUnsupportedTotal.WithLabelValues(unsup.Category).Inc()
+				slog.Default().Warn("rule skipped: fault category not supported by this host",
+					"rule", cr.Name, "category", unsup.Category, "fault_type", unsup.FaultType)
+				continue
+			}
 			return nil, fmt.Errorf("rule %q: %w", cr.Name, err)
 		}
 		rules = append(rules, sr)
@@ -172,6 +185,9 @@ func decodeFault(name string, f *wire.CompiledFault, cfg *decodeConfig) (fault.F
 	// Cross-category envelope checks.
 	if f.Network != nil && f.EffectiveCategory() != "network" {
 		return nil, fmt.Errorf("category %q must not carry a network envelope", f.EffectiveCategory())
+	}
+	if cfg.capabilities != nil && !cfg.capabilities[f.EffectiveCategory()] {
+		return nil, &UnsupportedFaultError{Category: f.EffectiveCategory(), FaultType: f.FaultType}
 	}
 
 	switch f.EffectiveCategory() {

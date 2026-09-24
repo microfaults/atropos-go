@@ -144,15 +144,36 @@ func Serve(ctx context.Context, cfg Config) (http.Handler, ShutdownFunc, error) 
 		return nil, nil, fmt.Errorf("atropos: init telemetry: %w", err)
 	}
 
+	// Mixed-fleet guard (design §5.12): a pod is instrumented by exactly one
+	// host. When the pod's atroposd sidecar owns the instrument, the embed
+	// stays passive — tracing only, no registration, no rules, no control
+	// surface — so egress is not evaluated, spanned and recorded twice.
+	if os.Getenv("ATROPOS_HOST") == instrument.HostSidecar {
+		logger.Info("atropos: ATROPOS_HOST=sidecar — in-process instrument passive (tracing only); the sidecar registers, evaluates rules and serves the control surface",
+			"service", cfg.Service, "instance", instanceID)
+		var h http.Handler = http.NotFoundHandler()
+		if cfg.Handler != nil {
+			h = ingressMiddleware(cfg.Handler, cfg.Service, currentInterceptor())
+		}
+		var once sync.Once
+		var shutdownErr error
+		return h, func(sctx context.Context) error {
+			once.Do(func() { shutdownErr = otelShutdown(sctx) })
+			return shutdownErr
+		}, nil
+	}
+
 	// The instrument core: fidelity registry, cache-box + push, host
 	// evaluator composed before the admin slot, the process-lifetime fault
 	// registry (never swapped, A1), the interceptor, the drain tracker.
 	core := instrument.NewCore(instrument.CoreConfig{
-		Service:     cfg.Service,
-		Instance:    instanceID,
-		ManteionURL: manteionURL,
-		Registry:    defaultRegistry,
-		Logger:      logger,
+		Service:      cfg.Service,
+		Instance:     instanceID,
+		ManteionURL:  manteionURL,
+		Registry:     defaultRegistry,
+		Logger:       logger,
+		Host:         instrument.HostInProcess,
+		Capabilities: instrument.AllCapabilities(),
 	})
 	// Install the core's interceptor as the package-level dispatcher the
 	// middleware, EgressTransport and the grpc subpackage resolve.
@@ -179,6 +200,7 @@ func Serve(ctx context.Context, cfg Config) (http.Handler, ShutdownFunc, error) 
 		Core:            core,
 		Client:          mc,
 		NetworkResolver: cfg.NetworkResolver,
+		Host:            instrument.HostInProcess,
 	})
 	if cfg.Handler != nil {
 		mux.Handle("/", ingressMiddleware(cfg.Handler, cfg.Service, currentInterceptor()))

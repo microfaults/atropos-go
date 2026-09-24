@@ -62,6 +62,10 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 		Logger:        logger,
 		EagerArm:      true,
 		DecodeOptions: []instrument.DecodeOption{instrument.WithInlineToxicHost(proxy.InlineToxicFactory(table))},
+		Host:          instrument.HostSidecar,
+		// Resource faults are never executed in the sidecar (design §5.6);
+		// the node agent (M4) adds CapResource when its socket is present.
+		Capabilities: []string{instrument.CapInline, instrument.CapNetwork, instrument.CapCacheBox},
 	})
 
 	controlLn, err := net.Listen("tcp", cfg.ControlListen)
@@ -114,7 +118,7 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	}
 
 	controlSrv := &http.Server{
-		Handler:           instrument.ControlSurface(instrument.ControlConfig{Core: core, Client: mc}),
+		Handler:           instrument.ControlSurface(instrument.ControlConfig{Core: core, Client: mc, Host: instrument.HostSidecar, Capture: cfg.Capture}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {

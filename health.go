@@ -13,5 +13,7 @@ var globalClient atomic.Pointer[instrument.ManteionClient]
 // Health returns the current SDK health status.
 // With no control plane configured (offline mode), Status is "offline".
 func Health() HealthStatus {
-	return instrument.HealthFrom(globalClient.Load())
+	h := instrument.HealthFrom(globalClient.Load())
+	h.Host = instrument.HostInProcess
+	return h
 }

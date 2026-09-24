@@ -122,6 +122,8 @@ type manteionConfig struct {
 	url            string
 	instanceID     string
 	routes         []wire.Route // published in the register payload
+	host           string       // advertised instrument host (register payload)
+	capabilities   []string     // advertised fault categories (register payload)
 	initTimeout    time.Duration
 	pollInterval   time.Duration
 	offline        bool
@@ -230,6 +232,8 @@ func ConnectManteion(ctx context.Context, c ConnectConfig) (*ManteionClient, err
 	cfg.instanceID = c.Core.instance
 	cfg.serviceVersion = c.ServiceVersion
 	cfg.routes = c.Routes
+	cfg.host = c.Core.hostName
+	cfg.capabilities = c.Core.capabilities
 	if c.Address != "" {
 		cfg.address = c.Address
 	}

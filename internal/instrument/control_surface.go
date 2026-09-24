@@ -16,6 +16,10 @@ type ControlConfig struct {
 	// NetworkResolver is forwarded to the rule decoders behind /admin/rules
 	// and /admin/fault; nil rejects network-category faults.
 	NetworkResolver wire.NetworkResolver
+	// Host and Capture are stamped on /atropos/health ("in-process" |
+	// "sidecar"; "" | "explicit" | "transparent").
+	Host    string
+	Capture string
 }
 
 // ControlSurface mounts the runtime-control and observability endpoints at
@@ -37,7 +41,7 @@ func ControlSurface(cfg ControlConfig) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.Handle("GET /metrics", metrics.Handler())
-	mux.Handle("/atropos/health", HealthHandler(cfg.Client))
+	mux.Handle("/atropos/health", HealthHandler(cfg.Client, cfg.Host, cfg.Capture))
 
 	// Bare path and subtree both: the subtree pattern alone would
 	// 301-redirect the bare path and drop freeze/thaw verbs.
