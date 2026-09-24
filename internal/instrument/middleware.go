@@ -9,6 +9,7 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/metrics"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
 )
 
 // IngressMiddleware is the ingress composition every host wraps business
@@ -48,7 +49,14 @@ func EgressTransport(base http.RoundTripper, resolve func() *interceptor.Interce
 	faulted := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
 		return resolve().EgressTransport(base).RoundTrip(r)
 	})
-	traced := otelhttp.NewTransport(faulted)
+	// Pin the client span to the global provider. otelhttp otherwise takes
+	// the provider of whatever span is in the context, and a context that
+	// only carries an extracted (remote) span — the sidecar's egress
+	// listener, or a caller that propagated headers without starting a
+	// span — resolves to the no-op provider, which mints no child span and
+	// re-emits the caller's span id unchanged. The global delegate is safe
+	// to capture before InitTelemetry runs: it forwards once set.
+	traced := otelhttp.NewTransport(faulted, otelhttp.WithTracerProvider(otel.GetTracerProvider()))
 	return roundTripperFunc(func(r *http.Request) (*http.Response, error) {
 		start := time.Now()
 		resp, err := traced.RoundTrip(r)
