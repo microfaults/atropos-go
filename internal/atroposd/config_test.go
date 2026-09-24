@@ -1,6 +1,8 @@
 package atroposd
 
 import (
+	"git.ucsc.edu/microfaults/atropos-go/internal/agent"
+
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,7 +22,8 @@ func clearEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{"ATROPOS_SERVICE", "MANTEION_SERVICE_VERSION", "MANTEION_URL", "MANTEION_ADVERTISE_ADDR",
 		"MANTEION_INSTANCE_ID", "ATROPOSD_CONTROL_ADDR", "ATROPOSD_INGRESS_ADDR", "ATROPOSD_INBOUND_UPSTREAM",
-		"ATROPOSD_CAPTURE", "ATROPOSD_EGRESS"} {
+		"ATROPOSD_CAPTURE", "ATROPOSD_EGRESS", "ATROPOSD_EGRESS_ADDR", "ATROPOSD_APP_HOST", "ATROPOSD_CAPTURE_MARKER",
+		"ATROPOSD_INBOUND_PORTS", "ATROPOSD_RAW_TCP_PORTS", "ATROPOSD_AGENT_SOCKET", "ATROPOSD_APP_CONTAINER", "ATROPOS_POD_UID"} {
 		t.Setenv(k, "")
 	}
 }
@@ -120,5 +123,26 @@ func TestLoad_TransparentDefaultsAndPortLists(t *testing.T) {
 	cfg, _ = Load("")
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "not a valid TCP port") {
 		t.Fatalf("junk port list must be rejected, got %v", err)
+	}
+}
+
+func TestLoad_AgentFieldsDefaultThenEnv(t *testing.T) {
+	clearEnv(t)
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AgentSocket != agent.DefaultSocket || cfg.AppContainer != DefaultAppContainer || cfg.PodUID != "" {
+		t.Fatalf("agent defaults: socket=%q container=%q pod_uid=%q", cfg.AgentSocket, cfg.AppContainer, cfg.PodUID)
+	}
+	t.Setenv("ATROPOSD_AGENT_SOCKET", "/run/x/agent.sock")
+	t.Setenv("ATROPOSD_APP_CONTAINER", "app")
+	t.Setenv("ATROPOS_POD_UID", "6d3f9a4e-0000-4000-8000-000000000001")
+	cfg, err = Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AgentSocket != "/run/x/agent.sock" || cfg.AppContainer != "app" || cfg.PodUID != "6d3f9a4e-0000-4000-8000-000000000001" {
+		t.Fatalf("agent env overlay not applied: socket=%q container=%q pod_uid=%q", cfg.AgentSocket, cfg.AppContainer, cfg.PodUID)
 	}
 }

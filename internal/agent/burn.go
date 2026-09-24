@@ -42,6 +42,7 @@ type Burn struct {
 // existing resource fault implementation with the target's capacity.
 func StartBurn(ctx context.Context, self, cgroupDir string, req wire.FaultRequest, avail Capacity) (*Burn, error) {
 	cmd := exec.Command(self, "stress")
+	setParentDeathSignal(cmd)
 	cmd.Env = append(os.Environ(), ChildEnv+"=1")
 	cmd.Stderr = os.Stderr
 	stdin, err := cmd.StdinPipe()

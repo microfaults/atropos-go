@@ -1,0 +1,72 @@
+# atropos-agent: one privileged pod per node (design §5.14). Sidecars reach
+# it through the hostPath socket; the agent identifies each caller's pod
+# from the socket peer and only ever touches that pod's app container.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: atropos-agent
+  labels:
+    app: atropos-agent
+spec:
+  selector:
+    matchLabels:
+      app: atropos-agent
+  template:
+    metadata:
+      labels:
+        app: atropos-agent
+    spec:
+      hostPID: true
+      containers:
+        - name: agent
+          image: atropos-agent:dev
+          args:
+            - serve
+            - -sock=/var/run/atropos/agent.sock
+            - -cgroup-root=/host/sys/fs/cgroup
+            - -task-root=/host/run/containerd/io.containerd.runtime.v2.task
+            - -task-root=/host/run/k3s/containerd/io.containerd.runtime.v2.task
+            - -journal=/var/lib/atropos-agent/quotas
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: cgroup
+              mountPath: /host/sys/fs/cgroup
+            - name: containerd-run
+              mountPath: /host/run/containerd
+              readOnly: true
+            - name: k3s-run
+              mountPath: /host/run/k3s
+              readOnly: true
+            - name: atropos-run
+              mountPath: /var/run/atropos
+            - name: journal
+              mountPath: /var/lib/atropos-agent
+          # No limits on purpose: a memory limit here would let the kernel
+          # OOM-kill the agent (orphaning its quota journal until restart),
+          # and burn children are charged to the target cgroup once placed.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+      volumes:
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        - name: containerd-run
+          hostPath:
+            path: /run/containerd
+            type: DirectoryOrCreate
+        - name: k3s-run
+          hostPath:
+            path: /run/k3s
+            type: DirectoryOrCreate
+        - name: atropos-run
+          hostPath:
+            path: /var/run/atropos
+            type: DirectoryOrCreate
+        - name: journal
+          hostPath:
+            path: /var/lib/atropos-agent
+            type: DirectoryOrCreate

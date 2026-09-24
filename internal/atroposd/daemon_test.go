@@ -2,6 +2,8 @@ package atroposd
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -17,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"git.ucsc.edu/microfaults/atropos-go/internal/agent"
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 
@@ -328,5 +332,76 @@ func TestRun_TransparentRecordThenReplay(t *testing.T) {
 	}
 	if code, body := getJSON(t, control+"/atropos/health"); code != 200 || !strings.Contains(body, `"capture":"transparent"`) || !strings.Contains(body, `"host":"sidecar"`) {
 		t.Fatalf("health: code=%d body=%s", code, body)
+	}
+}
+
+// TestRun_DelegatesResourceFaultsToAgent: with the node agent reachable, a
+// resource rule applied to the sidecar arms eagerly through the agent —
+// here a cpu quota on the app container's cgroup — and rule removal
+// restores it.
+func TestRun_DelegatesResourceFaultsToAgent(t *testing.T) {
+	cg := t.TempDir()
+	for name, content := range map[string]string{"cpu.max": "max 100000\n", "memory.max": "max\n", "memory.high": "max\n", "cgroup.procs": ""} {
+		if err := os.WriteFile(filepath.Join(cg, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var sb [4]byte
+	rand.Read(sb[:])
+	sock := filepath.Join(os.TempDir(), "atropos-agent-"+hex.EncodeToString(sb[:])+".sock")
+	t.Cleanup(func() { os.Remove(sock) })
+	srv := &agent.Server{
+		Resolver: agent.ResolverFunc(func(podUID, container string) (agent.Target, error) {
+			if podUID != "pod-x" || container != "server" {
+				return agent.Target{}, os.ErrNotExist
+			}
+			return agent.Target{PodUID: podUID, Container: container, ContainerID: "c1", CgroupDir: cg}, nil
+		}),
+		Journal: agent.Journal{Dir: filepath.Join(t.TempDir(), "journal")},
+		Self:    os.Args[0],
+		Peer:    func(net.Conn) (string, error) { return "pod-x", nil },
+		Host:    agent.Capacity{CPUs: 1, MemoryBytes: 1 << 30},
+		Logger:  slog.New(slog.DiscardHandler),
+	}
+	ln, err := agent.Listen(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actx, acancel := context.WithCancel(context.Background())
+	agentDone := make(chan struct{})
+	go func() { defer close(agentDone); _ = srv.Serve(actx, ln) }()
+	t.Cleanup(func() { acancel(); <-agentDone })
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	t.Cleanup(up.Close)
+	addrs := runDaemon(t, Config{
+		Service: "cartservice", Egress: []EgressRoute{{Listen: "127.0.0.1:0", Upstream: strings.TrimPrefix(up.URL, "http://")}},
+		AgentSocket: sock, PodUID: "pod-x", AppContainer: "server",
+	})
+	control := "http://" + addrs.Control
+
+	rule := `[{"name":"cpu-quota","injection_point":"ingress","mode":"background",
+		"fault":{"category":"resource","fault_type":"cpu","duration_ms":10000,"params":{"target_load":0.5,"mechanism":"quota"}}}]`
+	if code, body := postJSON(t, control+"/admin/rules", rule); code != http.StatusNoContent {
+		t.Fatalf("install rule: code=%d body=%s", code, body)
+	}
+	read := func() string { b, _ := os.ReadFile(filepath.Join(cg, "cpu.max")); return strings.TrimSpace(string(b)) }
+	deadline := time.Now().Add(5 * time.Second)
+	for read() != "50000 100000" && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := read(); got != "50000 100000" {
+		t.Fatalf("cpu.max after eager arming through the agent = %q, want 50000 100000", got)
+	}
+
+	if code, body := postJSON(t, control+"/admin/rules", `[]`); code != http.StatusNoContent {
+		t.Fatalf("clear rules: code=%d body=%s", code, body)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for read() != "max 100000" && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := read(); got != "max 100000" {
+		t.Fatalf("cpu.max after rule removal = %q, want restored", got)
 	}
 }

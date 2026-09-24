@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"git.ucsc.edu/microfaults/atropos-go/internal/agent"
 	"git.ucsc.edu/microfaults/atropos-go/internal/proxy"
 	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 
@@ -37,6 +38,7 @@ const (
 	DefaultIngressListen   = ":16006"
 	DefaultAppHost         = "127.0.0.1"
 	DefaultCaptureMarker   = "/var/run/atropos/capture.ok"
+	DefaultAppContainer    = "server"
 )
 
 // EgressRoute is one explicit-mode egress listener.
@@ -77,6 +79,13 @@ type Config struct {
 	RawTCPPorts   []int  `yaml:"raw_tcp_ports"`  // non-HTTP dependencies relayed at L4
 	AppHost       string `yaml:"app_host"`       // where the app listens; default 127.0.0.1
 	CaptureMarker string `yaml:"capture_marker"` // written by the init container; default /var/run/atropos/capture.ok
+
+	// Node agent (design §5.14): when the socket answers at startup, the
+	// sidecar advertises the resource capability and delegates resource
+	// faults to the agent for AppContainer of this pod.
+	AgentSocket  string `yaml:"agent_socket"`  // default /var/run/atropos/agent.sock
+	AppContainer string `yaml:"app_container"` // default "server"
+	PodUID       string `yaml:"pod_uid"`       // downward API metadata.uid (ATROPOS_POD_UID)
 
 	// TracerProvider, if set, replaces the OTLP exporter (tests, or hosts
 	// that own their OTel setup).
@@ -130,6 +139,9 @@ func (c *Config) overlayEnv() {
 	set(&c.InboundUpstream, "ATROPOSD_INBOUND_UPSTREAM")
 	set(&c.Capture, "ATROPOSD_CAPTURE")
 	set(&c.EgressListen, "ATROPOSD_EGRESS_ADDR")
+	set(&c.AgentSocket, "ATROPOSD_AGENT_SOCKET")
+	set(&c.AppContainer, "ATROPOSD_APP_CONTAINER")
+	set(&c.PodUID, "ATROPOS_POD_UID")
 	set(&c.AppHost, "ATROPOSD_APP_HOST")
 	set(&c.CaptureMarker, "ATROPOSD_CAPTURE_MARKER")
 	if v := os.Getenv("ATROPOSD_INBOUND_PORTS"); v != "" {
@@ -178,6 +190,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Capture == "" {
 		c.Capture = CaptureExplicit
+	}
+	if c.AgentSocket == "" {
+		c.AgentSocket = agent.DefaultSocket
+	}
+	if c.AppContainer == "" {
+		c.AppContainer = DefaultAppContainer
 	}
 	if c.Capture == CaptureTransparent {
 		if c.EgressListen == "" {

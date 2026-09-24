@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"time"
 
+	"git.ucsc.edu/microfaults/atropos-go/internal/agent"
 	"git.ucsc.edu/microfaults/atropos-go/internal/instrument"
 	"git.ucsc.edu/microfaults/atropos-go/internal/proxy"
 )
@@ -80,17 +81,27 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	// host=inline become armed proxy policies, and background faults arm
 	// when their rule applies rather than on the first matching request.
 	table := proxy.NewPolicyTable()
+	caps := []string{instrument.CapInline, instrument.CapNetwork, instrument.CapCacheBox}
+	decodeOpts := []instrument.DecodeOption{instrument.WithInlineToxicHost(proxy.InlineToxicFactory(table))}
+	// Resource faults are never executed in the sidecar (design §5.6). When
+	// the node agent answers on its socket, the sidecar advertises the
+	// capability and delegates every resource rule to it, for this pod's
+	// app container (design §5.14). An agent that appears later is picked
+	// up on the next sidecar start, never silently mid-experiment.
+	if cfg.AgentSocket != "" && agent.Reachable(cfg.AgentSocket) {
+		caps = append(caps, instrument.CapResource)
+		decodeOpts = append(decodeOpts, instrument.WithResourceHost(agent.ResourceFactory(cfg.AgentSocket, cfg.PodUID, cfg.AppContainer)))
+		logger.Info("atroposd: node agent reachable; resource faults delegated", "socket", cfg.AgentSocket, "container", cfg.AppContainer, "pod_uid", cfg.PodUID)
+	}
 	core := instrument.NewCore(instrument.CoreConfig{
 		Service:       cfg.Service,
 		Instance:      instanceID,
 		ManteionURL:   cfg.ManteionURL,
 		Logger:        logger,
 		EagerArm:      true,
-		DecodeOptions: []instrument.DecodeOption{instrument.WithInlineToxicHost(proxy.InlineToxicFactory(table))},
+		DecodeOptions: decodeOpts,
 		Host:          instrument.HostSidecar,
-		// Resource faults are never executed in the sidecar (design §5.6);
-		// the node agent (M4) adds CapResource when its socket is present.
-		Capabilities: []string{instrument.CapInline, instrument.CapNetwork, instrument.CapCacheBox},
+		Capabilities:  caps,
 	})
 
 	controlLn, err := net.Listen("tcp", cfg.ControlListen)
