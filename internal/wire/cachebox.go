@@ -16,15 +16,15 @@ import (
 // The type itself lives in internal/cachebox (so the evaluator and the
 // interceptor can reference it without an import cycle); this is a
 // transparent alias so the wire shape is unchanged.
-type CacheBoxContext = cachebox.CacheBoxContext
+type CacheBoxContext = cachebox.CacheBoxContext //@name atropos.CacheBoxContext
 
 // CacheBoxWireEntry is the JSON-serializable transfer format for cache
 // entries. Used for all SDK <-> manteion communication (ingest and preload).
-type CacheBoxWireEntry = cachebox.WireEntry
+type CacheBoxWireEntry = cachebox.WireEntry //@name atropos.CacheBoxWireEntry
 
 // CacheBoxStats is the GET /admin/cachebox response: combined store,
 // recorder, and record-buffer counters.
-type CacheBoxStats = cachebox.Stats
+type CacheBoxStats = cachebox.Stats //@name atropos.CacheBoxStats
 
 // DelayRequest is the JSON body for POST /admin/cachebox/delay -- the freeze
 // command manteion sends at freezeServices time. Context, when present,
@@ -35,7 +35,7 @@ type DelayRequest struct {
 	Sigma   float64          `json:"sigma"`
 	Seed    uint64           `json:"seed"`
 	Context *CacheBoxContext `json:"context,omitempty"`
-}
+} //@name atropos.DelayRequest
 
 // DrainReport (wire spec §W3) is the SDK's POST body to
 // /api/v1/sdk/cachebox/drain at recording-phase end, confirming every
@@ -60,12 +60,12 @@ type DrainReport struct {
 	LastBatchSeq           int64  `json:"last_batch_seq"`
 	KeyCollisionsDivergent int64  `json:"key_collisions_divergent"`
 	KeyCollisionsIdentical int64  `json:"key_collisions_identical"`
-}
+} //@name atropos.DrainReport
 
 // DrainReportResponse is manteion's response to a DrainReport.
 type DrainReportResponse struct {
 	Accepted bool `json:"accepted"`
-}
+} //@name atropos.DrainReportResponse
 
 // PreloadBeginRequest (wire spec §W4) starts a staged preload for
 // (ExperimentID, PhaseID), clearing any prior staging for that pair. Its
@@ -82,14 +82,14 @@ type PreloadBeginRequest struct {
 	StrategyVersion int      `json:"strategy_version"`
 	KeyHeaders      []string `json:"key_headers,omitempty"`
 	MaxBytes        int64    `json:"max_bytes,omitempty"`
-}
+} //@name atropos.PreloadBeginRequest
 
 // PreloadBeginResponse is returned on a successful begin (200). Begin can
 // alternatively fail with 413 (too_large) or 409 (unsupported strategy),
 // both reported via the shared ErrorResponse envelope.
 type PreloadBeginResponse struct {
 	OK bool `json:"ok"`
-}
+} //@name atropos.PreloadBeginResponse
 
 // PreloadChunkRequest carries one chunk of staged entries. ChunkSeq makes
 // redelivery idempotent.
@@ -98,13 +98,13 @@ type PreloadChunkRequest struct {
 	PhaseID      string               `json:"phase_id"`
 	ChunkSeq     int                  `json:"chunk_seq"`
 	Entries      []cachebox.WireEntry `json:"entries"`
-}
+} //@name atropos.PreloadChunkRequest
 
 // PreloadChunkResponse reports the running staged total after accepting
 // (or re-accepting, if ChunkSeq was already seen) a chunk.
 type PreloadChunkResponse struct {
 	StagedTotal int `json:"staged_total"`
-}
+} //@name atropos.PreloadChunkResponse
 
 // PreloadCommitRequest asks the SDK to verify staged entries against
 // (TotalEntries, Checksum) -- computed per wire spec §W5 -- and atomically
@@ -114,7 +114,7 @@ type PreloadCommitRequest struct {
 	PhaseID      string `json:"phase_id"`
 	TotalEntries int    `json:"total_entries"`
 	Checksum     string `json:"checksum"`
-}
+} //@name atropos.PreloadCommitRequest
 
 // PreloadCommitResponse reports the outcome of a commit: OK+200 on a
 // checksum match (the swap already happened), or OK=false+409 on mismatch
@@ -124,28 +124,28 @@ type PreloadCommitResponse struct {
 	OK       bool   `json:"ok"`
 	Loaded   int    `json:"loaded"`
 	Checksum string `json:"checksum"`
-}
+} //@name atropos.PreloadCommitResponse
 
 // PreloadAbortRequest drops any staged (not yet committed) entries for the
 // pair. The response is a bare 200 with no body.
 type PreloadAbortRequest struct {
 	ExperimentID string `json:"experiment_id"`
 	PhaseID      string `json:"phase_id"`
-}
+} //@name atropos.PreloadAbortRequest
 
 // FidelityMissReasons breaks down FidelitySnapshot.ReplayMisses by cause.
 type FidelityMissReasons struct {
 	KeyAbsent        int64 `json:"key_absent"`
 	NotCommitted     int64 `json:"not_committed"`
 	BodyBufferFailed int64 `json:"body_buffer_failed"`
-}
+} //@name atropos.FidelityMissReasons
 
 // FidelityReplayAge summarizes replay-hit staleness: milliseconds between
 // an entry's RecordedAt and when it was served.
 type FidelityReplayAge struct {
 	Max  int64 `json:"max"`
 	Mean int64 `json:"mean"`
-}
+} //@name atropos.FidelityReplayAge
 
 // FidelityPreloadState reports the SDK's current committed replay set for
 // the queried (experiment_id, phase_id), if any.
@@ -154,7 +154,7 @@ type FidelityPreloadState struct {
 	Entries     int       `json:"entries"`
 	Checksum    string    `json:"checksum"`
 	CommittedAt time.Time `json:"committed_at"`
-}
+} //@name atropos.FidelityPreloadState
 
 // FidelitySnapshot (wire spec §W6) is the SDK's response to
 // GET /cachebox/fidelity?experiment_id=&phase_id= -- the complete set of
@@ -176,4 +176,4 @@ type FidelitySnapshot struct {
 	KeyCollisionsIdentical int64                `json:"key_collisions_identical"`
 	ReplayAgeMs            FidelityReplayAge    `json:"replay_age_ms"`
 	Preload                FidelityPreloadState `json:"preload"`
-}
+} //@name atropos.FidelitySnapshot

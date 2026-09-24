@@ -104,6 +104,13 @@ A snapshot of what's shipped on `main`. For the research vision (cache-box primi
 └──────────────────────────────────────────────────────────────┘
 ```
 
+The root package is the in-process host only. `internal/instrument` is the
+instrument core every host builds (`Core`, `ControlSurface`, the manteion
+client, the rule decoders, the admin handlers); `internal/wire` holds the JSON
+wire shapes, re-exported here as type aliases; `internal/metrics` holds the
+Prometheus series. `cmd/atroposd`, the out-of-process sidecar host described in
+`docs/plans/2026-09-08-atropos-daemon-design.md`, builds the same core.
+
 ## Installation
 
 ```bash

@@ -12,4 +12,4 @@ type HealthStatus struct {
 	// StaleFor is the human-readable duration since LastSuccessfulPollAt.
 	// Empty if never polled. Helps ops dashboards distinguish a 5s vs 5h DEGRADED.
 	StaleFor string `json:"stale_for,omitempty"`
-}
+} //@name atropos.HealthStatus

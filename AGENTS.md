@@ -99,7 +99,8 @@ Runtime rule-set management against the host evaluator.
 Services embed via `atropos.Serve(ctx, atropos.Config{...})`, which registers
 with manteion on startup so manteion can serve them rules and reconcile
 intent on rolling deploys. Registration, polling, and intent application are
-internal to `Serve`; the wire types below stay public because manteion
+internal to `Serve` (they live in `internal/instrument`); the wire types
+below are aliases of `internal/wire` and stay public because manteion
 imports them.
 
 ### Types

@@ -25,7 +25,7 @@ type FaultRequest struct {
 
 	Network *NetworkEnvelope `json:"network,omitempty"`
 	Params  json.RawMessage  `json:"params,omitempty"`
-}
+} //@name atropos.FaultRequest
 
 // EffectiveCategory returns Category, defaulting an empty value to "inline".
 func (r *FaultRequest) EffectiveCategory() string {
@@ -38,8 +38,8 @@ func (r *FaultRequest) EffectiveCategory() string {
 // FaultStatus is the JSON response for GET /admin/fault.
 type FaultStatus struct {
 	Active bool            `json:"active"`
-	Faults []*FaultRequest `json:"faults,omitempty"`
-}
+	Faults []*FaultRequest `json:"faults,omitempty"` // matches new plan shape {"faults": [...]}
+} //@name atropos.FaultStatus
 
 // NetworkEnvelope is the network-category-only envelope. It separates the
 // "where does the toxic live and to which traffic does it apply" question
@@ -63,4 +63,4 @@ type NetworkEnvelope struct {
 	// Scope is the fraction of connections (proxy) or requests (inline)
 	// to which the toxic applies. Zero means 1.0 (all).
 	Scope float64 `json:"scope,omitempty"`
-}
+} //@name atropos.NetworkEnvelope

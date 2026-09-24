@@ -10,7 +10,7 @@ type RegisterRequest struct {
 	// Routes is the HTTP route inventory for manteion's workflow-builder
 	// catalog. Optional — gRPC services register without routes.
 	Routes []Route `json:"routes,omitempty"`
-}
+} //@name atropos.RegisterRequest
 
 // RegisterResponse is the JSON manteion returns from /api/v1/sdk/register:
 // a status string plus the same RuleSync desired-state payload the poll
@@ -19,7 +19,7 @@ type RegisterRequest struct {
 type RegisterResponse struct {
 	Status string `json:"status"`
 	RuleSync
-}
+} //@name atropos.RegisterResponse
 
 // Route is one HTTP route published to manteion at registration time.
 // Manteion aggregates routes across all live SDK instances into the
@@ -36,4 +36,4 @@ type Route struct {
 	Path        string   `json:"path"`
 	Description string   `json:"description,omitempty"`
 	DependsOn   []string `json:"depends_on,omitempty"`
-}
+} //@name atropos.Route
