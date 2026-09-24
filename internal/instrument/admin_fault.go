@@ -160,7 +160,7 @@ func (d *demoEvaluator) Active() []*wire.FaultRequest {
 // Confirm, the fault watchdog will reap admin slots after the grace period
 // (max(3*pollInterval, 30s)). Treat admin faults as short-lived overrides
 // when connected to manteion; in offline mode they persist until DELETEd.
-func faultAdminHandler(eval *demoEvaluator, reg *interceptor.FaultRegistry, resolve wire.NetworkResolver) http.Handler {
+func faultAdminHandler(eval *demoEvaluator, reg *interceptor.FaultRegistry, arm armFunc, opts ...decodeOption) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -169,7 +169,7 @@ func faultAdminHandler(eval *demoEvaluator, reg *interceptor.FaultRegistry, reso
 
 		switch r.Method {
 		case http.MethodPost:
-			handleFaultPost(w, r, eval, resolve)
+			handleFaultPost(w, r, eval, arm, opts)
 		case http.MethodDelete:
 			// check if path is /admin/fault or /admin/fault/{category}
 			if path == "/admin/fault" || path == "/admin/fault/" {
@@ -196,14 +196,21 @@ func faultAdminHandler(eval *demoEvaluator, reg *interceptor.FaultRegistry, reso
 	})
 }
 
-func handleFaultPost(w http.ResponseWriter, r *http.Request, eval *demoEvaluator, resolve wire.NetworkResolver) {
+func handleFaultPost(w http.ResponseWriter, r *http.Request, eval *demoEvaluator, arm armFunc, opts []decodeOption) {
 	var req wire.FaultRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, fmt.Sprintf("invalid json: %s", err), http.StatusBadRequest)
 		return
 	}
 
-	f, err := buildFault(req, resolve)
+	// Name = slot id, matching Set's key, so DELETE can stop the running
+	// fault through the registry under the same name (see applyActiveFault).
+	id := req.ID
+	if id == "" {
+		id = req.EffectiveCategory()
+	}
+
+	f, err := buildFault(id, req, opts...)
 	if err != nil {
 		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
@@ -214,12 +221,6 @@ func handleFaultPost(w http.ResponseWriter, r *http.Request, eval *demoEvaluator
 		mode = evaluator.Background
 	}
 
-	// Name = slot id, matching Set's key, so DELETE can stop the running
-	// fault through the registry under the same name (see applyActiveFault).
-	id := req.ID
-	if id == "" {
-		id = req.EffectiveCategory()
-	}
 	decision := &evaluator.Decision{
 		Name:   id,
 		Fault:  f,
@@ -227,6 +228,7 @@ func handleFaultPost(w http.ResponseWriter, r *http.Request, eval *demoEvaluator
 		Mode:   mode,
 	}
 	eval.Set(decision, &req)
+	armDecision(arm, evaluator.Egress, decision)
 
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(wire.FaultStatus{Active: true, Faults: []*wire.FaultRequest{&req}})
@@ -236,7 +238,6 @@ func handleFaultPost(w http.ResponseWriter, r *http.Request, eval *demoEvaluator
 // path shared with compiled rules. Used by admin.go (handleFaultPost) and
 // register.go (applyActiveFault) — the admin endpoint therefore gets the
 // same envelope validation and ramp support as rule-attached faults.
-func buildFault(req wire.FaultRequest, resolve wire.NetworkResolver) (fault.Fault, error) {
-	cfg := &decodeConfig{resolve: resolve}
-	return decodeFault(&req, cfg)
+func buildFault(id string, req wire.FaultRequest, opts ...decodeOption) (fault.Fault, error) {
+	return decodeFault(id, &req, buildDecodeConfig(opts))
 }

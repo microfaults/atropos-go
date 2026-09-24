@@ -21,7 +21,24 @@ import (
 )
 
 type decodeConfig struct {
-	resolve wire.NetworkResolver
+	resolve     wire.NetworkResolver
+	inlineToxic InlineToxicHost
+}
+
+// InlineToxicHost builds the fault that hosts a network toxic whose
+// NetworkEnvelope.Host is "inline". A host that owns the proxied
+// connections (the atroposd sidecar) supplies one; the in-process host does
+// not, and inline network faults stay rejected there. name is the rule or
+// slot the fault belongs to (its fault-registry key).
+type InlineToxicHost func(name string, env *wire.NetworkEnvelope, toxic network.Toxic, base fault.FaultConfig) (fault.Fault, error)
+
+// DecodeOption is the exported name of decodeOption, for hosts that supply
+// decode hooks through CoreConfig.DecodeOptions.
+type DecodeOption = decodeOption
+
+// WithInlineToxicHost installs the inline network-toxic host.
+func WithInlineToxicHost(h InlineToxicHost) DecodeOption {
+	return func(c *decodeConfig) { c.inlineToxic = h }
 }
 
 // decodeOption configures the behaviour of decodeCompiledRule(s).
@@ -78,7 +95,7 @@ func decodeCompiledRule(cr wire.CompiledRule, opts ...decodeOption) (evaluator.S
 	sr.Decision.StartPolicy = parseStartPolicy(cr.StartPolicy)
 
 	if cr.Fault != nil {
-		f, err := decodeFault(cr.Fault, cfg)
+		f, err := decodeFault(cr.Name, cr.Fault, cfg)
 		if err != nil {
 			return evaluator.StaticRule{}, err
 		}
@@ -138,7 +155,7 @@ func parseStartPolicy(s string) evaluator.StartPolicy {
 	}
 }
 
-func decodeFault(f *wire.CompiledFault, cfg *decodeConfig) (fault.Fault, error) {
+func decodeFault(name string, f *wire.CompiledFault, cfg *decodeConfig) (fault.Fault, error) {
 	baseCfg := fault.FaultConfig{
 		Duration: time.Duration(f.DurationMs) * time.Millisecond,
 		RampUp:   time.Duration(f.RampUpMs) * time.Millisecond,
@@ -164,7 +181,7 @@ func decodeFault(f *wire.CompiledFault, cfg *decodeConfig) (fault.Fault, error) 
 		if f.Network == nil {
 			return nil, fmt.Errorf("network fault %q requires a network envelope", f.FaultType)
 		}
-		return decodeNetworkFault(f.FaultType, f.Network, params, baseCfg, cfg.resolve)
+		return decodeNetworkFault(name, f.FaultType, f.Network, params, baseCfg, cfg)
 	case "resource":
 		return decodeResourceFault(f.FaultType, params, baseCfg)
 	default:
@@ -340,7 +357,7 @@ func decodeResourceFault(faultType string, params json.RawMessage, baseCfg fault
 	}
 }
 
-func decodeNetworkFault(faultType string, env *wire.NetworkEnvelope, params json.RawMessage, baseCfg fault.FaultConfig, resolve wire.NetworkResolver) (fault.Fault, error) {
+func decodeNetworkFault(name, faultType string, env *wire.NetworkEnvelope, params json.RawMessage, baseCfg fault.FaultConfig, cfg *decodeConfig) (fault.Fault, error) {
 	host := env.Host
 	if host == "" {
 		host = "proxy"
@@ -348,15 +365,22 @@ func decodeNetworkFault(faultType string, env *wire.NetworkEnvelope, params json
 
 	switch host {
 	case "proxy":
-		return decodeNetworkProxyFault(faultType, env, params, baseCfg, resolve)
+		return decodeNetworkProxyFault(faultType, env, params, baseCfg, cfg.resolve)
 	case "inline":
-		// v6 work: in-process Toxic host that wraps response.Body in
-		// the egress RoundTripper. Schema lands now; execution lands
-		// when ToxicTransport is implemented.
-		return nil, fmt.Errorf(
-			"network fault %q with host=%q: in-process toxic host is not yet supported (v6)",
-			faultType, host,
-		)
+		// The toxic runs on the proxied connection of a host that owns
+		// one (the atroposd sidecar, via WithInlineToxicHost). The
+		// in-process host has no such connection and rejects it.
+		if cfg.inlineToxic == nil {
+			return nil, fmt.Errorf(
+				"network fault %q with host=%q: this host does not own proxied connections (in-process toxic host is not yet supported; use the atroposd sidecar)",
+				faultType, host,
+			)
+		}
+		toxic, err := decodeNetworkToxic(faultType, params)
+		if err != nil {
+			return nil, err
+		}
+		return cfg.inlineToxic(name, env, toxic, baseCfg)
 	default:
 		return nil, fmt.Errorf("network fault %q: unknown host %q", faultType, host)
 	}

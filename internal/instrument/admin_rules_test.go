@@ -14,7 +14,7 @@ import (
 func TestRulesAdminHandler(t *testing.T) {
 	t.Run("GET on empty evaluator returns 200 with empty array", func(t *testing.T) {
 		eval := evaluator.NewStaticEvaluator()
-		handler := rulesAdminHandler(eval, nil)
+		handler := rulesAdminHandler(eval, nil, nil)
 
 		req := httptest.NewRequest(http.MethodGet, "/admin/rules", nil)
 		rec := httptest.NewRecorder()
@@ -35,7 +35,7 @@ func TestRulesAdminHandler(t *testing.T) {
 
 	t.Run("POST with valid compiled rules replaces evaluator rules", func(t *testing.T) {
 		eval := evaluator.NewStaticEvaluator()
-		handler := rulesAdminHandler(eval, nil)
+		handler := rulesAdminHandler(eval, nil, nil)
 
 		compiled := wire.CompiledRule{
 			Name:           "freeze-productcatalog",
@@ -73,7 +73,7 @@ func TestRulesAdminHandler(t *testing.T) {
 
 	t.Run("POST with malformed JSON returns 400", func(t *testing.T) {
 		eval := evaluator.NewStaticEvaluator()
-		handler := rulesAdminHandler(eval, nil)
+		handler := rulesAdminHandler(eval, nil, nil)
 
 		req := httptest.NewRequest(http.MethodPost, "/admin/rules", bytes.NewReader([]byte(`"not json"`)))
 		rec := httptest.NewRecorder()
@@ -86,7 +86,7 @@ func TestRulesAdminHandler(t *testing.T) {
 
 	t.Run("DELETE returns 405", func(t *testing.T) {
 		eval := evaluator.NewStaticEvaluator()
-		handler := rulesAdminHandler(eval, nil)
+		handler := rulesAdminHandler(eval, nil, nil)
 
 		req := httptest.NewRequest(http.MethodDelete, "/admin/rules", nil)
 		rec := httptest.NewRecorder()

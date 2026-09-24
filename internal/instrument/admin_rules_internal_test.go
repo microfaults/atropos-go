@@ -42,7 +42,7 @@ func TestApplyRuleSetStopsRemovedRuleFaults(t *testing.T) {
 		wire.StaticRule{Name: "r2", Point: evaluator.Egress},
 	)
 	// r1 drops out of the set; r2 stays.
-	applyRuleSet(reg, eval, []wire.StaticRule{{Name: "r2", Point: evaluator.Egress}})
+	applyRuleSet(reg, eval, []wire.StaticRule{{Name: "r2", Point: evaluator.Egress}}, nil)
 
 	select {
 	case <-h.Done():

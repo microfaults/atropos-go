@@ -98,9 +98,9 @@ func (i *Interceptor) Evaluate(ctx context.Context, req evaluator.Request) *eval
 	return i.eval.Evaluate(ctx, req)
 }
 
-// isInlineFault reports whether f is one of the inline fault types (latency,
+// IsInlineFault reports whether f is one of the inline fault types (latency,
 // error, hang) that execute in the request goroutine.
-func isInlineFault(f fault.Fault) bool {
+func IsInlineFault(f fault.Fault) bool {
 	switch f.(type) {
 	case *inlinefault.Latency, *inlinefault.Error, *inlinefault.Hang:
 		return true
@@ -128,12 +128,12 @@ func (i *Interceptor) StartFault(ctx context.Context, req evaluator.Request, dec
 
 	// Force Background mode for non-inline faults.
 	effectiveMode := decision.Mode
-	if !isInlineFault(decision.Fault) {
+	if !IsInlineFault(decision.Fault) {
 		effectiveMode = evaluator.Background
 	}
 
 	// Registry path: non-inline faults with a registry get deduped.
-	if i.registry != nil && !isInlineFault(decision.Fault) {
+	if i.registry != nil && !IsInlineFault(decision.Fault) {
 		return i.startRegistered(ctx, req, decision, faultType, effectiveMode)
 	}
 

@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault/inline"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault/network"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
 	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
@@ -336,10 +339,10 @@ func TestDecodeCompiledRules_NetworkInlineHostNotYetSupported(t *testing.T) {
 	}}
 	_, err := decodeCompiledRules(compiled)
 	if err == nil {
-		t.Fatal("expected error: inline host not yet supported")
+		t.Fatal("expected error: inline host without WithInlineToxicHost")
 	}
-	if !strings.Contains(err.Error(), "v6") {
-		t.Errorf("error should mention v6 deferral, got: %v", err)
+	if !strings.Contains(err.Error(), "does not own proxied connections") {
+		t.Errorf("error should say the host cannot run inline toxics, got: %v", err)
 	}
 }
 
@@ -453,5 +456,37 @@ func TestDecodeCompiledRules_PriorityStable(t *testing.T) {
 
 	if rules[0].Name != "first" || rules[1].Name != "second" {
 		t.Errorf("equal priority should preserve input order: got %q, %q", rules[0].Name, rules[1].Name)
+	}
+}
+
+// TestDecode_InlineToxicHostReceivesRuleNameEnvelopeAndToxic pins the
+// sidecar's decode seam: with WithInlineToxicHost installed, a host=inline
+// network fault is handed to the hook with its rule name, envelope and the
+// decoded toxic, and the hook's fault is what the rule carries.
+func TestDecode_InlineToxicHostReceivesRuleNameEnvelopeAndToxic(t *testing.T) {
+	var gotName, gotTarget string
+	var gotToxic network.Toxic
+	stub := &inline.Latency{FaultConfig: fault.FaultConfig{Duration: time.Second}, Delay: time.Millisecond}
+	hook := func(name string, env *wire.NetworkEnvelope, toxic network.Toxic, base fault.FaultConfig) (fault.Fault, error) {
+		gotName, gotTarget, gotToxic = name, env.Target, toxic
+		return stub, nil
+	}
+	rules, err := decodeCompiledRules([]wire.CompiledRule{{
+		Name: "throttle-redis", InjectionPoint: "egress", Mode: "background",
+		Fault: &wire.CompiledFault{Category: "network", FaultType: "throttle", DurationMs: 5000,
+			Network: &wire.NetworkEnvelope{Host: "inline", Target: "redis:6379", Direction: "downstream"},
+			Params:  json.RawMessage(`{"bytes_per_sec":1024}`)},
+	}}, WithInlineToxicHost(hook))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if gotName != "throttle-redis" || gotTarget != "redis:6379" {
+		t.Fatalf("hook got name=%q target=%q", gotName, gotTarget)
+	}
+	if th, ok := gotToxic.(*network.Throttle); !ok || th.BytesPerSec != 1024 {
+		t.Fatalf("hook got toxic %#v, want *network.Throttle{1024}", gotToxic)
+	}
+	if rules[0].Decision.Fault != stub {
+		t.Fatal("the hook's fault must be what the decoded rule carries")
 	}
 }

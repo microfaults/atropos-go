@@ -41,15 +41,12 @@ func ControlSurface(cfg ControlConfig) *http.ServeMux {
 
 	// Bare path and subtree both: the subtree pattern alone would
 	// 301-redirect the bare path and drop freeze/thaw verbs.
-	faultAdmin := faultAdminHandler(c.demo, c.registry, cfg.NetworkResolver)
+	opts := c.decodeOptsWith(cfg.NetworkResolver)
+	faultAdmin := faultAdminHandler(c.demo, c.registry, c.armFn(), opts...)
 	mux.Handle("/admin/fault", faultAdmin)
 	mux.Handle("/admin/fault/", faultAdmin)
 
-	var decodeOpts []decodeOption
-	if cfg.NetworkResolver != nil {
-		decodeOpts = append(decodeOpts, withNetworkResolver(cfg.NetworkResolver))
-	}
-	mux.Handle("/admin/rules", rulesAdminHandler(c.host, c.registry, decodeOpts...))
+	mux.Handle("/admin/rules", rulesAdminHandler(c.host, c.registry, c.armFn(), opts...))
 
 	cbAdmin := cacheBoxAdminHandler(c.cacheBox)
 	mux.Handle("/admin/cachebox", cbAdmin)

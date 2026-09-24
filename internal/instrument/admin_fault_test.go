@@ -37,7 +37,7 @@ func TestFaultAdmin_PostNetworkLatency(t *testing.T) {
 	resolver := func(target string) (string, string, error) {
 		return ":19099", "localhost:6379", nil
 	}
-	handler := faultAdminHandler(eval, nil, resolver)
+	handler := faultAdminHandler(eval, nil, nil, withNetworkResolver(resolver))
 
 	body := `{"category":"network","fault_type":"latency","duration_ms":5000,"network":{"target":"redis"},"params":{"delay":"100ms"}}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))

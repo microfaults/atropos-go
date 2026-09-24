@@ -81,6 +81,21 @@ type applyTargets struct {
 	// Registry holds every running background fault; rule/slot removal stops
 	// faults through it (nil-safe: a nil registry stops nothing).
 	Registry *interceptor.FaultRegistry
+	// DecodeOpts are host-supplied decode hooks (e.g. the inline toxic
+	// host), appended to the resolver option on every decode.
+	DecodeOpts []decodeOption
+	// Arm, when set, starts a decoded background fault as soon as its rule
+	// or slot applies (eager arming, design §3.D1). Nil keeps lazy arming.
+	Arm armFunc
+}
+
+// decodeOpts is the option set every decode under these targets uses.
+func (t applyTargets) decodeOpts() []decodeOption {
+	opts := append([]decodeOption(nil), t.DecodeOpts...)
+	if t.NetworkResolver != nil {
+		opts = append(opts, withNetworkResolver(t.NetworkResolver))
+	}
+	return opts
 }
 
 // apply installs the register response's intent state onto the supplied
@@ -105,15 +120,11 @@ func apply(resp wire.RegisterResponse, targets applyTargets) error {
 			return fmt.Errorf("apply rules: no Evaluator target for %d rules", len(resp.Rules))
 		}
 		if targets.Evaluator != nil {
-			var opts []decodeOption
-			if targets.NetworkResolver != nil {
-				opts = append(opts, withNetworkResolver(targets.NetworkResolver))
-			}
-			rules, err := decodeCompiledRules(resp.Rules, opts...)
+			rules, err := decodeCompiledRules(resp.Rules, targets.decodeOpts()...)
 			if err != nil {
 				return fmt.Errorf("apply rules: %w", err)
 			}
-			applyRuleSet(targets.Registry, targets.Evaluator, rules)
+			applyRuleSet(targets.Registry, targets.Evaluator, rules, targets.Arm)
 		}
 
 		// Observe every authoritative rule set, INCLUDING empty: the
@@ -159,7 +170,7 @@ func apply(resp wire.RegisterResponse, targets applyTargets) error {
 			if id == "" {
 				id = req.EffectiveCategory()
 			}
-			if err := applyActiveFault(req, targets.DemoEval, targets.NetworkResolver); err != nil {
+			if err := applyActiveFault(req, targets); err != nil {
 				return fmt.Errorf("apply active_faults[%s]: %w", id, err)
 			}
 			targets.DemoEval.Confirm(id)
@@ -186,8 +197,12 @@ func apply(resp wire.RegisterResponse, targets applyTargets) error {
 // the identical name. A shared constant name here would collapse distinct
 // slots into one registry entry -- deduplicating faults that should
 // coexist and stopping strangers on clear.
-func applyActiveFault(req wire.FaultRequest, eval *demoEvaluator, resolve wire.NetworkResolver) error {
-	f, err := buildFault(req, resolve)
+func applyActiveFault(req wire.FaultRequest, targets applyTargets) error {
+	id := req.ID
+	if id == "" {
+		id = req.EffectiveCategory()
+	}
+	f, err := buildFault(id, req, targets.decodeOpts()...)
 	if err != nil {
 		return err
 	}
@@ -197,16 +212,14 @@ func applyActiveFault(req wire.FaultRequest, eval *demoEvaluator, resolve wire.N
 		mode = evaluator.Background
 	}
 
-	id := req.ID
-	if id == "" {
-		id = req.EffectiveCategory()
-	}
-	eval.Set(&evaluator.Decision{
+	d := &evaluator.Decision{
 		Name:   id,
 		Fault:  f,
 		Reason: "register",
 		Mode:   mode,
-	}, &req)
+	}
+	targets.DemoEval.Set(d, &req)
+	armDecision(targets.Arm, evaluator.Egress, d)
 	return nil
 }
 

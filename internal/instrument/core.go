@@ -1,6 +1,7 @@
 package instrument
 
 import (
+	"context"
 	"log/slog"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
@@ -28,6 +29,13 @@ type CoreConfig struct {
 	// InjectionHook defaults to metrics.RecordFaultInjection.
 	InjectionHook interceptor.InjectionHook
 	Logger        *slog.Logger
+	// DecodeOptions are host-supplied rule-decode hooks, e.g. the sidecar's
+	// WithInlineToxicHost.
+	DecodeOptions []DecodeOption
+	// EagerArm starts background faults when their rule or slot applies
+	// instead of on the first matching request. The sidecar sets it: a
+	// network toxic must be in force from the moment the rule lands.
+	EagerArm bool
 }
 
 // Core is the instrument: one shared fidelity registry, the cache-box and
@@ -49,6 +57,9 @@ type Core struct {
 	ic       *interceptor.Interceptor
 	drain    *cacheDrainTracker // nil when offline
 	logger   *slog.Logger
+
+	decodeOpts []decodeOption
+	eagerArm   bool
 }
 
 // NewCore wires the instrument. The construction order is what the
@@ -99,6 +110,8 @@ func NewCore(cfg CoreConfig) *Core {
 		service: cfg.Service, instance: cfg.Instance,
 		fidelity: fidelity, cacheBox: cb, push: push,
 		host: host, demo: demo, registry: reg, ic: ic, logger: logger,
+		decodeOpts: append([]decodeOption(nil), cfg.DecodeOptions...),
+		eagerArm:   cfg.EagerArm,
 	}
 	if push != nil {
 		c.drain = newCacheDrainTracker(cb, push, logger)
@@ -122,6 +135,36 @@ func (c *Core) targets(resolver wire.NetworkResolver) applyTargets {
 		NetworkResolver: resolver,
 		CacheDrain:      c.drain,
 		Registry:        c.registry,
+		DecodeOpts:      c.decodeOpts,
+		Arm:             c.armFn(),
+	}
+}
+
+// decodeOptsWith is the decode option set for handlers that take a
+// resolver directly (the control surface).
+func (c *Core) decodeOptsWith(resolver wire.NetworkResolver) []decodeOption {
+	opts := append([]decodeOption(nil), c.decodeOpts...)
+	if resolver != nil {
+		opts = append(opts, withNetworkResolver(resolver))
+	}
+	return opts
+}
+
+// armFn is the eager-arming hook, or nil when this core arms lazily.
+func (c *Core) armFn() armFunc {
+	if !c.eagerArm {
+		return nil
+	}
+	return c.Arm
+}
+
+// Arm starts d's background fault now, through the interceptor (so the
+// fault span, the injection counter and the registry entry are exactly
+// what a request-triggered start would produce). Failures are logged: a
+// rule set must still apply when one fault cannot start.
+func (c *Core) Arm(point evaluator.InjectionPoint, d *evaluator.Decision) {
+	if _, err := c.ic.StartFault(context.Background(), evaluator.Request{Point: point, Labels: map[string]string{}}, d); err != nil {
+		c.logger.Warn("eager arm failed", "fault", d.Name, "error", err)
 	}
 }
 
