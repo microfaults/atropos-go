@@ -26,7 +26,30 @@ import (
 type decodeConfig struct {
 	resolve      wire.NetworkResolver
 	inlineToxic  InlineToxicHost
+	resourceHost ResourceHost
 	capabilities map[string]bool // nil = everything
+}
+
+// ResourceHost builds the fault that executes a resource-category fault on
+// behalf of a host that must not run it itself: the atroposd sidecar
+// delegates to the node agent (design §5.14). name is the rule or slot the
+// fault belongs to; req carries the category, type, params and mechanism.
+type ResourceHost func(name string, req *wire.FaultRequest, base fault.FaultConfig) (fault.Fault, error)
+
+// WithResourceHost installs the resource host; every resource fault then
+// decodes through it.
+func WithResourceHost(h ResourceHost) DecodeOption {
+	return func(c *decodeConfig) { c.resourceHost = h }
+}
+
+// resourceMechanism reads the optional mechanism param shared by the
+// resource fault types.
+func resourceMechanism(params json.RawMessage) string {
+	var m struct {
+		Mechanism string `json:"mechanism"`
+	}
+	_ = json.Unmarshal(params, &m)
+	return m.Mechanism
 }
 
 // InlineToxicHost builds the fault that hosts a network toxic whose
@@ -199,6 +222,14 @@ func decodeFault(name string, f *wire.CompiledFault, cfg *decodeConfig) (fault.F
 		}
 		return decodeNetworkFault(name, f.FaultType, f.Network, params, baseCfg, cfg)
 	case "resource":
+		if cfg.resourceHost != nil {
+			return cfg.resourceHost(name, f, baseCfg)
+		}
+		if resourceMechanism(params) == faultparams.MechanismQuota {
+			// Lowering a cgroup limit needs the node agent's authority; an
+			// in-process host has none.
+			return nil, &UnsupportedFaultError{Category: "resource", FaultType: f.FaultType + "/quota"}
+		}
 		return decodeResourceFault(f.FaultType, params, baseCfg)
 	default:
 		return nil, fmt.Errorf("unknown fault category %q", f.Category)
@@ -276,6 +307,16 @@ func decodeInlineFault(faultType string, params json.RawMessage, baseCfg fault.F
 	default:
 		return nil, fmt.Errorf("unknown inline fault type %q", faultType)
 	}
+}
+
+// DecodeResourceFault builds a resource-category fault from its wire
+// parameters. Exported for the node agent's stress child, which runs the
+// same implementations placed in the target container's cgroup.
+func DecodeResourceFault(faultType string, params json.RawMessage, baseCfg fault.FaultConfig) (fault.Fault, error) {
+	if len(params) == 0 {
+		params = json.RawMessage("{}")
+	}
+	return decodeResourceFault(faultType, params, baseCfg)
 }
 
 func decodeResourceFault(faultType string, params json.RawMessage, baseCfg fault.FaultConfig) (fault.Fault, error) {

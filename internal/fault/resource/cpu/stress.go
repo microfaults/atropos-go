@@ -63,7 +63,10 @@ func (s *Stress) Start(ctx context.Context) (*fault.Handle, error) {
 		return nil, err
 	}
 
-	available := AvailableCPUs()
+	available := s.Config.AvailableCPUs
+	if available <= 0 {
+		available = AvailableCPUs()
+	}
 
 	// Total CPU units to consume = TargetLoad × available CPUs.
 	// Workers = ceil(totalUnits), capped to NumCPU().

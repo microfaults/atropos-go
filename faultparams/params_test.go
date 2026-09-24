@@ -82,3 +82,20 @@ func TestValidateRaw_GoldenFixtures(t *testing.T) {
 		}
 	}
 }
+
+func TestResourceMechanism(t *testing.T) {
+	for _, m := range []string{"", "burn", "quota"} {
+		if err := (ResourceCPU{TargetLoad: 0.5, Mechanism: m}).Validate(); err != nil {
+			t.Errorf("cpu mechanism %q: %v", m, err)
+		}
+		if err := (ResourceMemory{TargetLoad: 0.5, Mechanism: m}).Validate(); err != nil {
+			t.Errorf("memory mechanism %q: %v", m, err)
+		}
+		if err := (ResourceIO{Mechanism: m}).Validate(); err != nil {
+			t.Errorf("io mechanism %q: %v", m, err)
+		}
+	}
+	if err := (ResourceCPU{TargetLoad: 0.5, Mechanism: "steal"}).Validate(); err == nil {
+		t.Error("unknown mechanism must be rejected")
+	}
+}

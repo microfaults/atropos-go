@@ -44,6 +44,14 @@ type Config struct {
 	// ThrashWorkers is the number of goroutines that concurrently access
 	// allocated memory when Thrashing is enabled. Defaults to 2 if zero.
 	ThrashWorkers int
+
+	// AvailableBytes, when > 0, replaces cgroup/meminfo detection of the
+	// memory limit the load fraction applies to, and CurrentBytes stands in
+	// for the detected current usage. The node agent sets them for a stress
+	// child it places in another container's cgroup: the child's own
+	// /sys/fs/cgroup view is its cgroup namespace, not the target's.
+	AvailableBytes uint64
+	CurrentBytes   uint64
 }
 
 // Validate checks that the memory config is valid.

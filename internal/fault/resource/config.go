@@ -42,6 +42,12 @@ type Config struct {
 	// Used by CPU. Memory has no duty cycle (allocations are sticky);
 	// IO and Disk shape via token-bucket refill rate, not Window.
 	Window time.Duration
+
+	// AvailableCPUs, when > 0, replaces cgroup/runtime detection of the CPU
+	// capacity the load fraction applies to. The node agent sets it for a
+	// stress child it places in another container's cgroup: the child's
+	// own /sys/fs/cgroup view is its cgroup namespace, not the target's.
+	AvailableCPUs float64
 }
 
 const DefaultWindow = 100 * time.Millisecond

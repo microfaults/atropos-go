@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault/inline"
 	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
 	"git.ucsc.edu/microfaults/atropos-go/internal/metrics"
 	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
@@ -123,5 +125,29 @@ func TestHealthHandler_StampsHostAndCapture(t *testing.T) {
 	}
 	if rec.Code != 200 || h.Status != "offline" || h.Host != "sidecar" || h.Capture != "transparent" {
 		t.Fatalf("code=%d health=%+v", rec.Code, h)
+	}
+}
+
+func TestDecode_QuotaMechanismNeedsAResourceHost(t *testing.T) {
+	rule := []wire.CompiledRule{{Name: "cpu-quota", InjectionPoint: "ingress", Mode: "background",
+		Fault: &wire.CompiledFault{Category: "resource", FaultType: "cpu", DurationMs: 1000,
+			Params: json.RawMessage(`{"target_load":0.5,"mechanism":"quota"}`)}}}
+
+	// In-process: skipped and counted, not executed, not a sync failure.
+	before := unsupportedCount(t, "resource")
+	rules, err := decodeCompiledRules(rule)
+	if err != nil || len(rules) != 0 || unsupportedCount(t, "resource")-before != 1 {
+		t.Fatalf("rules=%d err=%v counted=%v", len(rules), err, unsupportedCount(t, "resource")-before)
+	}
+
+	// With a resource host every resource fault goes through it.
+	var gotName, gotMech string
+	host := func(name string, req *wire.FaultRequest, base fault.FaultConfig) (fault.Fault, error) {
+		gotName, gotMech = name, resourceMechanism(req.Params)
+		return &inline.Latency{FaultConfig: base, Delay: time.Millisecond}, nil
+	}
+	rules, err = decodeCompiledRules(rule, WithResourceHost(host))
+	if err != nil || len(rules) != 1 || gotName != "cpu-quota" || gotMech != "quota" {
+		t.Fatalf("rules=%d err=%v name=%q mech=%q", len(rules), err, gotName, gotMech)
 	}
 }

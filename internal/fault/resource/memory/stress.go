@@ -59,6 +59,9 @@ func (s *Stress) Start(ctx context.Context) (*fault.Handle, error) {
 
 	available := AvailableMemory()
 	currentUsage := CurrentUsage()
+	if s.AvailableBytes > 0 {
+		available, currentUsage = s.AvailableBytes, s.CurrentBytes
+	}
 	chunkSize := s.EffectiveChunkSize()
 	thrashWorkers := s.EffectiveThrashWorkers()
 

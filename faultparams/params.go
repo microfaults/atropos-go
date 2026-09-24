@@ -82,10 +82,30 @@ func (p InlineHang) Validate() error {
 // resource
 // ---------------------------------------------------------------------------
 
+// Resource mechanisms (design doc §5.14). "burn" (the default) runs the
+// stress implementation — in-process, or placed in the target container's
+// cgroup by the node agent. "quota" lowers the target cgroup's limit
+// instead of consuming the resource; only the node agent can execute it.
+const (
+	MechanismBurn  = "burn"
+	MechanismQuota = "quota"
+)
+
+// ValidateMechanism accepts "", "burn" or "quota".
+func ValidateMechanism(category, m string) error {
+	switch m {
+	case "", MechanismBurn, MechanismQuota:
+		return nil
+	default:
+		return fmt.Errorf("resource %s: unknown mechanism %q (want burn|quota)", category, m)
+	}
+}
+
 // ResourceCPU burns CPU at an incremental target load with a duty-cycle window.
 type ResourceCPU struct {
-	TargetLoad float64 `json:"target_load"`      // required, fraction in (0,1]
-	Window     string  `json:"window,omitempty"` // duty-cycle period; "" = SDK default (100ms)
+	TargetLoad float64 `json:"target_load"`         // required, fraction in (0,1]
+	Window     string  `json:"window,omitempty"`    // duty-cycle period; "" = SDK default (100ms)
+	Mechanism  string  `json:"mechanism,omitempty"` // "" | "burn" | "quota" (node agent only)
 }
 
 func (p ResourceCPU) Validate() error {
@@ -97,7 +117,7 @@ func (p ResourceCPU) Validate() error {
 			return fmt.Errorf("resource cpu: invalid window %q: %w", p.Window, err)
 		}
 	}
-	return nil
+	return ValidateMechanism("cpu", p.Mechanism)
 }
 
 // ResourceMemory allocates (and optionally thrashes) memory toward a target
@@ -107,6 +127,7 @@ type ResourceMemory struct {
 	ChunkSize     int     `json:"chunk_size,omitempty"`     // bytes per chunk; 0 = SDK default (1 MiB)
 	Thrashing     bool    `json:"thrashing,omitempty"`      // page-thrash mode
 	ThrashWorkers int     `json:"thrash_workers,omitempty"` // 0 = SDK default (2)
+	Mechanism     string  `json:"mechanism,omitempty"`      // "" | "burn" | "quota" (node agent only)
 }
 
 func (p ResourceMemory) Validate() error {
@@ -119,7 +140,7 @@ func (p ResourceMemory) Validate() error {
 	if p.ThrashWorkers < 0 {
 		return errors.New("resource memory: thrash_workers must be >= 0")
 	}
-	return nil
+	return ValidateMechanism("memory", p.Mechanism)
 }
 
 // ResourceDisk fills disk at a sustained write rate up to a usage cap.
@@ -145,6 +166,7 @@ type ResourceIO struct {
 	Workers   int    `json:"workers,omitempty"`    // 0 = SDK default (4)
 	Path      string `json:"path,omitempty"`       // scratch dir; "" = os.TempDir()
 	Mode      string `json:"mode,omitempty"`       // "read" (default) | "write" | "read_write"
+	Mechanism string `json:"mechanism,omitempty"`  // "" | "burn" | "quota" (node agent only)
 }
 
 func (p ResourceIO) Validate() error {
@@ -153,10 +175,10 @@ func (p ResourceIO) Validate() error {
 	}
 	switch p.Mode {
 	case "", "read", "write", "read_write":
-		return nil
 	default:
 		return fmt.Errorf("resource io: unknown mode %q (want read|write|read_write)", p.Mode)
 	}
+	return ValidateMechanism("io", p.Mechanism)
 }
 
 // ---------------------------------------------------------------------------
