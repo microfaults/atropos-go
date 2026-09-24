@@ -1,9 +1,9 @@
-package atropos
+package instrument
 
 // Cross-repo wire contract tests for the manteion↔SDK sync payload. The
 // historical bug class here: manteion emitted "active_fault" (singular,
 // object) while the SDK decoded "active_faults" (plural, array) and silently
-// dropped the intent. Both ends now marshal/unmarshal RuleSync, and
+// dropped the intent. Both ends now marshal/unmarshal wire.RuleSync, and
 // this test guards the full marshal → unmarshal → Apply loop including the
 // omitted-vs-empty field semantics Apply's reconciliation relies on.
 
@@ -14,19 +14,20 @@ import (
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
 func TestRuleSync_WireRoundTripAndApply(t *testing.T) {
-	sync := RuleSync{
+	sync := wire.RuleSync{
 		Version: 7,
-		Rules: []CompiledRule{
+		Rules: []wire.CompiledRule{
 			{
 				Name:           "lat-rule",
 				InjectionPoint: "ingress",
 				Labels:         map[string]string{"workflow": "browse"},
 				Mode:           "background",
 				Priority:       50,
-				Fault: &CompiledFault{
+				Fault: &wire.CompiledFault{
 					Category:  "inline",
 					FaultType: "latency",
 					Params:    json.RawMessage(`{"delay":"250ms","jitter":"50ms"}`),
@@ -36,17 +37,17 @@ func TestRuleSync_WireRoundTripAndApply(t *testing.T) {
 				Name:           "cb-rule",
 				InjectionPoint: "egress",
 				Mode:           "inline",
-				CacheBox:       &CompiledCacheBox{Mode: "replay_with_delay", KeyStrategy: "exact_with_host"},
+				CacheBox:       &wire.CompiledCacheBox{Mode: "replay_with_delay", KeyStrategy: "exact_with_host"},
 			},
 		},
-		ActiveFaults: []FaultRequest{{
+		ActiveFaults: []wire.FaultRequest{{
 			ID:         "cfg-123",
 			Category:   "resource",
 			FaultType:  "cpu",
 			DurationMs: 60000,
 			Params:     json.RawMessage(`{"target_load":0.7}`),
 		}},
-		FreezeCfg: &DelayRequest{Mu: 8.5, Sigma: 0.3, Seed: 42},
+		FreezeCfg: &wire.DelayRequest{Mu: 8.5, Sigma: 0.3, Seed: 42},
 	}
 
 	// Wire round-trip.
@@ -61,7 +62,7 @@ func TestRuleSync_WireRoundTripAndApply(t *testing.T) {
 			t.Errorf("wire payload missing %s: %s", key, raw)
 		}
 	}
-	var decoded RuleSync
+	var decoded wire.RuleSync
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
@@ -72,7 +73,7 @@ func TestRuleSync_WireRoundTripAndApply(t *testing.T) {
 	cb := cachebox.New(cachebox.Config{})
 	defer cb.Stop()
 
-	resp := RegisterResponse{Status: "poll", RuleSync: decoded}
+	resp := wire.RegisterResponse{Status: "poll", RuleSync: decoded}
 	if err := apply(resp, applyTargets{Evaluator: eval, DemoEval: demo, CacheBox: cb}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -87,13 +88,13 @@ func TestRuleSync_WireRoundTripAndApply(t *testing.T) {
 
 // TestRuleSync_EmptyVsAbsentSemantics pins Apply's reconciliation contract:
 // an empty rules list is "no change", but an empty active_faults list means
-// "clear all manual faults" — which is why RuleSync marshals both fields
+// "clear all manual faults" — which is why wire.RuleSync marshals both fields
 // explicitly instead of omitempty.
 func TestRuleSync_EmptyVsAbsentSemantics(t *testing.T) {
 	// Arm one slot first.
 	demo := &demoEvaluator{}
-	armed := RegisterResponse{RuleSync: RuleSync{
-		ActiveFaults: []FaultRequest{{
+	armed := wire.RegisterResponse{RuleSync: wire.RuleSync{
+		ActiveFaults: []wire.FaultRequest{{
 			ID:        "f1",
 			FaultType: "latency",
 			Params:    json.RawMessage(`{"delay":"100ms"}`),
@@ -107,21 +108,21 @@ func TestRuleSync_EmptyVsAbsentSemantics(t *testing.T) {
 	}
 
 	// Pre-existing rules must survive an empty rules list.
-	eval := evaluator.NewStaticEvaluator(StaticRule{Name: "keep", Point: evaluator.Ingress})
+	eval := evaluator.NewStaticEvaluator(wire.StaticRule{Name: "keep", Point: evaluator.Ingress})
 
-	// A marshalled empty RuleSync carries explicit empty arrays.
-	raw, _ := json.Marshal(RuleSync{Version: 8})
+	// A marshalled empty wire.RuleSync carries explicit empty arrays.
+	raw, _ := json.Marshal(wire.RuleSync{Version: 8})
 	for _, key := range []string{`"rules"`, `"active_faults"`} {
 		if !strings.Contains(string(raw), key) {
-			t.Fatalf("empty RuleSync must still carry %s explicitly: %s", key, raw)
+			t.Fatalf("empty wire.RuleSync must still carry %s explicitly: %s", key, raw)
 		}
 	}
-	var decoded RuleSync
+	var decoded wire.RuleSync
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	resp := RegisterResponse{Status: "poll", RuleSync: decoded}
+	resp := wire.RegisterResponse{Status: "poll", RuleSync: decoded}
 	if err := apply(resp, applyTargets{Evaluator: eval, DemoEval: demo}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}

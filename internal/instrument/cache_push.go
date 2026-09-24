@@ -1,4 +1,4 @@
-package atropos
+package instrument
 
 import (
 	"bytes"
@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
+	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
 // cachePushConfig configures a cachePushClient.
@@ -411,13 +412,13 @@ func (c *cachePushClient) Stop() {
 // per-pair received count (INV-3). Called when a rule-version change
 // removes the recording context for this pair (ATRO-5(c)) -- detecting
 // that transition is the caller's job (see CacheDrainTracker).
-func (c *cachePushClient) SendDrainReport(experimentID, phaseID string, cb *cachebox.CacheBox) DrainReportResponse {
+func (c *cachePushClient) SendDrainReport(experimentID, phaseID string, cb *cachebox.CacheBox) wire.DrainReportResponse {
 	cb.FlushRecording()
 	c.Flush()
 
 	pair := cachebox.PhasePair{ExperimentID: experimentID, PhaseID: phaseID}
 	fc := cb.Fidelity().Snapshot(pair)
-	report := DrainReport{
+	report := wire.DrainReport{
 		ExperimentID:           experimentID,
 		PhaseID:                phaseID,
 		Service:                c.service,
@@ -433,7 +434,7 @@ func (c *cachePushClient) SendDrainReport(experimentID, phaseID string, cb *cach
 	body, err := json.Marshal(report)
 	if err != nil {
 		c.logger.Warn("drain report marshal error", "error", err)
-		return DrainReportResponse{Accepted: false}
+		return wire.DrainReportResponse{Accepted: false}
 	}
 
 	for attempt := 1; attempt <= maxPushAttempts; attempt++ {
@@ -443,7 +444,7 @@ func (c *cachePushClient) SendDrainReport(experimentID, phaseID string, cb *cach
 		if err != nil {
 			cancel()
 			c.logger.Warn("drain report request build error", "error", err)
-			return DrainReportResponse{Accepted: false}
+			return wire.DrainReportResponse{Accepted: false}
 		}
 		req.Header.Set("Content-Type", "application/json")
 
@@ -457,7 +458,7 @@ func (c *cachePushClient) SendDrainReport(experimentID, phaseID string, cb *cach
 			continue
 		}
 
-		var decoded DrainReportResponse
+		var decoded wire.DrainReportResponse
 		_ = json.NewDecoder(resp.Body).Decode(&decoded)
 		resp.Body.Close()
 
@@ -472,7 +473,7 @@ func (c *cachePushClient) SendDrainReport(experimentID, phaseID string, cb *cach
 			time.Sleep(pushBackoff(attempt))
 		}
 	}
-	return DrainReportResponse{Accepted: false}
+	return wire.DrainReportResponse{Accepted: false}
 }
 
 // currentBatchSeq returns the last batch_seq assigned, for the drain

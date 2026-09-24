@@ -1,4 +1,4 @@
-package atropos
+package instrument
 
 import (
 	"encoding/json"

@@ -1,4 +1,4 @@
-package atropos
+package instrument
 
 import (
 	"encoding/json"
@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
+	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
 // TestFidelity_SnapshotGoldenJSON runs a scripted sequence through the
@@ -57,7 +58,7 @@ func TestFidelity_SnapshotGoldenJSON(t *testing.T) {
 		}
 	}
 
-	var snap FidelitySnapshot
+	var snap wire.FidelitySnapshot
 	if err := json.Unmarshal(rec.Body.Bytes(), &snap); err != nil {
 		t.Fatalf("decode snapshot: %v", err)
 	}

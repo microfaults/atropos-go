@@ -1,4 +1,4 @@
-package atropos
+package instrument
 
 import (
 	"encoding/json"
@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
+	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
 func TestCachePushClient_BatchByCount(t *testing.T) {
@@ -264,20 +265,20 @@ func TestPush_TerminalRejectStopsRetry(t *testing.T) {
 // many records the test actually enqueued.
 func TestPush_DrainReportCountsMatchEnqueued(t *testing.T) {
 	var mu sync.Mutex
-	var drainReports []DrainReport
+	var drainReports []wire.DrainReport
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/cache/ingest":
 			w.WriteHeader(http.StatusCreated)
 		case "/api/v1/sdk/cachebox/drain":
-			var report DrainReport
+			var report wire.DrainReport
 			b, _ := io.ReadAll(r.Body)
 			json.Unmarshal(b, &report)
 			mu.Lock()
 			drainReports = append(drainReports, report)
 			mu.Unlock()
-			_ = json.NewEncoder(w).Encode(DrainReportResponse{Accepted: true})
+			_ = json.NewEncoder(w).Encode(wire.DrainReportResponse{Accepted: true})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -341,19 +342,19 @@ func TestPush_DrainReportCountsMatchEnqueued(t *testing.T) {
 // any phase after the first.
 func TestPush_DrainReportIsPerPhase(t *testing.T) {
 	var mu sync.Mutex
-	var drainReports []DrainReport
+	var drainReports []wire.DrainReport
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/v1/cache/ingest":
 			w.WriteHeader(http.StatusCreated)
 		case "/api/v1/sdk/cachebox/drain":
-			var report DrainReport
+			var report wire.DrainReport
 			b, _ := io.ReadAll(r.Body)
 			json.Unmarshal(b, &report)
 			mu.Lock()
 			drainReports = append(drainReports, report)
 			mu.Unlock()
-			_ = json.NewEncoder(w).Encode(DrainReportResponse{Accepted: true})
+			_ = json.NewEncoder(w).Encode(wire.DrainReportResponse{Accepted: true})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}

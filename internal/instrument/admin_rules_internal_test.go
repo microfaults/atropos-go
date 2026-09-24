@@ -1,4 +1,4 @@
-package atropos
+package instrument
 
 import (
 	"context"
@@ -7,6 +7,8 @@ import (
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
+	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
+	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
 // TestApplyRuleSetStopsRemovedRuleFaults pins the fault-stop seam (X1):
@@ -14,6 +16,8 @@ import (
 // must cancel running background faults whose rule dropped out -- however
 // the replacement arrives (poll Apply, push endpoint, teardown clear).
 func TestApplyRuleSetStopsRemovedRuleFaults(t *testing.T) {
+	reg := interceptor.NewFaultRegistry()
+	t.Cleanup(reg.Close)
 	longFault := func(ctx context.Context) (*fault.Handle, error) {
 		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		h := fault.NewHandle(cancel)
@@ -24,21 +28,21 @@ func TestApplyRuleSetStopsRemovedRuleFaults(t *testing.T) {
 		return h, nil
 	}
 
-	h, deduped, err := defaultRegistry.StartOrJoin("r1", evaluator.DeduplicateByRule, longFault)
+	h, deduped, err := reg.StartOrJoin("r1", evaluator.DeduplicateByRule, longFault)
 	if err != nil || deduped {
 		t.Fatalf("seed fault: err=%v deduped=%v", err, deduped)
 	}
-	hSurvivor, _, err := defaultRegistry.StartOrJoin("r2", evaluator.DeduplicateByRule, longFault)
+	hSurvivor, _, err := reg.StartOrJoin("r2", evaluator.DeduplicateByRule, longFault)
 	if err != nil {
 		t.Fatalf("seed survivor fault: %v", err)
 	}
 
 	eval := evaluator.NewStaticEvaluator(
-		StaticRule{Name: "r1", Point: evaluator.Egress},
-		StaticRule{Name: "r2", Point: evaluator.Egress},
+		wire.StaticRule{Name: "r1", Point: evaluator.Egress},
+		wire.StaticRule{Name: "r2", Point: evaluator.Egress},
 	)
 	// r1 drops out of the set; r2 stays.
-	applyRuleSet(eval, []StaticRule{{Name: "r2", Point: evaluator.Egress}})
+	applyRuleSet(reg, eval, []wire.StaticRule{{Name: "r2", Point: evaluator.Egress}})
 
 	select {
 	case <-h.Done():

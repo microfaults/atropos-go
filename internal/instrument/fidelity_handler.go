@@ -1,10 +1,11 @@
-package atropos
+package instrument
 
 import (
 	"encoding/json"
 	"net/http"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
+	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
 // cacheBoxFidelityHandler serves
@@ -32,14 +33,14 @@ func cacheBoxFidelityHandler(cb *cachebox.CacheBox, service, instanceID string) 
 		fc := cb.Fidelity().Snapshot(cachebox.PhasePair{ExperimentID: experimentID, PhaseID: phaseID})
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(FidelitySnapshot{
+		json.NewEncoder(w).Encode(wire.FidelitySnapshot{
 			InstanceID:   instanceID,
 			Service:      service,
 			ExperimentID: experimentID,
 			PhaseID:      phaseID,
 			ReplayHits:   fc.ReplayHits,
 			ReplayMisses: fc.ReplayMisses,
-			MissReasons: FidelityMissReasons{
+			MissReasons: wire.FidelityMissReasons{
 				KeyAbsent:        fc.MissKeyAbsent,
 				NotCommitted:     fc.MissNotCommitted,
 				BodyBufferFailed: fc.MissBodyBufferFailed,
@@ -50,11 +51,11 @@ func cacheBoxFidelityHandler(cb *cachebox.CacheBox, service, instanceID string) 
 			PushRejectedTerminal:   fc.PushRejectedTerminal,
 			KeyCollisionsDivergent: fc.KeyCollisionsDivergent,
 			KeyCollisionsIdentical: fc.KeyCollisionsIdentical,
-			ReplayAgeMs: FidelityReplayAge{
+			ReplayAgeMs: wire.FidelityReplayAge{
 				Max:  fc.ReplayAgeMaxMs,
 				Mean: fc.ReplayAgeMeanMs,
 			},
-			Preload: FidelityPreloadState{
+			Preload: wire.FidelityPreloadState{
 				Committed:   fc.PreloadCommitted,
 				Entries:     fc.PreloadEntries,
 				Checksum:    fc.PreloadChecksum,

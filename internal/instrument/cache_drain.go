@@ -1,10 +1,11 @@
-package atropos
+package instrument
 
 import (
 	"log/slog"
 	"sync"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
+	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
 // recordingPhaseKey identifies one (experiment_id, phase_id) pair a
@@ -15,11 +16,11 @@ type recordingPhaseKey struct {
 }
 
 // activeRecordingPhases scans rules for cache-box passthrough actions
-// carrying a CacheBoxContext and returns the set of (experiment_id,
+// carrying a wire.CacheBoxContext and returns the set of (experiment_id,
 // phase_id) pairs they authorize recording for. Used to detect phase
 // transitions across a rule update (design doc Q2/Q5): a pair present in
 // an older call but absent from a newer one has stopped recording.
-func activeRecordingPhases(rules []CompiledRule) map[recordingPhaseKey]bool {
+func activeRecordingPhases(rules []wire.CompiledRule) map[recordingPhaseKey]bool {
 	active := make(map[recordingPhaseKey]bool)
 	for _, r := range rules {
 		if r.CacheBox == nil || r.CacheBox.Mode != "passthrough" || r.CacheBox.Context == nil {
@@ -49,7 +50,7 @@ func endedRecordingPhases(prev, curr map[recordingPhaseKey]bool) []recordingPhas
 // cacheDrainTracker watches successive rule syncs for cache-box recording
 // phases that have ended and triggers a flush + W3 drain report for each
 // (design doc Q2: "the poll-driven bump manteion issues at drain start"
-// removes the phase's CacheBoxContext from the rule set). Wire it via
+// removes the phase's wire.CacheBoxContext from the rule set). Wire it via
 // ApplyTargets.CacheDrain; Apply calls Observe for every authoritative
 // (non-nil, including empty) rule set it applies -- the empty set is the
 // common drain trigger, since a baseline-recorded service usually has no
@@ -78,7 +79,7 @@ func newCacheDrainTracker(cb *cachebox.CacheBox, pusher *cachePushClient, logger
 // a drain report via pusher. Best-effort: a drain failure is logged, never
 // returned, so it never blocks rule application. Nil-safe (a nil tracker's
 // Observe is a no-op), so ApplyTargets.CacheDrain is a true optional.
-func (t *cacheDrainTracker) Observe(rules []CompiledRule) {
+func (t *cacheDrainTracker) Observe(rules []wire.CompiledRule) {
 	if t == nil {
 		return
 	}

@@ -1,4 +1,4 @@
-package atropos
+package instrument
 
 import (
 	"context"
@@ -11,11 +11,13 @@ import (
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
+	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
+	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
 func TestFaultAdmin_PostCPUStress(t *testing.T) {
 	eval := &demoEvaluator{}
-	handler := faultAdminHandler(eval, nil)
+	handler := faultAdminHandler(eval, nil, nil)
 
 	body := `{"category":"resource","fault_type":"cpu","duration_ms":5000,"params":{"target_load":0.7}}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
@@ -35,7 +37,7 @@ func TestFaultAdmin_PostNetworkLatency(t *testing.T) {
 	resolver := func(target string) (string, string, error) {
 		return ":19099", "localhost:6379", nil
 	}
-	handler := faultAdminHandler(eval, resolver)
+	handler := faultAdminHandler(eval, nil, resolver)
 
 	body := `{"category":"network","fault_type":"latency","duration_ms":5000,"network":{"target":"redis"},"params":{"delay":"100ms"}}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
@@ -49,7 +51,7 @@ func TestFaultAdmin_PostNetworkLatency(t *testing.T) {
 
 func TestFaultAdmin_PostLatency(t *testing.T) {
 	eval := &demoEvaluator{}
-	handler := faultAdminHandler(eval, nil)
+	handler := faultAdminHandler(eval, nil, nil)
 
 	// POST latency fault
 	body := `{"fault_type":"latency","params":{"delay":"200ms","jitter":"50ms"}}`
@@ -61,7 +63,7 @@ func TestFaultAdmin_PostLatency(t *testing.T) {
 		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	var status FaultStatus
+	var status wire.FaultStatus
 	json.NewDecoder(rec.Body).Decode(&status)
 	if !status.Active {
 		t.Fatal("expected active=true")
@@ -103,7 +105,7 @@ func TestFaultAdmin_PostLatency(t *testing.T) {
 
 func TestFaultAdmin_PostError(t *testing.T) {
 	eval := &demoEvaluator{}
-	handler := faultAdminHandler(eval, nil)
+	handler := faultAdminHandler(eval, nil, nil)
 
 	body := `{"fault_type":"error","params":{"status_code":503,"message":"service down"}}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
@@ -114,7 +116,7 @@ func TestFaultAdmin_PostError(t *testing.T) {
 		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	var status FaultStatus
+	var status wire.FaultStatus
 	json.NewDecoder(rec.Body).Decode(&status)
 	if len(status.Faults) == 0 || !strings.Contains(string(status.Faults[0].Params), "503") {
 		t.Fatalf("expected status_code=503 in params, got %s", string(status.Faults[0].Params))
@@ -123,7 +125,7 @@ func TestFaultAdmin_PostError(t *testing.T) {
 
 func TestFaultAdmin_PostHang(t *testing.T) {
 	eval := &demoEvaluator{}
-	handler := faultAdminHandler(eval, nil)
+	handler := faultAdminHandler(eval, nil, nil)
 
 	body := `{"fault_type":"hang","params":{"duration":"2s"}}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
@@ -137,7 +139,7 @@ func TestFaultAdmin_PostHang(t *testing.T) {
 
 func TestFaultAdmin_InvalidType(t *testing.T) {
 	eval := &demoEvaluator{}
-	handler := faultAdminHandler(eval, nil)
+	handler := faultAdminHandler(eval, nil, nil)
 
 	body := `{"fault_type":"explode"}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
@@ -151,7 +153,7 @@ func TestFaultAdmin_InvalidType(t *testing.T) {
 
 func TestFaultAdmin_MissingDelay(t *testing.T) {
 	eval := &demoEvaluator{}
-	handler := faultAdminHandler(eval, nil)
+	handler := faultAdminHandler(eval, nil, nil)
 
 	body := `{"fault_type":"latency"}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body))
@@ -165,7 +167,7 @@ func TestFaultAdmin_MissingDelay(t *testing.T) {
 
 func TestFaultAdmin_InvalidJSON(t *testing.T) {
 	eval := &demoEvaluator{}
-	handler := faultAdminHandler(eval, nil)
+	handler := faultAdminHandler(eval, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader("{bad"))
 	rec := httptest.NewRecorder()
@@ -178,7 +180,7 @@ func TestFaultAdmin_InvalidJSON(t *testing.T) {
 
 func TestFaultAdmin_MethodNotAllowed(t *testing.T) {
 	eval := &demoEvaluator{}
-	handler := faultAdminHandler(eval, nil)
+	handler := faultAdminHandler(eval, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPut, "/admin/fault", nil)
 	rec := httptest.NewRecorder()
@@ -210,7 +212,7 @@ func seedLongFault(ctx context.Context) (*fault.Handle, error) {
 // reconfiguring zero-arg handler this used to guard against no longer
 // exists.
 func TestAdminFault_ComposesWithHostEvaluator_RegistryUntouched(t *testing.T) {
-	host := evaluator.NewStaticEvaluator(StaticRule{
+	host := evaluator.NewStaticEvaluator(wire.StaticRule{
 		Name:  "host-egress-rule",
 		Point: evaluator.Egress,
 		Decision: evaluator.Decision{
@@ -220,20 +222,19 @@ func TestAdminFault_ComposesWithHostEvaluator_RegistryUntouched(t *testing.T) {
 		},
 	})
 	demo := &demoEvaluator{}
-	configure(evaluator.NewMultiEvaluator(host, demo), nil)
-	defer configure(nil, nil) // reset the package interceptor for later tests
-
-	regBefore := defaultRegistry
+	reg := interceptor.NewFaultRegistry()
+	t.Cleanup(reg.Close)
+	ic := interceptor.New(evaluator.NewMultiEvaluator(host, demo), nil, interceptor.WithRegistry(reg))
 
 	// Seed a running background fault through the shared registry, as a
 	// rule-attached fault would.
-	h, deduped, err := defaultRegistry.StartOrJoin("host-bg", evaluator.DeduplicateByRule, seedLongFault)
+	h, deduped, err := reg.StartOrJoin("host-bg", evaluator.DeduplicateByRule, seedLongFault)
 	if err != nil || deduped {
 		t.Fatalf("seed fault: err=%v deduped=%v", err, deduped)
 	}
 
 	// Arm an admin fault through the handler.
-	handler := faultAdminHandler(demo, nil)
+	handler := faultAdminHandler(demo, reg, nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/fault",
 		strings.NewReader(`{"fault_type":"latency","params":{"delay":"50ms"}}`)))
@@ -243,33 +244,30 @@ func TestAdminFault_ComposesWithHostEvaluator_RegistryUntouched(t *testing.T) {
 
 	// (a) Where a host rule matches, it wins: the armed admin latency must
 	// not shadow the host's egress replay rule mid-experiment.
-	d := currentInterceptor().Evaluate(context.Background(), evaluator.Request{Point: evaluator.Egress})
+	d := ic.Evaluate(context.Background(), evaluator.Request{Point: evaluator.Egress})
 	if d == nil || d.Name != "host-egress-rule" {
 		t.Fatalf("egress decision = %+v, want the host rule to win over the admin slot", d)
 	}
 
 	// (b) Where no host rule matches, the admin slot fills the gap.
-	d = currentInterceptor().Evaluate(context.Background(), evaluator.Request{Point: evaluator.Ingress})
+	d = ic.Evaluate(context.Background(), evaluator.Request{Point: evaluator.Ingress})
 	if d == nil || d.Reason != "admin" {
 		t.Fatalf("ingress decision = %+v, want the admin fault", d)
 	}
 
-	// (c) Arm + clear left the registry alone: same pointer, seeded fault
+	// (c) Arm + clear left the registry alone: seeded fault
 	// still running, and still stoppable through the same registry.
 	recD := httptest.NewRecorder()
 	handler.ServeHTTP(recD, httptest.NewRequest(http.MethodDelete, "/admin/fault", nil))
 	if recD.Code != http.StatusOK {
 		t.Fatalf("clear admin faults: %d", recD.Code)
 	}
-	if defaultRegistry != regBefore {
-		t.Fatal("defaultRegistry pointer changed across admin arm/clear")
-	}
 	select {
 	case <-h.Done():
 		t.Fatal("admin arm/clear cancelled a host background fault")
 	case <-time.After(100 * time.Millisecond):
 	}
-	defaultRegistry.Stop("host-bg")
+	reg.Stop("host-bg")
 	select {
 	case <-h.Done():
 	case <-time.After(2 * time.Second):
@@ -279,7 +277,7 @@ func TestAdminFault_ComposesWithHostEvaluator_RegistryUntouched(t *testing.T) {
 
 func TestFaultAdmin_MultiSlotIDs(t *testing.T) {
 	eval := &demoEvaluator{}
-	handler := faultAdminHandler(eval, nil)
+	handler := faultAdminHandler(eval, nil, nil)
 
 	// POST first inline latency with ID
 	body1 := `{"id":"f1","fault_type":"latency","params":{"delay":"100ms"}}`

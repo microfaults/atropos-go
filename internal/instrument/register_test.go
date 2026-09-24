@@ -1,4 +1,4 @@
-package atropos
+package instrument
 
 import (
 	"context"
@@ -13,6 +13,7 @@ import (
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
 func TestRegister_Success(t *testing.T) {
@@ -24,7 +25,7 @@ func TestRegister_Success(t *testing.T) {
 			t.Errorf("path = %s, want /api/v1/sdk/register", r.URL.Path)
 		}
 		body, _ := io.ReadAll(r.Body)
-		var req RegisterRequest
+		var req wire.RegisterRequest
 		if err := json.Unmarshal(body, &req); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
@@ -34,14 +35,14 @@ func TestRegister_Success(t *testing.T) {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(RegisterResponse{
+		_ = json.NewEncoder(w).Encode(wire.RegisterResponse{
 			Status: "registered",
-			RuleSync: RuleSync{Rules: []CompiledRule{{
+			RuleSync: wire.RuleSync{Rules: []wire.CompiledRule{{
 				Name:           "freeze-productcatalog",
 				InjectionPoint: "egress",
 				Mode:           "inline",
 				Priority:       10,
-				Fault: &CompiledFault{
+				Fault: &wire.CompiledFault{
 					Category:  "inline",
 					FaultType: "latency",
 					Params:    json.RawMessage(`{"delay":"200ms"}`),
@@ -51,7 +52,7 @@ func TestRegister_Success(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resp, err := registerWith(context.Background(), http.DefaultClient, server.URL, RegisterRequest{
+	resp, err := registerWith(context.Background(), http.DefaultClient, server.URL, wire.RegisterRequest{
 		ID:      "pod-abc",
 		Service: "productcatalog",
 		Address: "http://10.0.3.4:9090",
@@ -76,7 +77,7 @@ func TestRegister_NonCreatedStatus(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, err := registerWith(context.Background(), http.DefaultClient, server.URL, RegisterRequest{
+	_, err := registerWith(context.Background(), http.DefaultClient, server.URL, wire.RegisterRequest{
 		ID:      "pod-abc",
 		Service: "productcatalog",
 		Address: "http://10.0.3.4:9090",
@@ -94,12 +95,12 @@ func TestRegister_NonCreatedStatus(t *testing.T) {
 func TestRegisterWithClient_UsesSuppliedClient(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(RegisterResponse{Status: "registered"})
+		_ = json.NewEncoder(w).Encode(wire.RegisterResponse{Status: "registered"})
 	}))
 	defer server.Close()
 
 	custom := &http.Client{Timeout: 3 * time.Second}
-	resp, err := registerWith(context.Background(), custom, server.URL, RegisterRequest{ID: "pod-1", Service: "svc", Address: "http://10.0.0.1:8080"})
+	resp, err := registerWith(context.Background(), custom, server.URL, wire.RegisterRequest{ID: "pod-1", Service: "svc", Address: "http://10.0.0.1:8080"})
 	if err != nil || resp.Status != "registered" {
 		t.Fatalf("registerWith: err=%v status=%q", err, resp.Status)
 	}
@@ -107,12 +108,12 @@ func TestRegisterWithClient_UsesSuppliedClient(t *testing.T) {
 
 func TestApply_SetsRules(t *testing.T) {
 	eval := evaluator.NewStaticEvaluator()
-	resp := RegisterResponse{
-		RuleSync: RuleSync{Rules: []CompiledRule{{
+	resp := wire.RegisterResponse{
+		RuleSync: wire.RuleSync{Rules: []wire.CompiledRule{{
 			Name:           "r1",
 			InjectionPoint: "egress",
 			Mode:           "inline",
-			Fault: &CompiledFault{
+			Fault: &wire.CompiledFault{
 				Category:  "inline",
 				FaultType: "latency",
 				Params:    json.RawMessage(`{"delay":"100ms"}`),
@@ -133,8 +134,8 @@ func TestApply_SetsRules(t *testing.T) {
 }
 
 func TestApply_NoRulesIsNoop(t *testing.T) {
-	eval := evaluator.NewStaticEvaluator(StaticRule{Name: "preexisting", Point: evaluator.Ingress})
-	resp := RegisterResponse{Status: "registered"}
+	eval := evaluator.NewStaticEvaluator(wire.StaticRule{Name: "preexisting", Point: evaluator.Ingress})
+	resp := wire.RegisterResponse{Status: "registered"}
 	if err := apply(resp, applyTargets{Evaluator: eval}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -145,8 +146,8 @@ func TestApply_NoRulesIsNoop(t *testing.T) {
 }
 
 func TestApply_RulesWithoutEvaluatorErrors(t *testing.T) {
-	resp := RegisterResponse{
-		RuleSync: RuleSync{Rules: []CompiledRule{{Name: "r1", InjectionPoint: "egress", Mode: "inline"}}},
+	resp := wire.RegisterResponse{
+		RuleSync: wire.RuleSync{Rules: []wire.CompiledRule{{Name: "r1", InjectionPoint: "egress", Mode: "inline"}}},
 	}
 	err := apply(resp, applyTargets{})
 	if err == nil {
@@ -161,8 +162,8 @@ func TestApply_RulesWithoutEvaluatorErrors(t *testing.T) {
 
 func TestApply_ActiveFault_InvalidDelay(t *testing.T) {
 	demo := &demoEvaluator{}
-	resp := RegisterResponse{
-		RuleSync: RuleSync{ActiveFaults: []FaultRequest{{FaultType: "latency", Params: json.RawMessage(`{"delay":"bogus"}`)}}},
+	resp := wire.RegisterResponse{
+		RuleSync: wire.RuleSync{ActiveFaults: []wire.FaultRequest{{FaultType: "latency", Params: json.RawMessage(`{"delay":"bogus"}`)}}},
 	}
 	err := apply(resp, applyTargets{DemoEval: demo})
 	if err == nil {
@@ -178,8 +179,8 @@ func TestApply_ActiveFault_InvalidDelay(t *testing.T) {
 
 func TestApply_ActiveFault_UnknownType(t *testing.T) {
 	demo := &demoEvaluator{}
-	resp := RegisterResponse{
-		RuleSync: RuleSync{ActiveFaults: []FaultRequest{{FaultType: "quantum"}}},
+	resp := wire.RegisterResponse{
+		RuleSync: wire.RuleSync{ActiveFaults: []wire.FaultRequest{{FaultType: "quantum"}}},
 	}
 	err := apply(resp, applyTargets{DemoEval: demo})
 	if err == nil {
@@ -192,8 +193,8 @@ func TestApply_ActiveFault_UnknownType(t *testing.T) {
 
 func TestApply_FreezeCfg_NegativeMu(t *testing.T) {
 	cb := cachebox.New(cachebox.Config{})
-	resp := RegisterResponse{
-		RuleSync: RuleSync{FreezeCfg: &DelayRequest{Mu: -1}},
+	resp := wire.RegisterResponse{
+		RuleSync: wire.RuleSync{FreezeCfg: &wire.DelayRequest{Mu: -1}},
 	}
 	err := apply(resp, applyTargets{CacheBox: cb})
 	if err == nil {
@@ -209,8 +210,8 @@ func TestApply_FreezeCfg_NegativeMu(t *testing.T) {
 
 func TestApply_ActiveFault_CPUStress(t *testing.T) {
 	demo := &demoEvaluator{}
-	resp := RegisterResponse{
-		RuleSync: RuleSync{ActiveFaults: []FaultRequest{{
+	resp := wire.RegisterResponse{
+		RuleSync: wire.RuleSync{ActiveFaults: []wire.FaultRequest{{
 			Category:   "resource",
 			FaultType:  "cpu",
 			DurationMs: 5000,
@@ -227,12 +228,12 @@ func TestApply_ActiveFault_CPUStress(t *testing.T) {
 
 func TestApply_ActiveFault_NetworkRequiresResolver(t *testing.T) {
 	demo := &demoEvaluator{}
-	resp := RegisterResponse{
-		RuleSync: RuleSync{ActiveFaults: []FaultRequest{{
+	resp := wire.RegisterResponse{
+		RuleSync: wire.RuleSync{ActiveFaults: []wire.FaultRequest{{
 			Category:   "network",
 			FaultType:  "latency",
 			DurationMs: 5000,
-			Network:    &NetworkEnvelope{Target: "redis"},
+			Network:    &wire.NetworkEnvelope{Target: "redis"},
 			Params:     json.RawMessage(`{"delay":"100ms"}`),
 		}}},
 	}
@@ -245,15 +246,15 @@ func TestApply_ActiveFault_NetworkRequiresResolver(t *testing.T) {
 func TestRegisterAndApply_E2E(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(RegisterResponse{
+		_ = json.NewEncoder(w).Encode(wire.RegisterResponse{
 			Status: "registered",
-			RuleSync: RuleSync{Rules: []CompiledRule{{
+			RuleSync: wire.RuleSync{Rules: []wire.CompiledRule{{
 				Name:           "freeze-productcatalog",
 				InjectionPoint: "egress",
 				Labels:         map[string]string{"target": "productcatalog"},
 				Mode:           "inline",
 				Priority:       10,
-				Fault: &CompiledFault{
+				Fault: &wire.CompiledFault{
 					Category:  "inline",
 					FaultType: "latency",
 					Params:    json.RawMessage(`{"delay":"50ms"}`),
@@ -265,7 +266,7 @@ func TestRegisterAndApply_E2E(t *testing.T) {
 
 	eval := evaluator.NewStaticEvaluator()
 
-	resp, err := registerWith(context.Background(), http.DefaultClient, server.URL, RegisterRequest{
+	resp, err := registerWith(context.Background(), http.DefaultClient, server.URL, wire.RegisterRequest{
 		ID:      "pod-abc",
 		Service: "productcatalog",
 		Address: "http://10.0.3.4:9090",
@@ -293,8 +294,8 @@ func TestApply_FreezeCfg_SetsDistributionDelay(t *testing.T) {
 	cb := cachebox.New(cachebox.Config{})
 	defer cb.Stop()
 
-	resp := RegisterResponse{
-		RuleSync: RuleSync{FreezeCfg: &DelayRequest{Mu: 8.5, Sigma: 0.3, Seed: 42}},
+	resp := wire.RegisterResponse{
+		RuleSync: wire.RuleSync{FreezeCfg: &wire.DelayRequest{Mu: 8.5, Sigma: 0.3, Seed: 42}},
 	}
 	if err := apply(resp, applyTargets{CacheBox: cb}); err != nil {
 		t.Fatalf("Apply: %v", err)
@@ -323,8 +324,8 @@ func TestApply_FreezeCfg_SetsDistributionDelay(t *testing.T) {
 // replaying/faulting forever. (A nil list stays a no-op -- see
 // TestApply_NoRulesIsNoop.)
 func TestApply_EmptyRulesClears(t *testing.T) {
-	eval := evaluator.NewStaticEvaluator(StaticRule{Name: "leftover", Point: evaluator.Egress})
-	resp := RegisterResponse{RuleSync: RuleSync{Rules: []CompiledRule{}}}
+	eval := evaluator.NewStaticEvaluator(wire.StaticRule{Name: "leftover", Point: evaluator.Egress})
+	resp := wire.RegisterResponse{RuleSync: wire.RuleSync{Rules: []wire.CompiledRule{}}}
 	if err := apply(resp, applyTargets{Evaluator: eval}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -346,7 +347,7 @@ func TestApply_EmptyRulesFiresDrainTracker(t *testing.T) {
 			w.WriteHeader(http.StatusCreated)
 		case "/api/v1/sdk/cachebox/drain":
 			drains.Add(1)
-			_ = json.NewEncoder(w).Encode(DrainReportResponse{Accepted: true})
+			_ = json.NewEncoder(w).Encode(wire.DrainReportResponse{Accepted: true})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -365,11 +366,11 @@ func TestApply_EmptyRulesFiresDrainTracker(t *testing.T) {
 	tracker := newCacheDrainTracker(cb, pusher, nil)
 	targets := applyTargets{Evaluator: eval, CacheDrain: tracker}
 
-	recording := RegisterResponse{RuleSync: RuleSync{Rules: []CompiledRule{{
+	recording := wire.RegisterResponse{RuleSync: wire.RuleSync{Rules: []wire.CompiledRule{{
 		Name: "cachebox:passthrough:phase-1", InjectionPoint: "egress", Mode: "inline",
-		CacheBox: &CompiledCacheBox{
+		CacheBox: &wire.CompiledCacheBox{
 			Mode: "passthrough",
-			Context: &CacheBoxContext{
+			Context: &wire.CacheBoxContext{
 				ExperimentID: "exp-1", PhaseID: "phase-1",
 				KeyStrategy: "canonical_v2", StrategyVersion: 2,
 			},
@@ -384,7 +385,7 @@ func TestApply_EmptyRulesFiresDrainTracker(t *testing.T) {
 
 	// Drain start: the recording rule drops out and, this being the only
 	// rule for the service, the authoritative set is EMPTY.
-	empty := RegisterResponse{RuleSync: RuleSync{Rules: []CompiledRule{}}}
+	empty := wire.RegisterResponse{RuleSync: wire.RuleSync{Rules: []wire.CompiledRule{}}}
 	if err := apply(empty, targets); err != nil {
 		t.Fatalf("Apply empty rules: %v", err)
 	}

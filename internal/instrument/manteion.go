@@ -1,4 +1,4 @@
-package atropos
+package instrument
 
 import (
 	"context"
@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"time"
+
+	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
 // connectManteion connects this SDK to the manteion control plane.
@@ -17,14 +19,14 @@ import (
 // rules, configures the evaluator, and starts a background poll loop.
 //
 // Returns (nil, nil) if cfg.url is empty (offline mode — tracing-only). All
-// methods on *manteionClient are nil-receiver safe, so callers can
+// methods on *ManteionClient are nil-receiver safe, so callers can
 // unconditionally defer client.Close(ctx) without branching.
 //
 // Returns a non-nil error if:
 //   - cfg.targets.Evaluator is nil
 //   - manteion is unreachable past cfg.initTimeout
 //   - registration fails
-func connectManteion(ctx context.Context, cfg manteionConfig) (*manteionClient, error) {
+func connectManteion(ctx context.Context, cfg manteionConfig) (*ManteionClient, error) {
 	if cfg.logger == nil {
 		cfg.logger = slog.Default()
 	}
@@ -61,7 +63,7 @@ func connectManteion(ctx context.Context, cfg manteionConfig) (*manteionClient, 
 	sseTransport.IdleConnTimeout = 0
 	sseClient := &http.Client{Transport: sseTransport}
 
-	c := &manteionClient{
+	c := &ManteionClient{
 		cfg:        cfg,
 		httpClient: cfg.httpClient,
 		sseClient:  sseClient,
@@ -103,11 +105,10 @@ func connectManteion(ctx context.Context, cfg manteionConfig) (*manteionClient, 
 	})
 	if c.targets.DemoEval != nil {
 		c.wg.Go(func() {
-			startFaultWatchdog(pollCtx, c.targets.DemoEval, cfg.pollInterval, c.logger)
+			startFaultWatchdog(pollCtx, c.targets.DemoEval, c.targets.Registry, cfg.pollInterval, c.logger)
 		})
 	}
 	c.status.Store(int32(manteionConnected))
-	setGlobalClient(c)
 
 	return c, nil
 }
@@ -120,7 +121,7 @@ type manteionConfig struct {
 	address        string
 	url            string
 	instanceID     string
-	routes         []Route // published in the register payload
+	routes         []wire.Route // published in the register payload
 	initTimeout    time.Duration
 	pollInterval   time.Duration
 	offline        bool
@@ -196,4 +197,38 @@ func localIPv4() string {
 		}
 	}
 	return ""
+}
+
+// ConnectConfig is the host-facing input to ConnectManteion. Env-derived
+// defaults (MANTEION_ADVERTISE_ADDR, MANTEION_INIT_TIMEOUT, the 10s poll
+// interval) come from defaultManteionConfig; the fields here overlay them.
+type ConnectConfig struct {
+	// Core is the instrument the control plane drives. Its identity
+	// (service, instance) is what registers.
+	Core *Core
+	// URL is the control-plane base URL; empty = offline (returns nil, nil).
+	URL            string
+	ServiceVersion string
+	// Routes is the HTTP route inventory published at registration.
+	Routes []wire.Route
+	// NetworkResolver maps network-fault targets to (listen, upstream)
+	// pairs; nil rejects network-category faults at decode time.
+	NetworkResolver wire.NetworkResolver
+	Logger          *slog.Logger
+}
+
+// ConnectManteion connects a host's core to the control plane: waits for
+// readiness, registers, fetches initial rules, and starts the poll/SSE/
+// watchdog goroutines. Returns (nil, nil) when URL is empty (offline).
+func ConnectManteion(ctx context.Context, c ConnectConfig) (*ManteionClient, error) {
+	cfg := defaultManteionConfig(c.Core.service)
+	cfg.url = c.URL
+	cfg.instanceID = c.Core.instance
+	cfg.serviceVersion = c.ServiceVersion
+	cfg.routes = c.Routes
+	cfg.targets = c.Core.targets(c.NetworkResolver)
+	if c.Logger != nil {
+		cfg.logger = c.Logger
+	}
+	return connectManteion(ctx, cfg)
 }

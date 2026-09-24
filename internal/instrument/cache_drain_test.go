@@ -1,4 +1,4 @@
-package atropos
+package instrument
 
 import (
 	"encoding/json"
@@ -10,16 +10,17 @@ import (
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
-func recordingRule(name, experimentID, phaseID string) CompiledRule {
-	return CompiledRule{
+func recordingRule(name, experimentID, phaseID string) wire.CompiledRule {
+	return wire.CompiledRule{
 		Name:           name,
 		InjectionPoint: "egress",
 		Mode:           "inline",
-		CacheBox: &CompiledCacheBox{
+		CacheBox: &wire.CompiledCacheBox{
 			Mode: "passthrough",
-			Context: &CacheBoxContext{
+			Context: &wire.CacheBoxContext{
 				ExperimentID: experimentID, PhaseID: phaseID,
 				KeyStrategy: "canonical_v2", StrategyVersion: 2,
 			},
@@ -28,10 +29,10 @@ func recordingRule(name, experimentID, phaseID string) CompiledRule {
 }
 
 func TestActiveRecordingPhases_ScansPassthroughContexts(t *testing.T) {
-	rules := []CompiledRule{
+	rules := []wire.CompiledRule{
 		recordingRule("r1", "exp-1", "phase-1"),
-		{Name: "replay-rule", CacheBox: &CompiledCacheBox{Mode: "replay", Context: &CacheBoxContext{ExperimentID: "exp-2", PhaseID: "phase-2"}}},
-		{Name: "no-context", CacheBox: &CompiledCacheBox{Mode: "passthrough"}},
+		{Name: "replay-rule", CacheBox: &wire.CompiledCacheBox{Mode: "replay", Context: &wire.CacheBoxContext{ExperimentID: "exp-2", PhaseID: "phase-2"}}},
+		{Name: "no-context", CacheBox: &wire.CompiledCacheBox{Mode: "passthrough"}},
 		{Name: "fault-rule"},
 	}
 	active := activeRecordingPhases(rules)
@@ -73,7 +74,7 @@ func TestCacheDrainTracker_ObservesPhaseEnd(t *testing.T) {
 			mu.Lock()
 			drainCalls++
 			mu.Unlock()
-			_ = json.NewEncoder(w).Encode(DrainReportResponse{Accepted: true})
+			_ = json.NewEncoder(w).Encode(wire.DrainReportResponse{Accepted: true})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -93,8 +94,8 @@ func TestCacheDrainTracker_ObservesPhaseEnd(t *testing.T) {
 	targets := applyTargets{Evaluator: eval, CacheDrain: tracker}
 
 	// First poll: phase exp-1/phase-1 is recording.
-	first := RegisterResponse{RuleSync: RuleSync{
-		Rules: []CompiledRule{recordingRule("r1", "exp-1", "phase-1")},
+	first := wire.RegisterResponse{RuleSync: wire.RuleSync{
+		Rules: []wire.CompiledRule{recordingRule("r1", "exp-1", "phase-1")},
 	}}
 	if err := apply(first, targets); err != nil {
 		t.Fatalf("first apply: %v", err)
@@ -105,8 +106,8 @@ func TestCacheDrainTracker_ObservesPhaseEnd(t *testing.T) {
 
 	// Second poll: the rule set no longer contains exp-1/phase-1 --
 	// recording for it has ended.
-	second := RegisterResponse{RuleSync: RuleSync{
-		Rules: []CompiledRule{recordingRule("r2", "exp-9", "phase-9")},
+	second := wire.RegisterResponse{RuleSync: wire.RuleSync{
+		Rules: []wire.CompiledRule{recordingRule("r2", "exp-9", "phase-9")},
 	}}
 	if err := apply(second, targets); err != nil {
 		t.Fatalf("second apply: %v", err)
@@ -119,9 +120,9 @@ func TestCacheDrainTracker_ObservesPhaseEnd(t *testing.T) {
 		t.Fatalf("expected exactly 1 drain report for the ended phase, got %d", got)
 	}
 
-	// Third poll: an EMPTY rules list means "no change" (RuleSync's
+	// Third poll: an EMPTY rules list means "no change" (wire.RuleSync's
 	// documented semantics), not "every phase ended" -- must not misfire.
-	empty := RegisterResponse{RuleSync: RuleSync{}}
+	empty := wire.RegisterResponse{RuleSync: wire.RuleSync{}}
 	if err := apply(empty, targets); err != nil {
 		t.Fatalf("empty apply: %v", err)
 	}

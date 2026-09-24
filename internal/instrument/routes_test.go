@@ -1,4 +1,4 @@
-package atropos
+package instrument
 
 import (
 	"encoding/json"
@@ -9,6 +9,8 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
 func TestManteionClient_Register_IncludesRoutes(t *testing.T) {
@@ -19,16 +21,16 @@ func TestManteionClient_Register_IncludesRoutes(t *testing.T) {
 		}
 		body, _ = io.ReadAll(r.Body)
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(RegisterResponse{Status: "registered"})
+		_ = json.NewEncoder(w).Encode(wire.RegisterResponse{Status: "registered"})
 	}))
 	defer srv.Close()
 
-	c := &manteionClient{
+	c := &ManteionClient{
 		cfg: manteionConfig{
 			url:         srv.URL,
 			serviceName: "cartservice",
 			instanceID:  "pod-1",
-			routes: []Route{
+			routes: []wire.Route{
 				{Method: "GET", Path: "/cart/{user_id}", Description: "view cart"},
 				{Method: "POST", Path: "/cart/{user_id}/items"},
 			},
@@ -42,11 +44,11 @@ func TestManteionClient_Register_IncludesRoutes(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 
-	var req RegisterRequest
+	var req wire.RegisterRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		t.Fatalf("decode register body: %v", err)
 	}
-	want := []Route{
+	want := []wire.Route{
 		{Method: "GET", Path: "/cart/{user_id}", Description: "view cart"},
 		{Method: "POST", Path: "/cart/{user_id}/items"},
 	}
@@ -60,11 +62,11 @@ func TestManteionClient_Register_OmitsRoutesWhenEmpty(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ = io.ReadAll(r.Body)
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(RegisterResponse{Status: "registered"})
+		_ = json.NewEncoder(w).Encode(wire.RegisterResponse{Status: "registered"})
 	}))
 	defer srv.Close()
 
-	c := &manteionClient{
+	c := &ManteionClient{
 		cfg:        manteionConfig{url: srv.URL, serviceName: "grpc-svc", instanceID: "pod-2"},
 		httpClient: &http.Client{Timeout: 5 * time.Second},
 		targets:    newTestTargets(),

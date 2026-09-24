@@ -1,4 +1,4 @@
-package atropos
+package instrument
 
 import (
 	"encoding/json"
@@ -6,6 +6,8 @@ import (
 	"net/http"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
+	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
 // applyRuleSet atomically replaces eval's rules and stops any running
@@ -15,7 +17,7 @@ import (
 // started it, and the rule's removal -- however it arrives -- is the stop
 // signal. Replacement happens before the stops so a re-evaluated request
 // cannot restart a fault under the outgoing rule set.
-func applyRuleSet(eval *evaluator.StaticEvaluator, rules []evaluator.StaticRule) {
+func applyRuleSet(reg *interceptor.FaultRegistry, eval *evaluator.StaticEvaluator, rules []evaluator.StaticRule) {
 	prev := eval.Rules()
 	eval.SetRules(rules)
 
@@ -25,7 +27,7 @@ func applyRuleSet(eval *evaluator.StaticEvaluator, rules []evaluator.StaticRule)
 	}
 	for _, r := range prev {
 		if !next[r.Name] {
-			stopBackgroundFaults(r.Name)
+			stopFaults(reg, r.Name)
 		}
 	}
 }
@@ -35,12 +37,12 @@ func applyRuleSet(eval *evaluator.StaticEvaluator, rules []evaluator.StaticRule)
 //
 // Supported methods:
 //   - GET:  200 + JSON-encoded current rule list (empty array if nil)
-//   - POST: decode body as []CompiledRule (wire format), convert via
+//   - POST: decode body as []wire.CompiledRule (wire format), convert via
 //     decodeCompiledRules, atomically replace via SetRules, 204
 //   - Other: 405
 //
 // opts are forwarded to decodeCompiledRules (e.g. withNetworkResolver).
-func rulesAdminHandler(eval *evaluator.StaticEvaluator, opts ...decodeOption) http.Handler {
+func rulesAdminHandler(eval *evaluator.StaticEvaluator, reg *interceptor.FaultRegistry, opts ...decodeOption) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -53,13 +55,13 @@ func rulesAdminHandler(eval *evaluator.StaticEvaluator, opts ...decodeOption) ht
 			json.NewEncoder(w).Encode(rules)
 
 		case http.MethodPost:
-			var compiled []CompiledRule
+			var compiled []wire.CompiledRule
 			if err := json.NewDecoder(r.Body).Decode(&compiled); err != nil {
 				jsonError(w, fmt.Sprintf("invalid json: %s", err), http.StatusBadRequest)
 				return
 			}
 			if compiled == nil {
-				applyRuleSet(eval, nil)
+				applyRuleSet(reg, eval, nil)
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}
@@ -68,7 +70,7 @@ func rulesAdminHandler(eval *evaluator.StaticEvaluator, opts ...decodeOption) ht
 				jsonError(w, fmt.Sprintf("decode rules: %s", err), http.StatusBadRequest)
 				return
 			}
-			applyRuleSet(eval, rules)
+			applyRuleSet(reg, eval, rules)
 			w.WriteHeader(http.StatusNoContent)
 
 		default:

@@ -1,4 +1,4 @@
-package atropos
+package instrument
 
 import (
 	"context"
@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
 // newTestEvaluator returns a fresh StaticEvaluator with zero rules.
@@ -34,7 +35,7 @@ func TestManteionClient_WaitForReady_Success(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := &manteionClient{
+	c := &ManteionClient{
 		cfg: manteionConfig{
 			url:         srv.URL,
 			initTimeout: 5 * time.Second,
@@ -61,7 +62,7 @@ func TestManteionClient_WaitForReady_Retry(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := &manteionClient{
+	c := &ManteionClient{
 		cfg: manteionConfig{
 			url:         srv.URL,
 			initTimeout: 10 * time.Second,
@@ -83,7 +84,7 @@ func TestManteionClient_WaitForReady_Timeout(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := &manteionClient{
+	c := &ManteionClient{
 		cfg: manteionConfig{
 			url:         srv.URL,
 			initTimeout: 600 * time.Millisecond,
@@ -107,7 +108,7 @@ func TestManteionClient_PollLoop_304(t *testing.T) {
 	defer srv.Close()
 
 	eval := newTestEvaluator()
-	c := &manteionClient{
+	c := &ManteionClient{
 		cfg:        manteionConfig{url: srv.URL, serviceName: "svc"},
 		httpClient: &http.Client{Timeout: 5 * time.Second},
 		targets:    applyTargets{Evaluator: eval},
@@ -123,11 +124,11 @@ func TestManteionClient_PollLoop_304(t *testing.T) {
 }
 
 func TestManteionClient_PollLoop_RuleUpdate(t *testing.T) {
-	compiled := []CompiledRule{{
+	compiled := []wire.CompiledRule{{
 		Name:           "test-latency",
 		InjectionPoint: "ingress",
 		Mode:           "inline",
-		Fault: &CompiledFault{
+		Fault: &wire.CompiledFault{
 			Category:  "inline",
 			FaultType: "latency",
 			Params:    json.RawMessage(`{"delay":"100ms"}`),
@@ -144,7 +145,7 @@ func TestManteionClient_PollLoop_RuleUpdate(t *testing.T) {
 	defer srv.Close()
 
 	eval := newTestEvaluator()
-	c := &manteionClient{
+	c := &ManteionClient{
 		cfg:        manteionConfig{url: srv.URL, serviceName: "svc"},
 		httpClient: &http.Client{Timeout: 5 * time.Second},
 		targets:    applyTargets{Evaluator: eval},
@@ -173,10 +174,10 @@ func TestManteionClient_PollLoop_Recovery(t *testing.T) {
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]any{"version": 1, "rules": []CompiledRule{}})
+			json.NewEncoder(w).Encode(map[string]any{"version": 1, "rules": []wire.CompiledRule{}})
 		case "/api/v1/sdk/register":
 			w.WriteHeader(http.StatusCreated)
-			json.NewEncoder(w).Encode(RegisterResponse{Status: "registered"})
+			json.NewEncoder(w).Encode(wire.RegisterResponse{Status: "registered"})
 		}
 	}))
 	defer srv.Close()
@@ -185,7 +186,7 @@ func TestManteionClient_PollLoop_Recovery(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
 
-	c := &manteionClient{
+	c := &ManteionClient{
 		cfg:        manteionConfig{url: srv.URL, serviceName: "svc", pollInterval: 50 * time.Millisecond},
 		httpClient: &http.Client{Timeout: 5 * time.Second},
 		targets:    applyTargets{Evaluator: eval},
@@ -223,7 +224,7 @@ func TestHealth_Status_AllStates(t *testing.T) {
 	}
 
 	eval := newTestEvaluator()
-	c := &manteionClient{
+	c := &ManteionClient{
 		cfg:     manteionConfig{url: "http://manteion:8080", serviceName: "svc"},
 		targets: applyTargets{Evaluator: eval},
 		logger:  slog.New(slog.DiscardHandler),
@@ -321,7 +322,7 @@ func TestFetchRules_BodyLimitEnforced(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := &manteionClient{
+	c := &ManteionClient{
 		cfg:        manteionConfig{url: srv.URL, serviceName: "svc"},
 		httpClient: &http.Client{Timeout: 5 * time.Second},
 		targets:    applyTargets{Evaluator: newTestEvaluator()},
@@ -336,10 +337,10 @@ func TestFetchRules_BodyLimitEnforced(t *testing.T) {
 
 // ---------- SSE stream parsing ----------
 
-// newTestSSEClient returns a manteionClient wired to srv for SSE tests.
-func newTestSSEClient(t *testing.T, srv *httptest.Server) *manteionClient {
+// newTestSSEClient returns a ManteionClient wired to srv for SSE tests.
+func newTestSSEClient(t *testing.T, srv *httptest.Server) *ManteionClient {
 	t.Helper()
-	return &manteionClient{
+	return &ManteionClient{
 		cfg:       manteionConfig{url: srv.URL, serviceName: "svc"},
 		sseClient: &http.Client{Timeout: 5 * time.Second},
 		logger:    slog.New(slog.DiscardHandler),
@@ -423,7 +424,7 @@ func TestClose_WaitsForRegisterGoroutine(t *testing.T) {
 
 	pollCtx, cancel := context.WithCancel(context.Background())
 
-	c := &manteionClient{
+	c := &ManteionClient{
 		cfg: manteionConfig{
 			url:         srv.URL,
 			serviceName: "svc",

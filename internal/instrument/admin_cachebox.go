@@ -1,4 +1,4 @@
-package atropos
+package instrument
 
 import (
 	"encoding/json"
@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
+	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
 // cacheBoxAdminHandler serves runtime cache-box control (mounted at
@@ -56,7 +57,7 @@ func handleCacheBoxStats(w http.ResponseWriter, cb *cachebox.CacheBox) {
 }
 
 func handleCacheBoxDelay(w http.ResponseWriter, r *http.Request, cb *cachebox.CacheBox) {
-	var req DelayRequest
+	var req wire.DelayRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, fmt.Sprintf("invalid json: %s", err), http.StatusBadRequest)
 		return

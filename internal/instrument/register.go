@@ -1,4 +1,4 @@
-package atropos
+package instrument
 
 import (
 	"bytes"
@@ -11,6 +11,8 @@ import (
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
+	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
 // registerTimeout is the default per-call deadline for Register.
@@ -21,10 +23,10 @@ const registerTimeout = 5 * time.Second
 // (registerTimeout) layered onto ctx, and decodes the response. Response body
 // is read under a 1 MiB cap; a truncated/erroring read still surfaces as a
 // decode failure below, so dropping the ReadAll error loses no diagnostic value.
-func registerWith(ctx context.Context, hc *http.Client, baseURL string, req RegisterRequest) (RegisterResponse, error) {
+func registerWith(ctx context.Context, hc *http.Client, baseURL string, req wire.RegisterRequest) (wire.RegisterResponse, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
-		return RegisterResponse{}, fmt.Errorf("marshal register request: %w", err)
+		return wire.RegisterResponse{}, fmt.Errorf("marshal register request: %w", err)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, registerTimeout)
@@ -33,25 +35,25 @@ func registerWith(ctx context.Context, hc *http.Client, baseURL string, req Regi
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		baseURL+"/api/v1/sdk/register", bytes.NewReader(body))
 	if err != nil {
-		return RegisterResponse{}, fmt.Errorf("new register request: %w", err)
+		return wire.RegisterResponse{}, fmt.Errorf("new register request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	httpResp, err := hc.Do(httpReq)
 	if err != nil {
-		return RegisterResponse{}, fmt.Errorf("send register request: %w", err)
+		return wire.RegisterResponse{}, fmt.Errorf("send register request: %w", err)
 	}
 	defer httpResp.Body.Close()
 
 	respBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
 	if httpResp.StatusCode != http.StatusCreated {
-		return RegisterResponse{}, fmt.Errorf("register returned status %d: %s",
+		return wire.RegisterResponse{}, fmt.Errorf("register returned status %d: %s",
 			httpResp.StatusCode, string(respBody))
 	}
 
-	var resp RegisterResponse
+	var resp wire.RegisterResponse
 	if err := json.Unmarshal(respBody, &resp); err != nil {
-		return RegisterResponse{}, fmt.Errorf("decode register response: %w", err)
+		return wire.RegisterResponse{}, fmt.Errorf("decode register response: %w", err)
 	}
 	return resp, nil
 }
@@ -68,7 +70,7 @@ type applyTargets struct {
 	CacheBox *cachebox.CacheBox
 	// NetworkResolver maps logical targets to listen/upstream pairs for network
 	// fault proxies. Required if rules or active_fault contain network-category faults.
-	NetworkResolver NetworkResolver
+	NetworkResolver wire.NetworkResolver
 	// CacheDrain, if set, is notified with the applied rule set on every
 	// Apply that carries a non-empty rules list. It diffs against the
 	// previously-seen active recording phases and fires a flush + W3 drain
@@ -76,6 +78,9 @@ type applyTargets struct {
 	// this SDK doesn't need automatic drain-report generation (e.g. it
 	// never records, or triggers draining some other way).
 	CacheDrain *cacheDrainTracker
+	// Registry holds every running background fault; rule/slot removal stops
+	// faults through it (nil-safe: a nil registry stops nothing).
+	Registry *interceptor.FaultRegistry
 }
 
 // apply installs the register response's intent state onto the supplied
@@ -94,7 +99,7 @@ type applyTargets struct {
 // Error messages are prefixed by category ("apply rules: ...",
 // "apply active_fault: ...", "apply freeze_cfg: ...") so log grepping
 // can filter a single bootstrap phase without ambiguity.
-func apply(resp RegisterResponse, targets applyTargets) error {
+func apply(resp wire.RegisterResponse, targets applyTargets) error {
 	if resp.Rules != nil {
 		if targets.Evaluator == nil && len(resp.Rules) > 0 {
 			return fmt.Errorf("apply rules: no Evaluator target for %d rules", len(resp.Rules))
@@ -108,7 +113,7 @@ func apply(resp RegisterResponse, targets applyTargets) error {
 			if err != nil {
 				return fmt.Errorf("apply rules: %w", err)
 			}
-			applyRuleSet(targets.Evaluator, rules)
+			applyRuleSet(targets.Registry, targets.Evaluator, rules)
 		}
 
 		// Observe every authoritative rule set, INCLUDING empty: the
@@ -143,7 +148,7 @@ func apply(resp RegisterResponse, targets applyTargets) error {
 				targets.DemoEval.ClearSlot(id)
 				// Manteion dropped the slot; a running background fault it
 				// started must not keep executing under a withdrawn intent.
-				stopBackgroundFaults(id)
+				stopFaults(targets.Registry, id)
 			}
 		}
 
@@ -173,7 +178,7 @@ func apply(resp RegisterResponse, targets applyTargets) error {
 	return nil
 }
 
-// applyActiveFault builds a Fault from a FaultRequest and installs it on the
+// applyActiveFault builds a Fault from a wire.FaultRequest and installs it on the
 // demoEvaluator. Uses the shared buildFault dispatcher.
 //
 // Decision.Name is the slot id (the same key Set stores under): it becomes
@@ -181,7 +186,7 @@ func apply(resp RegisterResponse, targets applyTargets) error {
 // the identical name. A shared constant name here would collapse distinct
 // slots into one registry entry -- deduplicating faults that should
 // coexist and stopping strangers on clear.
-func applyActiveFault(req FaultRequest, eval *demoEvaluator, resolve NetworkResolver) error {
+func applyActiveFault(req wire.FaultRequest, eval *demoEvaluator, resolve wire.NetworkResolver) error {
 	f, err := buildFault(req, resolve)
 	if err != nil {
 		return err
@@ -206,8 +211,8 @@ func applyActiveFault(req FaultRequest, eval *demoEvaluator, resolve NetworkReso
 }
 
 // applyFreezeCfg installs a distribution delay source on the CacheBox from a
-// DelayRequest. Mirrors cachebox_admin.go's handleCacheBoxDelay.
-func applyFreezeCfg(req DelayRequest, cb *cachebox.CacheBox) error {
+// wire.DelayRequest. Mirrors cachebox_admin.go's handleCacheBoxDelay.
+func applyFreezeCfg(req wire.DelayRequest, cb *cachebox.CacheBox) error {
 	if req.Mu < 0 {
 		return fmt.Errorf("mu must be >= 0, got %f", req.Mu)
 	}
@@ -224,7 +229,7 @@ func applyFreezeCfg(req DelayRequest, cb *cachebox.CacheBox) error {
 // Grace = max(3 * pollInterval, 30s). This is the only mechanism that
 // protects against zombie faults when duration_ms = 0 (infinite) AND
 // Manteion crashes.
-func startFaultWatchdog(ctx context.Context, eval *demoEvaluator, pollInterval time.Duration, logger interface{ Warn(string, ...any) }) {
+func startFaultWatchdog(ctx context.Context, eval *demoEvaluator, reg *interceptor.FaultRegistry, pollInterval time.Duration, logger interface{ Warn(string, ...any) }) {
 	grace := 3 * pollInterval
 	if grace < 30*time.Second {
 		grace = 30 * time.Second
@@ -240,11 +245,20 @@ func startFaultWatchdog(ctx context.Context, eval *demoEvaluator, pollInterval t
 				eval.ClearSlot(cat)
 				// Clearing the slot only stops NEW starts; the zombie guard
 				// is only real if the running instance dies too.
-				stopBackgroundFaults(cat)
+				stopFaults(reg, cat)
 				if logger != nil {
 					logger.Warn("watchdog: dropped stale fault slot", "category", cat, "grace", grace)
 				}
 			}
 		}
+	}
+}
+
+// stopFaults cancels the running background faults started under keys.
+// Rule removal is the platform's fault-stop signal, so every path that
+// drops a rule or slot funnels here. Nil-safe on the registry.
+func stopFaults(reg *interceptor.FaultRegistry, keys ...string) {
+	for _, k := range keys {
+		reg.Stop(k)
 	}
 }

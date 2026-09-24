@@ -1,4 +1,4 @@
-package atropos
+package instrument
 
 import (
 	"encoding/json"
@@ -17,10 +17,11 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault/resource/disk"
 	iostress "git.ucsc.edu/microfaults/atropos-go/internal/fault/resource/io"
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault/resource/memory"
+	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
 type decodeConfig struct {
-	resolve NetworkResolver
+	resolve wire.NetworkResolver
 }
 
 // decodeOption configures the behaviour of decodeCompiledRule(s).
@@ -29,7 +30,7 @@ type decodeOption func(*decodeConfig)
 // withNetworkResolver supplies the resolver that maps a logical target name
 // (e.g. "redis") to a listen and upstream address pair for network fault
 // proxies. Required when decoding rules whose Network.Host=="proxy".
-func withNetworkResolver(r NetworkResolver) decodeOption {
+func withNetworkResolver(r wire.NetworkResolver) decodeOption {
 	return func(c *decodeConfig) { c.resolve = r }
 }
 
@@ -43,8 +44,8 @@ func buildDecodeConfig(opts []decodeOption) *decodeConfig {
 
 // decodeCompiledRules converts wire-format CompiledRules into evaluator
 // StaticRules that can be loaded into the host StaticEvaluator.
-func decodeCompiledRules(compiled []CompiledRule, opts ...decodeOption) ([]evaluator.StaticRule, error) {
-	sorted := make([]CompiledRule, len(compiled))
+func decodeCompiledRules(compiled []wire.CompiledRule, opts ...decodeOption) ([]evaluator.StaticRule, error) {
+	sorted := make([]wire.CompiledRule, len(compiled))
 	copy(sorted, compiled)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		return sorted[i].Priority > sorted[j].Priority
@@ -61,8 +62,8 @@ func decodeCompiledRules(compiled []CompiledRule, opts ...decodeOption) ([]evalu
 	return rules, nil
 }
 
-// decodeCompiledRule converts a single CompiledRule into a StaticRule.
-func decodeCompiledRule(cr CompiledRule, opts ...decodeOption) (evaluator.StaticRule, error) {
+// decodeCompiledRule converts a single wire.CompiledRule into a wire.StaticRule.
+func decodeCompiledRule(cr wire.CompiledRule, opts ...decodeOption) (evaluator.StaticRule, error) {
 	cfg := buildDecodeConfig(opts)
 
 	sr := evaluator.StaticRule{
@@ -137,7 +138,7 @@ func parseStartPolicy(s string) evaluator.StartPolicy {
 	}
 }
 
-func decodeFault(f *CompiledFault, cfg *decodeConfig) (fault.Fault, error) {
+func decodeFault(f *wire.CompiledFault, cfg *decodeConfig) (fault.Fault, error) {
 	baseCfg := fault.FaultConfig{
 		Duration: time.Duration(f.DurationMs) * time.Millisecond,
 		RampUp:   time.Duration(f.RampUpMs) * time.Millisecond,
@@ -339,7 +340,7 @@ func decodeResourceFault(faultType string, params json.RawMessage, baseCfg fault
 	}
 }
 
-func decodeNetworkFault(faultType string, env *NetworkEnvelope, params json.RawMessage, baseCfg fault.FaultConfig, resolve NetworkResolver) (fault.Fault, error) {
+func decodeNetworkFault(faultType string, env *wire.NetworkEnvelope, params json.RawMessage, baseCfg fault.FaultConfig, resolve wire.NetworkResolver) (fault.Fault, error) {
 	host := env.Host
 	if host == "" {
 		host = "proxy"
@@ -361,9 +362,9 @@ func decodeNetworkFault(faultType string, env *NetworkEnvelope, params json.RawM
 	}
 }
 
-func decodeNetworkProxyFault(faultType string, env *NetworkEnvelope, params json.RawMessage, baseCfg fault.FaultConfig, resolve NetworkResolver) (fault.Fault, error) {
+func decodeNetworkProxyFault(faultType string, env *wire.NetworkEnvelope, params json.RawMessage, baseCfg fault.FaultConfig, resolve wire.NetworkResolver) (fault.Fault, error) {
 	if resolve == nil {
-		return nil, fmt.Errorf("network fault %q with host=proxy requires a NetworkResolver (use withNetworkResolver)", faultType)
+		return nil, fmt.Errorf("network fault %q with host=proxy requires a wire.NetworkResolver (use withNetworkResolver)", faultType)
 	}
 	if env.Target == "" {
 		return nil, fmt.Errorf("network fault %q with host=proxy requires network.target", faultType)

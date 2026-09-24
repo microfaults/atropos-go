@@ -9,6 +9,7 @@ import (
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault/inline"
+	"git.ucsc.edu/microfaults/atropos-go/internal/instrument"
 
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -21,7 +22,7 @@ func TestIntegration_IngressMiddleware_WithFault(t *testing.T) {
 		sdktrace.WithSampler(sdktrace.AlwaysSample()),
 	)
 
-	shutdown, err := initTelemetry(context.Background(), telemetryConfig{tracerProvider: tp})
+	shutdown, err := instrument.InitTelemetry(context.Background(), instrument.TelemetryConfig{TracerProvider: tp})
 	if err != nil {
 		t.Fatal(err)
 	}

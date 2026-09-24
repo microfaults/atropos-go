@@ -9,9 +9,7 @@ import (
 	"os"
 	"sync"
 
-	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
-	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
-	"git.ucsc.edu/microfaults/atropos-go/internal/metrics"
+	"git.ucsc.edu/microfaults/atropos-go/internal/instrument"
 
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
@@ -132,79 +130,59 @@ func Serve(ctx context.Context, cfg Config) (http.Handler, ShutdownFunc, error) 
 	if manteionURL == "" {
 		manteionURL = os.Getenv("MANTEION_URL")
 	}
-	instanceID := resolveInstanceID(cfg)
+	instanceID := instrument.ResolveInstanceID(cfg.InstanceID, cfg.Service)
 
 	// Telemetry first: everything below emits spans through the global
 	// tracer provider this installs.
-	otelShutdown, err := initTelemetry(ctx, telemetryConfig{
-		serviceName:    cfg.Service,
-		serviceVersion: version,
-		environment:    cfg.Environment,
-		tracerProvider: cfg.TracerProvider,
+	otelShutdown, err := instrument.InitTelemetry(ctx, instrument.TelemetryConfig{
+		ServiceName:    cfg.Service,
+		ServiceVersion: version,
+		Environment:    cfg.Environment,
+		TracerProvider: cfg.TracerProvider,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("atropos: init telemetry: %w", err)
 	}
 
-	// One fidelity registry, handed to both the push client and the
-	// cache-box at construction: record-side and push-side counts must land
-	// in the single registry the drain report and fidelity endpoint
-	// snapshot. Constructing both around it removes the order-sensitive
-	// bind step the hand-wired embeds needed.
-	fidelity := cachebox.NewFidelityRegistry()
-	var push *cachePushClient
-	cbCfg := cachebox.Config{Fidelity: fidelity}
-	if manteionURL != "" {
-		push = newCachePushClient(cachePushConfig{
-			BaseURL:  manteionURL,
-			Service:  cfg.Service,
-			Instance: instanceID,
-			Logger:   logger,
-			Fidelity: fidelity,
-		})
-		cbCfg.Push = push.PushFunc()
-	}
-	cb := cachebox.New(cbCfg)
+	// The instrument core: fidelity registry, cache-box + push, host
+	// evaluator composed before the admin slot, the process-lifetime fault
+	// registry (never swapped, A1), the interceptor, the drain tracker.
+	core := instrument.NewCore(instrument.CoreConfig{
+		Service:     cfg.Service,
+		Instance:    instanceID,
+		ManteionURL: manteionURL,
+		Registry:    defaultRegistry,
+		Logger:      logger,
+	})
+	// Install the core's interceptor as the package-level dispatcher the
+	// middleware, EgressTransport and the grpc subpackage resolve.
+	defaultInterceptor.Store(core.Interceptor())
 
-	// The host evaluator receives manteion's compiled rules; the demo
-	// evaluator holds admin/manual fault slots. Composed host-first: an
-	// armed admin fault can fill gaps but never shadow an experiment's
-	// rules — a demo fault that outranked a recording or freeze rule would
-	// silently corrupt the phase's measurement (invariant 7).
-	host := evaluator.NewStaticEvaluator()
-	demo := &demoEvaluator{}
-	configure(evaluator.NewMultiEvaluator(host, demo), cb)
-
-	targets := applyTargets{
-		Evaluator:       host,
-		DemoEval:        demo,
-		CacheBox:        cb,
+	mc, err := instrument.ConnectManteion(ctx, instrument.ConnectConfig{
+		Core:            core,
+		URL:             manteionURL,
+		ServiceVersion:  version,
+		Routes:          cfg.Routes,
 		NetworkResolver: cfg.NetworkResolver,
-	}
-	if push != nil {
-		targets.CacheDrain = newCacheDrainTracker(cb, push, logger)
-	}
-
-	mcfg := defaultManteionConfig(cfg.Service)
-	mcfg.url = manteionURL
-	mcfg.instanceID = instanceID
-	mcfg.serviceVersion = version
-	mcfg.routes = cfg.Routes
-	mcfg.targets = targets
-	mcfg.logger = logger
-	mc, err := connectManteion(ctx, mcfg)
+		Logger:          logger,
+	})
 	if err != nil {
 		// Fail closed rather than run silently offline with a configured
 		// control plane. Unwind what was built.
-		cb.Stop()
-		if push != nil {
-			push.Stop()
-		}
+		core.Stop()
 		_ = otelShutdown(ctx)
 		return nil, nil, fmt.Errorf("atropos: connect manteion: %w", err)
 	}
+	globalClient.Store(mc)
 
-	handler := controlMux(cfg, host, demo, cb, instanceID)
+	mux := instrument.ControlSurface(instrument.ControlConfig{
+		Core:            core,
+		Client:          mc,
+		NetworkResolver: cfg.NetworkResolver,
+	})
+	if cfg.Handler != nil {
+		mux.Handle("/", ingressMiddleware(cfg.Handler, cfg.Service, currentInterceptor()))
+	}
 
 	var once sync.Once
 	var shutdownErr error
@@ -214,66 +192,11 @@ func Serve(ctx context.Context, cfg Config) (http.Handler, ShutdownFunc, error) 
 			// recorder INTO the push client; then flush the push client's
 			// final batch; then flush spans.
 			_ = mc.Close(sctx) // nil-safe in offline mode
-			cb.Stop()
-			if push != nil {
-				push.Stop()
-			}
+			core.Stop()
 			globalClient.CompareAndSwap(mc, nil)
 			shutdownErr = otelShutdown(sctx)
 		})
 		return shutdownErr
 	}
-	return handler, shutdown, nil
-}
-
-// resolveInstanceID picks the identity manteion correlates this SDK
-// instance under. It MUST be identical across the register call, the
-// cache-push envelopes/drain reports, and the fidelity endpoint, so it is
-// resolved exactly once, in Serve, and threaded to all three. Precedence:
-// Config.InstanceID > MANTEION_INSTANCE_ID > hostname (the pod name in k8s)
-// > service name.
-func resolveInstanceID(cfg Config) string {
-	if cfg.InstanceID != "" {
-		return cfg.InstanceID
-	}
-	if id := os.Getenv("MANTEION_INSTANCE_ID"); id != "" {
-		return id
-	}
-	if h, err := os.Hostname(); err == nil && h != "" {
-		return h
-	}
-	return cfg.Service
-}
-
-// controlMux mounts the control/observability surface at the exact paths
-// manteion addresses, with the business handler as the middleware-wrapped
-// fallback. Control paths deliberately bypass the fault/OTel middleware.
-func controlMux(cfg Config, host *evaluator.StaticEvaluator, demo *demoEvaluator, cb *cachebox.CacheBox, instanceID string) http.Handler {
-	mux := http.NewServeMux()
-
-	mux.Handle("GET /metrics", metrics.Handler())
-	mux.Handle("/atropos/health", healthHandler())
-
-	// Bare path and subtree both: the subtree pattern alone would
-	// 301-redirect the bare path and drop freeze/thaw verbs.
-	faultAdmin := faultAdminHandler(demo, cfg.NetworkResolver)
-	mux.Handle("/admin/fault", faultAdmin)
-	mux.Handle("/admin/fault/", faultAdmin)
-
-	var decodeOpts []decodeOption
-	if cfg.NetworkResolver != nil {
-		decodeOpts = append(decodeOpts, withNetworkResolver(cfg.NetworkResolver))
-	}
-	mux.Handle("/admin/rules", rulesAdminHandler(host, decodeOpts...))
-
-	cbAdmin := cacheBoxAdminHandler(cb)
-	mux.Handle("/admin/cachebox", cbAdmin)
-	mux.Handle("/admin/cachebox/", cbAdmin)
-	mux.Handle("/cachebox/preload/", cacheBoxPreloadHandler(cb))
-	mux.Handle("GET /cachebox/fidelity", cacheBoxFidelityHandler(cb, cfg.Service, instanceID))
-
-	if cfg.Handler != nil {
-		mux.Handle("/", ingressMiddleware(cfg.Handler, cfg.Service, currentInterceptor()))
-	}
-	return mux
+	return mux, shutdown, nil
 }

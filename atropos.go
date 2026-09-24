@@ -11,7 +11,8 @@
 // Serve is the embed path — see its doc for the full wiring. EgressTransport
 // wraps a service's outbound HTTP client so egress rules (faults and
 // cache-box record/replay) apply. Everything else exported here is a wire
-// type shared with manteion.
+// type shared with manteion (see types.go); the instrument itself lives in
+// internal/instrument and is shared with the atroposd sidecar host.
 package atropos
 
 import (
@@ -33,10 +34,10 @@ var (
 	defaultInterceptor atomic.Pointer[interceptor.Interceptor]
 
 	// defaultRegistry holds every running background fault so rule/slot
-	// removal can stop it (see FaultRegistry). It is created ONCE in init()
-	// and shared across every configure call: the registry is rule-name-keyed
-	// and evaluator-agnostic, so reconfiguring the evaluator/cache-box must
-	// not orphan the faults the live middleware is still routing through it
+	// removal can stop it. It is created ONCE in init() and handed to the
+	// core Serve builds: the registry is rule-name-keyed and
+	// evaluator-agnostic, so reconfiguring the evaluator/cache-box must not
+	// orphan the faults the live middleware is still routing through it
 	// (A1).
 	defaultRegistry *interceptor.FaultRegistry
 )
@@ -62,23 +63,11 @@ func DefaultInterceptor() *Interceptor {
 	return currentInterceptor()
 }
 
-// stopBackgroundFaults cancels the running background faults started under
-// the given rule/slot keys (Decision.Name; the registry's key). Called
-// wherever a rule or fault slot is removed -- rule removal is the
-// platform's fault-stop signal, and a background fault that outlives its
-// phase contaminates the next phase's measurement (X1).
-func stopBackgroundFaults(keys ...string) {
-	reg := defaultRegistry
-	for _, k := range keys {
-		reg.Stop(k)
-	}
-}
-
 // configure swaps the package-level interceptor to one built around eval
-// and cb. Called once by Serve; the fault registry is process-lifetime and
-// deliberately NOT swapped or closed here — the live middleware still
-// routes background faults through it, so replacing it would orphan
-// running faults (A1).
+// and cb over the process-lifetime registry. Serve installs its core's
+// interceptor directly; this remains for tests that pin a private
+// evaluator. The fault registry is deliberately NOT swapped or closed here
+// (A1).
 func configure(eval evaluator.Evaluator, cb *cachebox.CacheBox) {
 	opts := []interceptor.Option{
 		interceptor.WithInjectionHook(metrics.RecordFaultInjection),

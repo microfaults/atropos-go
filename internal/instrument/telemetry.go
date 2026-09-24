@@ -1,4 +1,4 @@
-package atropos
+package instrument
 
 import (
 	"context"
@@ -140,4 +140,27 @@ func initTelemetry(ctx context.Context, cfg telemetryConfig) (func(context.Conte
 	otel.SetTracerProvider(tp)
 
 	return tp.Shutdown, nil
+}
+
+// TelemetryConfig is the host-facing OTel bootstrap input. Endpoint,
+// transport and sampler come from the environment (OTEL_EXPORTER_OTLP_ENDPOINT
+// > COLLECTOR_SERVICE_ADDR > localhost:4317, insecure, AlwaysSample).
+type TelemetryConfig struct {
+	ServiceName    string
+	ServiceVersion string
+	Environment    string // "" = "development"
+	// TracerProvider, if set, is registered globally instead of building an
+	// OTLP exporter — the seam for tests and hosts that own their OTel setup.
+	TracerProvider oteltrace.TracerProvider
+}
+
+// InitTelemetry bootstraps OpenTelemetry for a host and returns the span
+// flush/shutdown function.
+func InitTelemetry(ctx context.Context, cfg TelemetryConfig) (func(context.Context) error, error) {
+	return initTelemetry(ctx, telemetryConfig{
+		serviceName:    cfg.ServiceName,
+		serviceVersion: cfg.ServiceVersion,
+		environment:    cfg.Environment,
+		tracerProvider: cfg.TracerProvider,
+	})
 }

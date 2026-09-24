@@ -1,4 +1,4 @@
-package atropos
+package instrument
 
 import (
 	"encoding/json"
@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
+	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
 // cacheBoxPreloadHandler implements the ATRO-6
@@ -53,7 +54,7 @@ func cacheBoxPreloadHandler(cb *cachebox.CacheBox) http.Handler {
 }
 
 func handlePreloadBegin(w http.ResponseWriter, r *http.Request, cb *cachebox.CacheBox) {
-	var req PreloadBeginRequest
+	var req wire.PreloadBeginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, fmt.Sprintf("invalid json: %s", err), http.StatusBadRequest)
 		return
@@ -63,11 +64,11 @@ func handlePreloadBegin(w http.ResponseWriter, r *http.Request, cb *cachebox.Cac
 		jsonError(w, fmt.Sprintf("unsupported key_strategy %q", req.KeyStrategy), http.StatusConflict)
 		return
 	}
-	_ = json.NewEncoder(w).Encode(PreloadBeginResponse{OK: true})
+	_ = json.NewEncoder(w).Encode(wire.PreloadBeginResponse{OK: true})
 }
 
 func handlePreloadChunk(w http.ResponseWriter, r *http.Request, cb *cachebox.CacheBox) {
-	var req PreloadChunkRequest
+	var req wire.PreloadChunkRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<20)).Decode(&req); err != nil {
 		jsonError(w, fmt.Sprintf("invalid json: %s", err), http.StatusBadRequest)
 		return
@@ -83,12 +84,12 @@ func handlePreloadChunk(w http.ResponseWriter, r *http.Request, cb *cachebox.Cac
 	case result.TooLarge:
 		jsonError(w, "too_large", http.StatusRequestEntityTooLarge)
 	default:
-		_ = json.NewEncoder(w).Encode(PreloadChunkResponse{StagedTotal: result.StagedTotal})
+		_ = json.NewEncoder(w).Encode(wire.PreloadChunkResponse{StagedTotal: result.StagedTotal})
 	}
 }
 
 func handlePreloadCommit(w http.ResponseWriter, r *http.Request, cb *cachebox.CacheBox) {
-	var req PreloadCommitRequest
+	var req wire.PreloadCommitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, fmt.Sprintf("invalid json: %s", err), http.StatusBadRequest)
 		return
@@ -101,13 +102,13 @@ func handlePreloadCommit(w http.ResponseWriter, r *http.Request, cb *cachebox.Ca
 	if !result.OK {
 		w.WriteHeader(http.StatusConflict)
 	}
-	_ = json.NewEncoder(w).Encode(PreloadCommitResponse{
+	_ = json.NewEncoder(w).Encode(wire.PreloadCommitResponse{
 		OK: result.OK, Loaded: result.Loaded, Checksum: result.Checksum,
 	})
 }
 
 func handlePreloadAbort(w http.ResponseWriter, r *http.Request, cb *cachebox.CacheBox) {
-	var req PreloadAbortRequest
+	var req wire.PreloadAbortRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, fmt.Sprintf("invalid json: %s", err), http.StatusBadRequest)
 		return

@@ -1,4 +1,4 @@
-package atropos
+package instrument
 
 import (
 	"bufio"
@@ -14,6 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
 // manteionStatus represents the SDK's connectivity state with manteion.
@@ -25,9 +27,9 @@ const (
 	manteionDegraded                           // recent poll failures; using stale rules
 )
 
-// manteionClient manages the lifecycle of the SDK's connection to manteion:
+// ManteionClient manages the lifecycle of the SDK's connection to manteion:
 // startup polling, registration, rule sync, and graceful shutdown.
-type manteionClient struct {
+type ManteionClient struct {
 	cfg        manteionConfig
 	httpClient *http.Client // used for all short-lived calls (poll, register, init)
 	sseClient  *http.Client // no Timeout — SSE connections are indefinitely long-lived
@@ -45,7 +47,7 @@ type manteionClient struct {
 
 // newReq builds a manteion-bound request with auth applied.
 // Single chokepoint for all outgoing manteion requests in this client.
-func (c *manteionClient) newReq(ctx context.Context, method, url string, body io.Reader) (*http.Request, error) {
+func (c *ManteionClient) newReq(ctx context.Context, method, url string, body io.Reader) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, err
@@ -59,7 +61,7 @@ func (c *manteionClient) newReq(ctx context.Context, method, url string, body io
 }
 
 // Status returns the current connectivity status.
-func (c *manteionClient) Status() manteionStatus {
+func (c *ManteionClient) Status() manteionStatus {
 	if c == nil {
 		return manteionDisconnected
 	}
@@ -69,7 +71,7 @@ func (c *manteionClient) Status() manteionStatus {
 // Close cancels the poll loop, waits for it to exit, and sends a best-effort
 // deregister to manteion. Safe to call on a nil receiver (offline mode).
 // Always returns nil today (best-effort); reserved for future fatal-error reporting.
-func (c *manteionClient) Close(ctx context.Context) error {
+func (c *ManteionClient) Close(ctx context.Context) error {
 	if c == nil {
 		return nil
 	}
@@ -102,7 +104,7 @@ func (c *manteionClient) Close(ctx context.Context) error {
 
 // waitForReady polls GET /api/v1/sdk/init with exponential backoff until it
 // returns 200 or the context deadline is reached.
-func (c *manteionClient) waitForReady(ctx context.Context) error {
+func (c *ManteionClient) waitForReady(ctx context.Context) error {
 	deadline := time.Now().Add(c.cfg.initTimeout)
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
@@ -139,12 +141,12 @@ func (c *manteionClient) waitForReady(ctx context.Context) error {
 
 // register POSTs the registration then applies the piggybacked intent to
 // configure the evaluator.
-func (c *manteionClient) register(ctx context.Context) error {
+func (c *ManteionClient) register(ctx context.Context) error {
 	routes := c.cfg.routes
 	if len(routes) == 0 {
 		routes = nil // omit the field entirely from the payload
 	}
-	resp, err := registerWith(ctx, c.httpClient, c.cfg.url, RegisterRequest{
+	resp, err := registerWith(ctx, c.httpClient, c.cfg.url, wire.RegisterRequest{
 		ID:             c.cfg.instanceID,
 		Service:        c.cfg.serviceName,
 		Version:        c.cfg.serviceVersion,
@@ -161,7 +163,7 @@ func (c *manteionClient) register(ctx context.Context) error {
 // pollLoopWithTrigger runs until ctx is cancelled. It fetches rules every
 // pollInterval or immediately when the SSE listener sends a trigger signal.
 // Applies exponential backoff on failures and re-registers on recovery.
-func (c *manteionClient) pollLoopWithTrigger(ctx context.Context, trigger <-chan struct{}) {
+func (c *ManteionClient) pollLoopWithTrigger(ctx context.Context, trigger <-chan struct{}) {
 	ticker := time.NewTicker(c.cfg.pollInterval)
 	defer ticker.Stop()
 
@@ -219,7 +221,7 @@ func (c *manteionClient) pollLoopWithTrigger(ctx context.Context, trigger <-chan
 }
 
 // fetchRules calls GET /api/v1/sdk/rules and applies any updated rules.
-func (c *manteionClient) fetchRules(ctx context.Context) error {
+func (c *ManteionClient) fetchRules(ctx context.Context) error {
 	q := url.Values{
 		"service":     {c.cfg.serviceName},
 		"version":     {strconv.FormatUint(c.ruleVersion.Load(), 10)},
@@ -246,15 +248,15 @@ func (c *manteionClient) fetchRules(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("read rules body: %w", err)
 		}
-		var payload RuleSync
+		var payload wire.RuleSync
 		if err := json.Unmarshal(body, &payload); err != nil {
 			return fmt.Errorf("decode rules: %w", err)
 		}
 
 		// Single application path: apply decodes rules with the configured
-		// NetworkResolver, reconciles active faults, and installs freeze config.
+		// wire.NetworkResolver, reconciles active faults, and installs freeze config.
 		// On error we keep stale state — manteion is alive, the issue is data.
-		applyResp := RegisterResponse{Status: "poll", RuleSync: payload}
+		applyResp := wire.RegisterResponse{Status: "poll", RuleSync: payload}
 		if err := apply(applyResp, c.targets); err != nil {
 			c.logger.Error("apply failed, keeping stale state", "error", err)
 			return nil
@@ -280,7 +282,7 @@ func (c *manteionClient) fetchRules(ctx context.Context) error {
 // whenever a "rules_changed" event arrives. Reconnects silently on disconnect —
 // the poll loop already handles degraded state logging, so SSE errors are only
 // logged on the first failure per connection to avoid noise during outages.
-func (c *manteionClient) listenSSE(ctx context.Context, triggerPoll func()) {
+func (c *ManteionClient) listenSSE(ctx context.Context, triggerPoll func()) {
 	sseURL := c.cfg.url + "/api/v1/sdk/events?service=" + url.QueryEscape(c.cfg.serviceName)
 	firstFailure := true
 	for {
@@ -307,7 +309,7 @@ func (c *manteionClient) listenSSE(ctx context.Context, triggerPoll func()) {
 	}
 }
 
-func (c *manteionClient) sseStream(ctx context.Context, sseURL string, triggerPoll func()) error {
+func (c *ManteionClient) sseStream(ctx context.Context, sseURL string, triggerPoll func()) error {
 	req, err := c.newReq(ctx, http.MethodGet, sseURL, nil)
 	if err != nil {
 		return err

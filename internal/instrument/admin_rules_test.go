@@ -1,4 +1,4 @@
-package atropos
+package instrument
 
 import (
 	"bytes"
@@ -8,12 +8,13 @@ import (
 	"testing"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
 func TestRulesAdminHandler(t *testing.T) {
 	t.Run("GET on empty evaluator returns 200 with empty array", func(t *testing.T) {
 		eval := evaluator.NewStaticEvaluator()
-		handler := rulesAdminHandler(eval)
+		handler := rulesAdminHandler(eval, nil)
 
 		req := httptest.NewRequest(http.MethodGet, "/admin/rules", nil)
 		rec := httptest.NewRecorder()
@@ -23,7 +24,7 @@ func TestRulesAdminHandler(t *testing.T) {
 			t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 		}
 
-		var got []StaticRule
+		var got []wire.StaticRule
 		if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
 			t.Fatalf("failed to decode response: %v", err)
 		}
@@ -34,15 +35,15 @@ func TestRulesAdminHandler(t *testing.T) {
 
 	t.Run("POST with valid compiled rules replaces evaluator rules", func(t *testing.T) {
 		eval := evaluator.NewStaticEvaluator()
-		handler := rulesAdminHandler(eval)
+		handler := rulesAdminHandler(eval, nil)
 
-		compiled := CompiledRule{
+		compiled := wire.CompiledRule{
 			Name:           "freeze-productcatalog",
 			InjectionPoint: "egress",
 			Mode:           "inline",
-			CacheBox:       &CompiledCacheBox{Mode: "replay", KeyStrategy: "exact"},
+			CacheBox:       &wire.CompiledCacheBox{Mode: "replay", KeyStrategy: "exact"},
 		}
-		body, err := json.Marshal([]CompiledRule{compiled})
+		body, err := json.Marshal([]wire.CompiledRule{compiled})
 		if err != nil {
 			t.Fatalf("marshal: %v", err)
 		}
@@ -72,7 +73,7 @@ func TestRulesAdminHandler(t *testing.T) {
 
 	t.Run("POST with malformed JSON returns 400", func(t *testing.T) {
 		eval := evaluator.NewStaticEvaluator()
-		handler := rulesAdminHandler(eval)
+		handler := rulesAdminHandler(eval, nil)
 
 		req := httptest.NewRequest(http.MethodPost, "/admin/rules", bytes.NewReader([]byte(`"not json"`)))
 		rec := httptest.NewRecorder()
@@ -85,7 +86,7 @@ func TestRulesAdminHandler(t *testing.T) {
 
 	t.Run("DELETE returns 405", func(t *testing.T) {
 		eval := evaluator.NewStaticEvaluator()
-		handler := rulesAdminHandler(eval)
+		handler := rulesAdminHandler(eval, nil)
 
 		req := httptest.NewRequest(http.MethodDelete, "/admin/rules", nil)
 		rec := httptest.NewRecorder()

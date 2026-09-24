@@ -1,4 +1,4 @@
-package atropos
+package instrument
 
 import (
 	"context"
@@ -11,11 +11,13 @@ import (
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
+	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
+	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
 type faultSlot struct {
 	decision        *evaluator.Decision
-	req             *FaultRequest
+	req             *wire.FaultRequest
 	lastConfirmedAt time.Time
 }
 
@@ -62,7 +64,7 @@ func (d *demoEvaluator) sortedIDsLocked() []string {
 
 // Set installs or replaces the slot for req.ID.
 // If req.ID is empty, it falls back to effectiveCategory.
-func (d *demoEvaluator) Set(decision *evaluator.Decision, req *FaultRequest) {
+func (d *demoEvaluator) Set(decision *evaluator.Decision, req *wire.FaultRequest) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.slots == nil {
@@ -128,11 +130,11 @@ func (d *demoEvaluator) StaleSlots(maxAge time.Duration) []string {
 
 // Active returns all active fault requests, grouped by category in
 // inline > network > resource order and lexicographic by ID within each group.
-func (d *demoEvaluator) Active() []*FaultRequest {
+func (d *demoEvaluator) Active() []*wire.FaultRequest {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	ids := d.sortedIDsLocked()
-	out := make([]*FaultRequest, 0, len(ids))
+	out := make([]*wire.FaultRequest, 0, len(ids))
 
 	for _, cat := range []string{"inline", "network", "resource"} {
 		for _, id := range ids {
@@ -158,11 +160,11 @@ func (d *demoEvaluator) Active() []*FaultRequest {
 // Confirm, the fault watchdog will reap admin slots after the grace period
 // (max(3*pollInterval, 30s)). Treat admin faults as short-lived overrides
 // when connected to manteion; in offline mode they persist until DELETEd.
-func faultAdminHandler(eval *demoEvaluator, resolve NetworkResolver) http.Handler {
+func faultAdminHandler(eval *demoEvaluator, reg *interceptor.FaultRegistry, resolve wire.NetworkResolver) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
-		// Route manually to support DELETE /admin/fault/{category}
+		// wire.Route manually to support DELETE /admin/fault/{category}
 		path := r.URL.Path
 
 		switch r.Method {
@@ -173,20 +175,20 @@ func faultAdminHandler(eval *demoEvaluator, resolve NetworkResolver) http.Handle
 			if path == "/admin/fault" || path == "/admin/fault/" {
 				ids := eval.ActiveIDs()
 				eval.Clear()
-				stopBackgroundFaults(ids...)
+				stopFaults(reg, ids...)
 			} else {
 				// strip /admin/fault/ to get ID
 				id := path[len("/admin/fault/"):]
 				eval.ClearSlot(id)
-				stopBackgroundFaults(id)
+				stopFaults(reg, id)
 			}
-			json.NewEncoder(w).Encode(FaultStatus{Active: false})
+			json.NewEncoder(w).Encode(wire.FaultStatus{Active: false})
 		case http.MethodGet:
 			reqs := eval.Active()
 			if len(reqs) > 0 {
-				json.NewEncoder(w).Encode(FaultStatus{Active: true, Faults: reqs})
+				json.NewEncoder(w).Encode(wire.FaultStatus{Active: true, Faults: reqs})
 			} else {
-				json.NewEncoder(w).Encode(FaultStatus{Active: false})
+				json.NewEncoder(w).Encode(wire.FaultStatus{Active: false})
 			}
 		default:
 			jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -194,8 +196,8 @@ func faultAdminHandler(eval *demoEvaluator, resolve NetworkResolver) http.Handle
 	})
 }
 
-func handleFaultPost(w http.ResponseWriter, r *http.Request, eval *demoEvaluator, resolve NetworkResolver) {
-	var req FaultRequest
+func handleFaultPost(w http.ResponseWriter, r *http.Request, eval *demoEvaluator, resolve wire.NetworkResolver) {
+	var req wire.FaultRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, fmt.Sprintf("invalid json: %s", err), http.StatusBadRequest)
 		return
@@ -227,14 +229,14 @@ func handleFaultPost(w http.ResponseWriter, r *http.Request, eval *demoEvaluator
 	eval.Set(decision, &req)
 
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(FaultStatus{Active: true, Faults: []*FaultRequest{&req}})
+	json.NewEncoder(w).Encode(wire.FaultStatus{Active: true, Faults: []*wire.FaultRequest{&req}})
 }
 
-// buildFault constructs a Fault from a FaultRequest via the single decode
+// buildFault constructs a Fault from a wire.FaultRequest via the single decode
 // path shared with compiled rules. Used by admin.go (handleFaultPost) and
 // register.go (applyActiveFault) — the admin endpoint therefore gets the
 // same envelope validation and ramp support as rule-attached faults.
-func buildFault(req FaultRequest, resolve NetworkResolver) (fault.Fault, error) {
+func buildFault(req wire.FaultRequest, resolve wire.NetworkResolver) (fault.Fault, error) {
 	cfg := &decodeConfig{resolve: resolve}
 	return decodeFault(&req, cfg)
 }
