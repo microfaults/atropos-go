@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"sync/atomic"
+
 	"bufio"
 	"encoding/binary"
 	"net"
@@ -96,13 +98,15 @@ func TestTransparentEgress_LoopGuardAndMissingDst(t *testing.T) {
 	ti := newTestInstrument(t)
 	up := newUpstream(t, `x`)
 
-	// Loop: original destination is the listener itself.
-	var self string
+	// Loop: original destination is the listener itself. The accept
+	// goroutine reads what the test writes after Start, hence the atomic.
+	var self atomic.Value
+	self.Store("")
 	p := startProxy(t, Config{Service: "svc", Resolve: ti.resolve, Base: transparentBase(nil),
 		TransparentEgress: &TransparentEgress{Listen: "127.0.0.1:0"},
-		OriginalDst:       func(net.Conn) (string, error) { return self, nil }})
-	self = p.TransparentEgressAddr()
-	resp, body := doGet(t, &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}, "http://"+self+"/x", nil)
+		OriginalDst:       func(net.Conn) (string, error) { return self.Load().(string), nil }})
+	self.Store(p.TransparentEgressAddr())
+	resp, body := doGet(t, &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}, "http://"+p.TransparentEgressAddr()+"/x", nil)
 	if resp.StatusCode != 502 || !strings.Contains(body, "itself") || up.calls() != 0 {
 		t.Fatalf("loop guard: status=%d body=%q calls=%d", resp.StatusCode, body, up.calls())
 	}
@@ -124,10 +128,11 @@ func TestTransparentIngress_RoutesByOriginalPortAndRejectsOthers(t *testing.T) {
 	_, appPort, _ := net.SplitHostPort(hostPort(app))
 	port, _ := strconv.Atoi(appPort)
 
-	dst := "10.42.0.7:" + appPort
+	var dst atomic.Value // read by the accept goroutine, rewritten by the test
+	dst.Store("10.42.0.7:" + appPort)
 	p := startProxy(t, Config{Service: "svc", Resolve: ti.resolve,
 		TransparentIngress: &TransparentIngress{Listen: "127.0.0.1:0", AppHost: "127.0.0.1", AllowedPorts: []int{port}},
-		OriginalDst:        func(net.Conn) (string, error) { return dst, nil }})
+		OriginalDst:        func(net.Conn) (string, error) { return dst.Load().(string), nil }})
 	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
 
 	req, _ := http.NewRequest("GET", "http://"+p.TransparentIngressAddr()+"/cart", nil)
@@ -143,7 +148,7 @@ func TestTransparentIngress_RoutesByOriginalPortAndRejectsOthers(t *testing.T) {
 		t.Fatalf("status=%d body=%q", resp.StatusCode, b[:n])
 	}
 
-	dst = "10.42.0.7:9999"
+	dst.Store("10.42.0.7:9999")
 	resp, body := doGet(t, client, "http://"+p.TransparentIngressAddr()+"/cart", nil)
 	if resp.StatusCode != 502 || !strings.Contains(body, "not an inbound app port") {
 		t.Fatalf("disallowed port: status=%d body=%q", resp.StatusCode, body)
