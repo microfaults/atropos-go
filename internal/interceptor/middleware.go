@@ -1,14 +1,23 @@
 package interceptor
 
 import (
+	"io"
 	"log"
 	"net/http"
+	"strings"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	inlinefault "git.ucsc.edu/microfaults/atropos-go/internal/fault/inline"
 	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 
 	"go.opentelemetry.io/otel/baggage"
 )
+
+// HeaderFault marks a response the interceptor synthesized for an inline
+// error fault (ingress: the handler never ran; egress: the upstream was
+// never called), so callers and tests can tell an injected error from a
+// real one.
+const HeaderFault = "X-Atropos-Fault"
 
 // workflowBaggageKey is the W3C baggage entry name used to carry per-request
 // workflow identity across service boundaries. Cache-box rules can match on
@@ -31,7 +40,13 @@ func (i *Interceptor) IngressMiddleware(next http.Handler) http.Handler {
 		}
 
 		if cr.Handle != nil && cr.Decision.Mode == evaluator.Inline {
-			<-cr.Handle.Done()
+			res := <-cr.Handle.Done()
+			// An inline error fault is the response: the handler never runs.
+			if d := inlinefault.IsErrorResult(res); d != nil {
+				w.Header().Set(HeaderFault, "error")
+				http.Error(w, d.StatusText(), d.StatusCode)
+				return
+			}
 		}
 
 		next.ServeHTTP(w, r)
@@ -70,12 +85,38 @@ func (i *Interceptor) EgressTransport(base http.RoundTripper) http.RoundTripper 
 				log.Printf("atropos: egress check error: %v", err)
 			}
 			if cr.Handle != nil && cr.Decision.Mode == evaluator.Inline {
-				<-cr.Handle.Done()
+				res := <-cr.Handle.Done()
+				// An inline error fault is the response: the upstream is
+				// never called.
+				if d := inlinefault.IsErrorResult(res); d != nil {
+					return syntheticErrorResponse(r, d), nil
+				}
 			}
 		}
 
 		return base.RoundTrip(r)
 	})
+}
+
+// syntheticErrorResponse builds the response an inline error fault stands in
+// for at egress: the configured status, the fault's message as a text/plain
+// body, and HeaderFault so the caller can tell it from a real upstream error.
+func syntheticErrorResponse(r *http.Request, d *inlinefault.ErrorDetail) *http.Response {
+	body := d.StatusText()
+	header := http.Header{}
+	header.Set("Content-Type", "text/plain; charset=utf-8")
+	header.Set(HeaderFault, "error")
+	return &http.Response{
+		Status:        http.StatusText(d.StatusCode),
+		StatusCode:    d.StatusCode,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        header,
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+		Request:       r,
+	}
 }
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)

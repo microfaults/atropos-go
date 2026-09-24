@@ -2,35 +2,16 @@ package atropos
 
 import (
 	"net/http"
-	"strconv"
-	"time"
 
+	"git.ucsc.edu/microfaults/atropos-go/internal/instrument"
 	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
-	"git.ucsc.edu/microfaults/atropos-go/internal/metrics"
-
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
-// ingressMiddleware composes otelhttp request spans with fault injection and
-// records Prometheus metrics (request count, duration histogram). Serve
-// wraps the business handler with it; control paths are mounted beside it.
+// ingressMiddleware is the shared ingress composition (metrics → otelhttp
+// server span → fault check) Serve wraps the business handler in; control
+// paths are mounted beside it.
 func ingressMiddleware(next http.Handler, serviceName string, i *interceptor.Interceptor) http.Handler {
-	// Inner: fault injection check (creates fault span as child).
-	faulted := i.IngressMiddleware(next)
-	// Middle: otelhttp request span (becomes parent of fault span).
-	traced := otelhttp.NewHandler(faulted, serviceName)
-	// Outer: metrics recording.
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rec := &statusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
-		start := time.Now()
-
-		traced.ServeHTTP(rec, r)
-
-		duration := time.Since(start).Seconds()
-		status := strconv.Itoa(rec.statusCode)
-		metrics.HTTPServerRequestDuration.WithLabelValues(r.Method, status, serviceName).Observe(duration)
-		metrics.HTTPServerRequestsTotal.WithLabelValues(r.Method, status, serviceName).Inc()
-	})
+	return instrument.IngressMiddleware(next, serviceName, i)
 }
 
 // EgressTransport composes otelhttp client spans with fault injection and
@@ -48,82 +29,7 @@ func EgressTransport(base http.RoundTripper) http.RoundTripper {
 // egressTransport is EgressTransport with an explicit interceptor resolver —
 // the seam tests use to pin a private interceptor.
 func egressTransport(base http.RoundTripper, resolve func() *interceptor.Interceptor) http.RoundTripper {
-	if base == nil {
-		base = http.DefaultTransport
-	}
-
-	// Inner: fault injection check, resolved per call (creates fault span
-	// as child of the otelhttp client span).
-	faulted := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
-		return resolve().EgressTransport(base).RoundTrip(r)
-	})
-	// Middle: otelhttp client span (becomes parent of fault span).
-	traced := otelhttp.NewTransport(faulted)
-	// Outer: metrics recording.
-	return roundTripperFunc(func(r *http.Request) (*http.Response, error) {
-		start := time.Now()
-		resp, err := traced.RoundTrip(r)
-		duration := time.Since(start).Seconds()
-
-		status := "error"
-		if resp != nil {
-			status = strconv.Itoa(resp.StatusCode)
-		}
-		target := r.URL.Host
-		if target == "" {
-			target = r.Host
-		}
-		metrics.HTTPClientRequestDuration.WithLabelValues(r.Method, status, target).Observe(duration)
-		metrics.HTTPClientRequestsTotal.WithLabelValues(r.Method, status, target).Inc()
-
-		// Classification order matters: a fail-closed miss carries BOTH the
-		// miss marker and the mode header, so the miss check must run first
-		// or every counted-503 miss inflates the hit counter.
-		if resp != nil {
-			switch {
-			case resp.Header.Get(interceptor.HeaderCacheMiss) != "":
-				metrics.CacheBoxMissesTotal.Inc()
-			case resp.Header.Get(interceptor.HeaderCacheMode) != "":
-				metrics.CacheBoxHitsTotal.Inc()
-			case resp.Header.Get(interceptor.HeaderCacheKey) != "":
-				metrics.CacheBoxRecordsTotal.Inc()
-			}
-		}
-
-		return resp, err
-	})
-}
-
-type statusRecorder struct {
-	http.ResponseWriter
-	statusCode int
-	written    bool
-}
-
-func (r *statusRecorder) WriteHeader(code int) {
-	if !r.written {
-		r.statusCode = code
-		r.written = true
-	}
-	r.ResponseWriter.WriteHeader(code)
-}
-
-func (r *statusRecorder) Write(b []byte) (int, error) {
-	if !r.written {
-		r.statusCode = http.StatusOK
-		r.written = true
-	}
-	return r.ResponseWriter.Write(b)
-}
-
-func (r *statusRecorder) Flush() {
-	if f, ok := r.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
-func (r *statusRecorder) Unwrap() http.ResponseWriter {
-	return r.ResponseWriter
+	return instrument.EgressTransport(base, resolve)
 }
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
