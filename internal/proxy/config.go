@@ -42,9 +42,28 @@ type Config struct {
 	Ingress *IngressListener
 	// Base is the transport the egress transport composition forwards
 	// through; nil uses http.DefaultTransport. The daemon passes a
-	// ToxicTransport so armed network toxics apply to live calls.
+	// ToxicTransport (over NewTransparentTransport in transparent mode) so
+	// armed network toxics apply to live calls.
 	Base   http.RoundTripper
 	Logger *slog.Logger
+
+	// TransparentEgress and TransparentIngress are the iptables-redirected
+	// listeners (design §5.2); nil disables each.
+	TransparentEgress  *TransparentEgress
+	TransparentIngress *TransparentIngress
+	// OriginalDst resolves a redirected connection's original destination;
+	// nil uses the platform implementation (SO_ORIGINAL_DST on linux).
+	OriginalDst OriginalDstFunc
+	// Policies is the armed toxic table raw-TCP relays consult; nil relays
+	// without toxics.
+	Policies *PolicyTable
+}
+
+func (c Config) originalDst() OriginalDstFunc {
+	if c.OriginalDst != nil {
+		return c.OriginalDst
+	}
+	return platformOriginalDst
 }
 
 func (c Config) base() http.RoundTripper {

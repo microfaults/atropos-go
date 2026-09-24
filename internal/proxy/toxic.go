@@ -35,16 +35,54 @@ type armed struct {
 }
 
 // PolicyTable holds the armed policies of one sidecar. ToxicTransport
-// consults it per request; PolicyFault arms and disarms.
+// consults it per request (by URL host); raw-TCP relays per connection (by
+// original destination address, resolving target names); PolicyFault arms
+// and disarms.
 type PolicyTable struct {
-	mu    sync.RWMutex
-	armed map[string]*armed
-	roll  func() float64
+	mu     sync.RWMutex
+	armed  map[string]*armed
+	roll   func() float64
+	lookup func(host string) []net.IP // name → addresses, for matchAddr
+
+	rmu      sync.Mutex
+	resolved map[string]resolvedIPs
 }
+
+type resolvedIPs struct {
+	ips []net.IP
+	at  time.Time
+}
+
+const resolveTTL = 30 * time.Second
 
 // NewPolicyTable returns an empty table.
 func NewPolicyTable() *PolicyTable {
-	return &PolicyTable{armed: map[string]*armed{}, roll: rand.Float64}
+	t := &PolicyTable{armed: map[string]*armed{}, roll: rand.Float64, resolved: map[string]resolvedIPs{}}
+	t.lookup = t.cachedLookup
+	return t
+}
+
+func (t *PolicyTable) cachedLookup(host string) []net.IP {
+	t.rmu.Lock()
+	if r, ok := t.resolved[host]; ok && time.Since(r.at) < resolveTTL {
+		t.rmu.Unlock()
+		return r.ips
+	}
+	t.rmu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil
+	}
+	ips := make([]net.IP, len(addrs))
+	for i, a := range addrs {
+		ips[i] = a.IP
+	}
+	t.rmu.Lock()
+	t.resolved[host] = resolvedIPs{ips: ips, at: time.Now()}
+	t.rmu.Unlock()
+	return ips
 }
 
 func (t *PolicyTable) arm(ctx context.Context, p Policy) *armed {
@@ -106,6 +144,65 @@ func (t *PolicyTable) match(host string) (*armed, bool) {
 	}
 	hit.affected.Add(1)
 	return hit, true
+}
+
+// matchAddr is match for a raw-TCP connection, whose destination is an
+// "ip:port" with no Host header: a target that names a host is resolved and
+// compared by address (port too, when the target has one).
+func (t *PolicyTable) matchAddr(dst string) (*armed, bool) {
+	t.mu.RLock()
+	names := make([]string, 0, len(t.armed))
+	for n := range t.armed {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	var hit *armed
+	for _, n := range names {
+		if targetMatches(t.armed[n].Target, dst) || targetMatchesAddr(t.armed[n].Target, dst, t.lookup) {
+			hit = t.armed[n]
+			break
+		}
+	}
+	t.mu.RUnlock()
+	if hit == nil {
+		return nil, false
+	}
+	hit.matched.Add(1)
+	scope := hit.Scope
+	if scope <= 0 {
+		scope = 1
+	}
+	if scope < 1 && t.roll() >= scope {
+		return nil, false
+	}
+	hit.affected.Add(1)
+	return hit, true
+}
+
+// targetMatchesAddr resolves a named target and compares it with an
+// "ip:port" destination.
+func targetMatchesAddr(target, dst string, lookup func(string) []net.IP) bool {
+	th, tp, err := net.SplitHostPort(target)
+	if err != nil {
+		th, tp = target, ""
+	}
+	dh, dp, err := net.SplitHostPort(dst)
+	if err != nil {
+		return false
+	}
+	if tp != "" && tp != dp {
+		return false
+	}
+	dip := net.ParseIP(dh)
+	if dip == nil || net.ParseIP(th) != nil || lookup == nil {
+		return false
+	}
+	for _, ip := range lookup(th) {
+		if ip.Equal(dip) {
+			return true
+		}
+	}
+	return false
 }
 
 // targetMatches: an exact "host:port" match, or a port-less target matching
