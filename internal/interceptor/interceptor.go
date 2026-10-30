@@ -29,9 +29,9 @@ func WithRegistry(r *FaultRegistry) Option {
 }
 
 // InjectionHook is called once each time the interceptor starts a fault,
-// with the fault's Go type and the injection point ("ingress"/"egress").
-// The parent atropos package wires this to a Prometheus counter; keep it
-// cheap and non-blocking.
+// with the fault's Go type and the injection point ("ingress", "egress",
+// "transient" or "custom"). The parent atropos package wires this to a
+// Prometheus counter; keep it cheap and non-blocking.
 type InjectionHook func(faultType, injectionPoint string)
 
 // WithInjectionHook sets the per-injection callback. A nil hook is ignored.
@@ -134,11 +134,35 @@ func (i *Interceptor) StartFault(ctx context.Context, req evaluator.Request, dec
 
 	// Registry path: non-inline faults with a registry get deduped.
 	if i.registry != nil && !IsInlineFault(decision.Fault) {
-		return i.startRegistered(ctx, req, decision, faultType, effectiveMode)
+		return i.startRegistered(i.registry.ctx, req, decision, faultType, effectiveMode)
 	}
 
 	// Direct path: inline faults (or no registry configured).
 	return i.startDirect(ctx, req, decision, faultType, effectiveMode)
+}
+
+// StartTransient starts decision's fault for the Transient point, where the
+// response is already complete: inline mode has nothing left to block, so
+// every fault -- inline types included -- runs in Background mode and, when
+// a registry is configured, through it (stoppable by rule name, deduplicated
+// by StartPolicy) regardless of its type. The fault span is parented on
+// ctx's trace context while the fault runs detached from ctx's cancellation
+// (context.WithoutCancel): it outlives the request without losing the link
+// to it. An inline error fault here has no response to shape; it only
+// leaves its span.
+func (i *Interceptor) StartTransient(ctx context.Context, req evaluator.Request, decision *evaluator.Decision) (CheckResult, error) {
+	if decision == nil || decision.Fault == nil {
+		return CheckResult{}, nil
+	}
+	if err := decision.Fault.Validate(); err != nil {
+		return CheckResult{}, fmt.Errorf("interceptor: invalid fault from evaluator: %w", err)
+	}
+	faultType := fmt.Sprintf("%T", decision.Fault)
+	detached := context.WithoutCancel(ctx)
+	if i.registry != nil {
+		return i.startRegistered(detached, req, decision, faultType, evaluator.Background)
+	}
+	return i.startDirect(detached, req, decision, faultType, evaluator.Background)
 }
 
 // startDirect is the inline-fault path. It creates a span, wires up events,
@@ -175,17 +199,20 @@ func (i *Interceptor) startDirect(ctx context.Context, req evaluator.Request, de
 	return CheckResult{Handle: handle, Decision: &d}, nil
 }
 
-// startRegistered routes non-inline faults through the registry for
-// deduplication. The span is anchored to the registry context so faults can
-// outlive the triggering request.
-func (i *Interceptor) startRegistered(ctx context.Context, req evaluator.Request, decision *evaluator.Decision, faultType string, mode evaluator.Mode) (CheckResult, error) {
+// startRegistered routes faults through the registry for deduplication and
+// detachment: the fault runs under the registry context so it can outlive
+// the triggering request and be stopped by key. Its span is parented on
+// spanParent -- the registry context for StartFault (a root span, as
+// before) or the request context stripped of cancellation for
+// StartTransient (a child of the request's server span).
+func (i *Interceptor) startRegistered(spanParent context.Context, req evaluator.Request, decision *evaluator.Decision, faultType string, mode evaluator.Mode) (CheckResult, error) {
 	key := decision.Name
 	if key == "" {
 		key = faultType
 	}
 
 	handle, deduped, err := i.registry.StartOrJoin(key, decision.StartPolicy, func(regCtx context.Context) (*fault.Handle, error) {
-		_, span := i.tracer.Start(regCtx, trace.SpanFaultInject,
+		_, span := i.tracer.Start(spanParent, trace.SpanFaultInject,
 			attribute.String(trace.AttrFaultType, faultType),
 			attribute.String(trace.AttrFaultInjectionPoint, req.Point.String()),
 			attribute.String(trace.AttrFaultReason, decision.Reason),

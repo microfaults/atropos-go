@@ -346,6 +346,8 @@ type recordingTracer struct {
 	span     recordingSpan
 	// spanCount tracks how many times Start was called (hook + fault = 2).
 	spanCount int
+	// startCtx is the context the last Start received (span parent).
+	startCtx context.Context
 }
 
 type recordingSpan struct {
@@ -359,6 +361,7 @@ type recordingSpan struct {
 func (t *recordingTracer) Start(ctx context.Context, name string, _ ...attribute.KeyValue) (context.Context, trace.Span) {
 	t.started = true
 	t.spanCount++
+	t.startCtx = ctx
 	// Record the first span name (hook or fault depending on call order).
 	if t.spanCount == 1 {
 		t.spanName = name
