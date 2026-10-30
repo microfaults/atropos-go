@@ -15,19 +15,20 @@ import (
 // IngressMiddleware is the ingress composition every host wraps business
 // traffic in: Prometheus request metrics (outer), the otelhttp server span
 // (middle), and the interceptor's fault check (inner, so the fault span is
-// a child of the request span). Control paths are mounted beside it, never
-// inside it.
+// a child of the request span; it also evaluates the Transient point once
+// the response is complete, so a transient fault span is a child of the
+// request span too). Control paths are mounted beside it, never inside it.
 func IngressMiddleware(next http.Handler, serviceName string, i *interceptor.Interceptor) http.Handler {
 	faulted := i.IngressMiddleware(next)
 	traced := otelhttp.NewHandler(faulted, serviceName)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rec := &statusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
+		rec := interceptor.NewStatusRecorder(w)
 		start := time.Now()
 
 		traced.ServeHTTP(rec, r)
 
 		duration := time.Since(start).Seconds()
-		status := strconv.Itoa(rec.statusCode)
+		status := strconv.Itoa(rec.Status())
 		metrics.HTTPServerRequestDuration.WithLabelValues(r.Method, status, serviceName).Observe(duration)
 		metrics.HTTPServerRequestsTotal.WithLabelValues(r.Method, status, serviceName).Inc()
 	})
@@ -89,38 +90,6 @@ func EgressTransport(base http.RoundTripper, resolve func() *interceptor.Interce
 
 		return resp, err
 	})
-}
-
-type statusRecorder struct {
-	http.ResponseWriter
-	statusCode int
-	written    bool
-}
-
-func (r *statusRecorder) WriteHeader(code int) {
-	if !r.written {
-		r.statusCode = code
-		r.written = true
-	}
-	r.ResponseWriter.WriteHeader(code)
-}
-
-func (r *statusRecorder) Write(b []byte) (int, error) {
-	if !r.written {
-		r.statusCode = http.StatusOK
-		r.written = true
-	}
-	return r.ResponseWriter.Write(b)
-}
-
-func (r *statusRecorder) Flush() {
-	if f, ok := r.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
-func (r *statusRecorder) Unwrap() http.ResponseWriter {
-	return r.ResponseWriter
 }
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)

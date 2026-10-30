@@ -3,7 +3,9 @@ package interceptor
 import (
 	"io"
 	"log"
+	"maps"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
@@ -24,33 +26,51 @@ const HeaderFault = "X-Atropos-Fault"
 // this to scope freezing to specific workflows (e.g. "browse" vs "checkout").
 const workflowBaggageKey = "atropos.workflow"
 
-// IngressMiddleware checks for faults on inbound HTTP requests.
+// IngressMiddleware checks for faults on inbound HTTP requests, then -- once
+// the response is complete, whichever path produced it -- evaluates the
+// Transient point with the same labels plus the response status.
 // Cache-box is not dispatched at ingress in Stage 1 -- see
 // internal/interceptor/cachebox.go for the egress dispatcher.
 func (i *Interceptor) IngressMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		req := evaluator.Request{
-			Point:  evaluator.Ingress,
-			Labels: extractHTTPLabels(r),
-		}
-
-		cr, err := i.Check(r.Context(), req)
+		labels := extractHTTPLabels(r)
+		cr, err := i.Check(r.Context(), evaluator.Request{Point: evaluator.Ingress, Labels: labels})
 		if err != nil {
 			log.Printf("atropos: ingress check error: %v", err)
 		}
 
+		rec := NewStatusRecorder(w)
 		if cr.Handle != nil && cr.Decision.Mode == evaluator.Inline {
 			res := <-cr.Handle.Done()
 			// An inline error fault is the response: the handler never runs.
 			if d := inlinefault.IsErrorResult(res); d != nil {
-				w.Header().Set(HeaderFault, "error")
-				http.Error(w, d.StatusText(), d.StatusCode)
+				rec.Header().Set(HeaderFault, "error")
+				http.Error(rec, d.StatusText(), d.StatusCode)
+				i.transient(r, labels, rec.Status())
 				return
 			}
 		}
 
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(rec, r)
+		i.transient(r, labels, rec.Status())
 	})
+}
+
+// transient evaluates the Transient point for a completed response: the
+// ingress labels plus atropos.http.status_code. A matching fault starts
+// detached from the request and never blocks it (StartTransient); cache-box
+// decisions have no meaning here and are ignored.
+func (i *Interceptor) transient(r *http.Request, labels map[string]string, status int) {
+	tl := maps.Clone(labels)
+	tl[trace.AttrHTTPStatusCode] = strconv.Itoa(status)
+	req := evaluator.Request{Point: evaluator.Transient, Labels: tl}
+	d := i.Evaluate(r.Context(), req)
+	if d == nil || d.CacheBox != evaluator.CacheBoxNone {
+		return
+	}
+	if _, err := i.StartTransient(r.Context(), req, d); err != nil {
+		log.Printf("atropos: transient check error: %v", err)
+	}
 }
 
 // EgressTransport checks for faults and cache-box operations on outbound

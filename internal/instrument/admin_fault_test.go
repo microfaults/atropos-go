@@ -11,6 +11,7 @@ import (
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault/inline"
 	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
 	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
@@ -326,5 +327,23 @@ func TestFaultAdmin_MultiSlotIDs(t *testing.T) {
 	handler.ServeHTTP(recD2, reqD2)
 	if len(eval.Active()) != 0 {
 		t.Fatal("expected no active faults after global DELETE")
+	}
+}
+
+// TestDemoEvaluator_IgnoresTransientPoint: an armed admin fault matches the
+// request path (ingress/egress/custom), never the post-response point --
+// otherwise every armed inline fault would fire twice per request and the
+// span accounting in TestServe_BusinessThroughMiddleware_ControlBypassed
+// would see the second, later-ending fault span.
+func TestDemoEvaluator_IgnoresTransientPoint(t *testing.T) {
+	demo := &demoEvaluator{}
+	demo.Set(&evaluator.Decision{Name: "lat", Reason: "admin", Mode: evaluator.Inline,
+		Fault: &inline.Latency{FaultConfig: fault.FaultConfig{Duration: time.Millisecond}, Delay: time.Millisecond}},
+		&wire.FaultRequest{ID: "lat", Category: "inline", FaultType: "latency"})
+	if demo.Evaluate(context.Background(), evaluator.Request{Point: evaluator.Ingress}) == nil {
+		t.Fatal("armed slot must match at ingress")
+	}
+	if d := demo.Evaluate(context.Background(), evaluator.Request{Point: evaluator.Transient}); d != nil {
+		t.Fatalf("armed slot matched at Transient: %+v", d)
 	}
 }

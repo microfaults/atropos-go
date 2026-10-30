@@ -14,11 +14,12 @@ const (
 	AttrHookName = "atropos.hook.name"
 
 	// HTTP label attributes (set by middleware).
-	AttrHTTPMethod    = "atropos.http.method"
-	AttrHTTPPath      = "atropos.http.path"
-	AttrHTTPQuery     = "atropos.http.query"
-	AttrHTTPHost      = "atropos.http.host"
-	AttrHTTPUserAgent = "atropos.http.user_agent"
+	AttrHTTPMethod     = "atropos.http.method"
+	AttrHTTPPath       = "atropos.http.path"
+	AttrHTTPQuery      = "atropos.http.query"
+	AttrHTTPHost       = "atropos.http.host"
+	AttrHTTPUserAgent  = "atropos.http.user_agent"
+	AttrHTTPStatusCode = "atropos.http.status_code" // Transient point only: the completed response's status
 
 	// gRPC label attributes (set by gRPC interceptors).
 	AttrGRPCMethod    = "atropos.grpc.method"

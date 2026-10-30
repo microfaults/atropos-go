@@ -44,9 +44,12 @@ func applyRuleSet(reg *interceptor.FaultRegistry, eval *evaluator.StaticEvaluato
 type armFunc func(point evaluator.InjectionPoint, d *evaluator.Decision)
 
 // armDecision applies arm to d when the host arms eagerly and the fault is
-// a background one. Inline faults are per-request by nature and stay lazy.
+// a background one. Inline faults are per-request by nature and stay lazy,
+// as do Transient rules.
 func armDecision(arm armFunc, point evaluator.InjectionPoint, d *evaluator.Decision) {
-	if arm == nil || d == nil || d.Fault == nil || interceptor.IsInlineFault(d.Fault) {
+	// Transient rules are request-triggered by definition: their status
+	// label only exists once a response has completed.
+	if arm == nil || d == nil || d.Fault == nil || point == evaluator.Transient || interceptor.IsInlineFault(d.Fault) {
 		return
 	}
 	arm(point, d)

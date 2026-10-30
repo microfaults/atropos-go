@@ -36,7 +36,12 @@ type demoEvaluator struct {
 // higher-sorting IDs are inert as long as a winning slot exists. See
 // docs/plans/2026-05-17-concurrent-multi-fault-execution.md for the path to
 // true concurrent multi-fault execution.
-func (d *demoEvaluator) Evaluate(_ context.Context, _ evaluator.Request) *evaluator.Decision {
+func (d *demoEvaluator) Evaluate(_ context.Context, req evaluator.Request) *evaluator.Decision {
+	// Admin slots arm the request path. The post-response point would fire
+	// every armed inline fault a second time per request.
+	if req.Point == evaluator.Transient {
+		return nil
+	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 

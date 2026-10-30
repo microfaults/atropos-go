@@ -7,6 +7,7 @@ import (
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault/resource/cpu"
 	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
 	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
@@ -55,4 +56,18 @@ func TestApplyRuleSetStopsRemovedRuleFaults(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 	hSurvivor.Stop() // clean up
+}
+
+// TestArmDecision_SkipsTransientRules: a Transient rule is request-triggered
+// by definition (its status label only exists once a response completed),
+// so eagerly-arming hosts must not start it at apply time.
+func TestArmDecision_SkipsTransientRules(t *testing.T) {
+	var armed int
+	arm := func(evaluator.InjectionPoint, *evaluator.Decision) { armed++ }
+	d := &evaluator.Decision{Name: "burn", Fault: &cpu.Stress{}}
+	armDecision(arm, evaluator.Ingress, d)
+	armDecision(arm, evaluator.Transient, d)
+	if armed != 1 {
+		t.Fatalf("armed %d times, want 1 (ingress only)", armed)
+	}
 }

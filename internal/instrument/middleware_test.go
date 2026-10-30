@@ -7,11 +7,13 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault/inline"
 	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
+	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 )
 
 func errorRule(point evaluator.InjectionPoint, status int, msg string) evaluator.StaticRule {
@@ -84,5 +86,29 @@ func TestEgressTransport_LatencyFaultStillForwards(t *testing.T) {
 	resp, err := EgressTransport(base, func() *interceptor.Interceptor { return ic }).RoundTrip(httptest.NewRequest("GET", "http://dep/x", nil))
 	if err != nil || resp.StatusCode != 200 || live.Load() != 1 {
 		t.Fatalf("err=%v status=%v live=%d", err, resp, live.Load())
+	}
+}
+
+// TestIngressMiddleware_TransientThroughFullComposition: metrics + otelhttp +
+// fault middleware; the transient rule sees the status the handler wrote and
+// the injection hook is called with the transient point.
+func TestIngressMiddleware_TransientThroughFullComposition(t *testing.T) {
+	reg := interceptor.NewFaultRegistry()
+	t.Cleanup(reg.Close)
+	var points []string
+	ic := interceptor.New(evaluator.NewStaticEvaluator(evaluator.StaticRule{
+		Name: "after-404", Point: evaluator.Transient, Labels: map[string]string{trace.AttrHTTPStatusCode: "404"},
+		Decision: evaluator.Decision{Name: "after-404", Mode: evaluator.Inline, Reason: "test",
+			Fault: &inline.Latency{FaultConfig: fault.FaultConfig{Duration: time.Millisecond}, Delay: time.Millisecond}},
+	}), nil, interceptor.WithRegistry(reg), interceptor.WithInjectionHook(func(_, p string) { points = append(points, p) }))
+	h := IngressMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }), "svc", ic)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/missing", nil))
+	if rec.Code != 404 {
+		t.Fatalf("code = %d, want 404", rec.Code)
+	}
+	if len(points) != 1 || points[0] != "transient" {
+		t.Fatalf("injection points = %v, want [transient]", points)
 	}
 }
