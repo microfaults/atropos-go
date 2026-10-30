@@ -95,12 +95,12 @@ func TestEgressTransport_LatencyFaultStillForwards(t *testing.T) {
 func TestIngressMiddleware_TransientThroughFullComposition(t *testing.T) {
 	reg := interceptor.NewFaultRegistry()
 	t.Cleanup(reg.Close)
-	var points []string
+	points := make(chan string, 4)
 	ic := interceptor.New(evaluator.NewStaticEvaluator(evaluator.StaticRule{
 		Name: "after-404", Point: evaluator.Transient, Labels: map[string]string{trace.AttrHTTPStatusCode: "404"},
 		Decision: evaluator.Decision{Name: "after-404", Mode: evaluator.Inline, Reason: "test",
 			Fault: &inline.Latency{FaultConfig: fault.FaultConfig{Duration: time.Millisecond}, Delay: time.Millisecond}},
-	}), nil, interceptor.WithRegistry(reg), interceptor.WithInjectionHook(func(_, p string) { points = append(points, p) }))
+	}), nil, interceptor.WithRegistry(reg), interceptor.WithInjectionHook(func(_, p string) { points <- p }))
 	h := IngressMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }), "svc", ic)
 
 	rec := httptest.NewRecorder()
@@ -108,7 +108,18 @@ func TestIngressMiddleware_TransientThroughFullComposition(t *testing.T) {
 	if rec.Code != 404 {
 		t.Fatalf("code = %d, want 404", rec.Code)
 	}
-	if len(points) != 1 || points[0] != "transient" {
-		t.Fatalf("injection points = %v, want [transient]", points)
+	// The transient start runs on its own goroutine: wait for the hook.
+	select {
+	case p := <-points:
+		if p != "transient" {
+			t.Fatalf("injection point = %q, want transient", p)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("transient fault did not start")
+	}
+	select {
+	case p := <-points:
+		t.Fatalf("unexpected second injection point %q, want exactly [transient]", p)
+	case <-time.After(50 * time.Millisecond):
 	}
 }

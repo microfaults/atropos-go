@@ -149,7 +149,10 @@ func (i *Interceptor) StartFault(ctx context.Context, req evaluator.Request, dec
 // ctx's trace context while the fault runs detached from ctx's cancellation
 // (context.WithoutCancel): it outlives the request without losing the link
 // to it. An inline error fault here has no response to shape; it only
-// leaves its span.
+// leaves its span. It returns once the fault has started, and a fault's
+// Start can block (the registry holds its lock meanwhile), so a caller that
+// still has a response to finish runs it on its own goroutine, as
+// IngressMiddleware does.
 func (i *Interceptor) StartTransient(ctx context.Context, req evaluator.Request, decision *evaluator.Decision) (CheckResult, error) {
 	if decision == nil || decision.Fault == nil {
 		return CheckResult{}, nil

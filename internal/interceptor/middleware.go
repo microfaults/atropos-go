@@ -1,6 +1,7 @@
 package interceptor
 
 import (
+	"context"
 	"io"
 	"log"
 	"maps"
@@ -28,7 +29,9 @@ const workflowBaggageKey = "atropos.workflow"
 
 // IngressMiddleware checks for faults on inbound HTTP requests, then -- once
 // the response is complete, whichever path produced it -- evaluates the
-// Transient point with the same labels plus the response status.
+// Transient point with the same labels plus the response status. A matching
+// transient fault is started off the request goroutine and never delays the
+// response.
 // Cache-box is not dispatched at ingress in Stage 1 -- see
 // internal/interceptor/cachebox.go for the egress dispatcher.
 func (i *Interceptor) IngressMiddleware(next http.Handler) http.Handler {
@@ -57,20 +60,30 @@ func (i *Interceptor) IngressMiddleware(next http.Handler) http.Handler {
 }
 
 // transient evaluates the Transient point for a completed response: the
-// ingress labels plus atropos.http.status_code. A matching fault starts
-// detached from the request and never blocks it (StartTransient); cache-box
-// decisions have no meaning here and are ignored.
+// ingress labels plus atropos.http.status_code. The evaluation is
+// synchronous (a rule match); the start is not. A fault's Start can block --
+// the sidecar's agent fault waits on a unix-socket round trip, the
+// in-process disk stress writes its files -- and the registry runs it under
+// its lock, so a matching fault is started on its own goroutine
+// (StartTransient) and the response is never delayed by it. The goroutine
+// gets the request's context snapshotted here and detached from the
+// request's cancellation, keeping the trace parent; it never touches r, so
+// the request may finish while the fault starts. A start failure is only
+// logged. Cache-box decisions have no meaning here and are ignored.
 func (i *Interceptor) transient(r *http.Request, labels map[string]string, status int) {
 	tl := maps.Clone(labels)
 	tl[trace.AttrHTTPStatusCode] = strconv.Itoa(status)
 	req := evaluator.Request{Point: evaluator.Transient, Labels: tl}
-	d := i.Evaluate(r.Context(), req)
+	ctx := context.WithoutCancel(r.Context())
+	d := i.Evaluate(ctx, req)
 	if d == nil || d.CacheBox != evaluator.CacheBoxNone {
 		return
 	}
-	if _, err := i.StartTransient(r.Context(), req, d); err != nil {
-		log.Printf("atropos: transient check error: %v", err)
-	}
+	go func() {
+		if _, err := i.StartTransient(ctx, req, d); err != nil {
+			log.Printf("atropos: transient check error: %v", err)
+		}
+	}()
 }
 
 // EgressTransport checks for faults and cache-box operations on outbound

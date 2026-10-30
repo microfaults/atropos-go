@@ -120,6 +120,44 @@ func (f *afterHandlerFault) Start(ctx context.Context) (*fault.Handle, error) {
 	return h, nil
 }
 
+// slowStartFault blocks inside Start, like the sidecar's agent fault (a
+// unix-socket round trip) or a disk stress writing its files. Through the
+// registry, Start also runs under the registry lock, so a slow one must stay
+// off the response path.
+type slowStartFault struct {
+	delay   time.Duration
+	started chan struct{}
+}
+
+func (f *slowStartFault) Validate() error { return nil }
+func (f *slowStartFault) Start(ctx context.Context) (*fault.Handle, error) {
+	time.Sleep(f.delay)
+	_, cancel := context.WithCancel(ctx)
+	h := fault.NewHandle(cancel)
+	go func() { defer cancel(); h.Send(fault.Result{}) }()
+	close(f.started)
+	return h, nil
+}
+
+// hookCalls collects injection-hook calls. The Transient start runs on its
+// own goroutine, so tests wait on the hook (bounded) instead of reading hook
+// or registry state right after ServeHTTP returns.
+type hookCalls chan string
+
+func newHookCalls() hookCalls { return make(hookCalls, 16) }
+
+func (h hookCalls) hook() InjectionHook { return func(_, point string) { h <- point } }
+
+// next returns the point of the next hook call, waiting up to d for it.
+func (h hookCalls) next(d time.Duration) (string, bool) {
+	select {
+	case p := <-h:
+		return p, true
+	case <-time.After(d):
+		return "", false
+	}
+}
+
 // TestIngressMiddleware_TransientFiresAfterResponse: the Transient point is
 // evaluated once the handler has written its response, with the response
 // status as a label, and the fault starts under the "transient" point.
@@ -128,9 +166,9 @@ func TestIngressMiddleware_TransientFiresAfterResponse(t *testing.T) {
 	t.Cleanup(reg.Close)
 	var handlerDone atomic.Bool
 	f := &afterHandlerFault{handlerDone: &handlerDone, started: make(chan struct{})}
-	var points []string
+	hooks := newHookCalls()
 	i := New(evaluator.NewStaticEvaluator(transientRule("after", map[string]string{trace.AttrHTTPStatusCode: "201"}, f)),
-		trace.Noop(), WithRegistry(reg), WithInjectionHook(func(_, point string) { points = append(points, point) }))
+		trace.Noop(), WithRegistry(reg), WithInjectionHook(hooks.hook()))
 	h := i.IngressMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte("made"))
@@ -150,8 +188,12 @@ func TestIngressMiddleware_TransientFiresAfterResponse(t *testing.T) {
 	if !f.startedAfter.Load() {
 		t.Fatal("transient fault started before the handler finished writing")
 	}
-	if len(points) != 1 || points[0] != "transient" {
-		t.Fatalf("injection hook points = %v, want [transient]", points)
+	// The hook follows the start on the same goroutine, so wait for it.
+	if p, ok := hooks.next(time.Second); !ok || p != "transient" {
+		t.Fatalf("injection hook = %q (called=%v), want transient", p, ok)
+	}
+	if p, ok := hooks.next(50 * time.Millisecond); ok {
+		t.Fatalf("injection hook called again (%q), want exactly one call", p)
 	}
 }
 
@@ -162,13 +204,18 @@ func TestIngressMiddleware_TransientDoesNotDelayResponse(t *testing.T) {
 	reg := NewFaultRegistry()
 	t.Cleanup(reg.Close)
 	slow := &inline.Latency{FaultConfig: fault.FaultConfig{Duration: 300 * time.Millisecond}, Delay: 300 * time.Millisecond}
-	i := New(evaluator.NewStaticEvaluator(transientRule("slow", nil, slow)), trace.Noop(), WithRegistry(reg))
+	hooks := newHookCalls()
+	i := New(evaluator.NewStaticEvaluator(transientRule("slow", nil, slow)), trace.Noop(), WithRegistry(reg), WithInjectionHook(hooks.hook()))
 	h := i.IngressMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
 
 	start := time.Now()
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/x", nil))
 	if elapsed := time.Since(start); elapsed > 150*time.Millisecond {
 		t.Fatalf("response took %v; the transient fault must not block it", elapsed)
+	}
+	// The start is asynchronous; the hook fires once the fault is registered.
+	if _, ok := hooks.next(time.Second); !ok {
+		t.Fatal("transient fault did not start")
 	}
 	startedAnother := false
 	_, deduped, err := reg.StartOrJoin("slow", evaluator.DeduplicateByRule, func(context.Context) (*fault.Handle, error) {
@@ -181,6 +228,34 @@ func TestIngressMiddleware_TransientDoesNotDelayResponse(t *testing.T) {
 	reg.Stop("slow")
 }
 
+// TestIngressMiddleware_TransientSlowStartDoesNotDelayResponse: the start
+// itself is off the response path, not just the fault's run. A fault whose
+// Start blocks (and, through the registry, holds its lock while it does) must
+// not hold the response back; it still starts afterwards.
+func TestIngressMiddleware_TransientSlowStartDoesNotDelayResponse(t *testing.T) {
+	reg := NewFaultRegistry()
+	t.Cleanup(reg.Close)
+	slow := &slowStartFault{delay: 300 * time.Millisecond, started: make(chan struct{})}
+	hooks := newHookCalls()
+	i := New(evaluator.NewStaticEvaluator(transientRule("slow-start", nil, slow)),
+		trace.Noop(), WithRegistry(reg), WithInjectionHook(hooks.hook()))
+	h := i.IngressMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+
+	start := time.Now()
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/x", nil))
+	if elapsed := time.Since(start); elapsed > 150*time.Millisecond {
+		t.Fatalf("response took %v; a blocking transient Start must not delay it", elapsed)
+	}
+	select {
+	case <-slow.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow-start transient fault never started")
+	}
+	if p, ok := hooks.next(time.Second); !ok || p != "transient" {
+		t.Fatalf("injection hook = %q (called=%v), want transient", p, ok)
+	}
+}
+
 // TestIngressMiddleware_TransientMatchesResponseStatus: the status label is
 // the response's status; a rule for another status does not fire.
 func TestIngressMiddleware_TransientMatchesResponseStatus(t *testing.T) {
@@ -191,12 +266,18 @@ func TestIngressMiddleware_TransientMatchesResponseStatus(t *testing.T) {
 		t.Run(strconv.Itoa(tc.status), func(t *testing.T) {
 			reg := NewFaultRegistry()
 			t.Cleanup(reg.Close)
-			var fired atomic.Int32
+			hooks := newHookCalls()
 			i := New(evaluator.NewStaticEvaluator(transientRule("on-503", map[string]string{trace.AttrHTTPStatusCode: "503"}, shortLatency())),
-				trace.Noop(), WithRegistry(reg), WithInjectionHook(func(_, _ string) { fired.Add(1) }))
+				trace.Noop(), WithRegistry(reg), WithInjectionHook(hooks.hook()))
 			h := i.IngressMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(tc.status) }))
 			h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/x", nil))
-			if got := fired.Load() == 1; got != tc.want {
+			// The start runs on its own goroutine: wait for it when a fault is
+			// expected; when none is, give a stray start time to show itself.
+			wait := 50 * time.Millisecond
+			if tc.want {
+				wait = time.Second
+			}
+			if _, got := hooks.next(wait); got != tc.want {
 				t.Fatalf("status %d: fired=%v, want %v", tc.status, got, tc.want)
 			}
 		})
@@ -209,12 +290,12 @@ func TestIngressMiddleware_TransientMatchesResponseStatus(t *testing.T) {
 func TestIngressMiddleware_TransientAfterInlineError(t *testing.T) {
 	reg := NewFaultRegistry()
 	t.Cleanup(reg.Close)
-	var points []string
+	hooks := newHookCalls()
 	i := New(evaluator.NewStaticEvaluator(
 		evaluator.StaticRule{Name: "err", Point: evaluator.Ingress, Decision: evaluator.Decision{Name: "err", Mode: evaluator.Inline, Reason: "test",
 			Fault: &inline.Error{FaultConfig: fault.FaultConfig{Duration: 1}, StatusCode: 503, Message: "down"}}},
 		transientRule("after-503", map[string]string{trace.AttrHTTPStatusCode: "503"}, shortLatency()),
-	), trace.Noop(), WithRegistry(reg), WithInjectionHook(func(_, point string) { points = append(points, point) }))
+	), trace.Noop(), WithRegistry(reg), WithInjectionHook(hooks.hook()))
 	var reached atomic.Bool
 	h := i.IngressMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { reached.Store(true) }))
 
@@ -222,6 +303,16 @@ func TestIngressMiddleware_TransientAfterInlineError(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/x", nil))
 	if rec.Code != 503 || reached.Load() {
 		t.Fatalf("code=%d reached=%v, want the injected 503 without the handler", rec.Code, reached.Load())
+	}
+	// "ingress" is reported on the request goroutine; "transient" follows from
+	// the start goroutine.
+	var points []string
+	for range 2 {
+		p, ok := hooks.next(time.Second)
+		if !ok {
+			break
+		}
+		points = append(points, p)
 	}
 	if len(points) != 2 || points[0] != "ingress" || points[1] != "transient" {
 		t.Fatalf("points = %v, want [ingress transient]", points)
