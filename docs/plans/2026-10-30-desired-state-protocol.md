@@ -62,7 +62,9 @@ Body:
   "replay_set": { "id": "sha256:...", "state": "committed" } }
 ```
 `204`. Sent by the instance after every apply (200 path) and whenever `replay_set.state` changes
-(`fetching|committed|failed`). `unsupported` and `errors` replace the previous report (empty list clears).
+(`fetching|committed|failed`). The report is a **full snapshot** of what the instance holds: `unsupported`
+and `errors` replace the previous report (empty list clears), and `replay_set` names the set the instance
+currently holds, so an absent `replay_set` means "none" and clears the stored id and state.
 manteion stores them on `sdk_instances` (`observed_unsupported JSONB`, `observed_errors JSONB`,
 `replay_set_id TEXT`, `replay_set_state TEXT`, `observed_at`).
 
