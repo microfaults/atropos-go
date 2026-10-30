@@ -43,10 +43,13 @@
   "rules": [ /* CompiledRule, never null */ ],
   "active_faults": [ /* FaultRequest, never null */ ],
   "freeze_cfg": { "mu": 0.0, "sigma": 0.0, "seed": 7, "context": { "experiment_id": "...", "phase_id": "..." } },
-  "replay_set": { "id": "sha256:...", "key_strategy": "canonical_v2", "count": 1234, "sha256": "...",
+  "replay_set": { "id": "sha256:...", "experiment_id": "...", "phase_id": "...",
+                  "key_strategy": "canonical_v2", "count": 1234, "sha256": "...",
                   "size_bytes": 5242880, "url": "/api/v1/cache/artifacts/sha256:..." }
 }
 ```
+`replay_set.experiment_id` and `phase_id` name the pair the set is installed under (the cache-box serves a
+replay set only to the rule whose context matches that pair; a set without a pair is unusable).
 `freeze_cfg` and `replay_set` are `omitempty`; absent means "none desired": the instance clears its delay
 source / replay set if it holds one from an earlier state.
 
