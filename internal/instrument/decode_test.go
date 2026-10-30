@@ -382,31 +382,35 @@ func TestDecodeCompiledRules_UnknownNetworkType(t *testing.T) {
 	}
 }
 
-func TestDecodeCompiledRules_CompositionRejected(t *testing.T) {
-	compiled := []wire.CompiledRule{{
-		Name: "comp-rule",
-		Mode: "inline",
-		Composition: &wire.CompiledComposition{
+// TestDecodeCompiledRules_CompositionSkippedAndCounted: a composition rule
+// is skipped per rule -- counted, logged -- and never fails the set it
+// arrives in (design review §5; protocol §3). Categories keep their
+// semantics: see TestDecode_UnsupportedCategoryIsSkippedAndCounted and
+// TestDecodeCompiledRules_UnknownCategory.
+func TestDecodeCompiledRules_CompositionSkippedAndCounted(t *testing.T) {
+	before := unsupportedCount(t, "composition")
+	compiled := []wire.CompiledRule{
+		{Name: "lat", Mode: "inline", Priority: 10, Fault: &wire.CompiledFault{
+			Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"10ms"}`)}},
+		{Name: "comp-rule", Mode: "inline", Priority: 5, Composition: &wire.CompiledComposition{
 			Name: "x", ExecutionMode: "parallel",
 			Members: []wire.CompiledCompositionMember{
 				{Fault: &wire.CompiledFault{Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"10ms"}`)}},
 				{Fault: &wire.CompiledFault{Category: "inline", FaultType: "error", Params: json.RawMessage(`{"status_code":500}`)}},
-			},
-		},
-	}}
+			}}},
+		{Name: "err", Mode: "inline", Priority: 1, Fault: &wire.CompiledFault{
+			Category: "inline", FaultType: "error", Params: json.RawMessage(`{"status_code":500}`)}},
+	}
 
-	_, err := decodeCompiledRules(compiled)
-	if err == nil {
-		t.Fatal("expected error for composition rule")
+	rules, err := decodeCompiledRules(compiled)
+	if err != nil {
+		t.Fatalf("a composition must not fail the set: %v", err)
 	}
-	if !strings.Contains(err.Error(), "comp-rule") {
-		t.Errorf("error should name the rule, got: %v", err)
+	if len(rules) != 2 || rules[0].Name != "lat" || rules[1].Name != "err" {
+		t.Fatalf("rules = %+v, want [lat err] with the composition skipped", rules)
 	}
-	if !strings.Contains(err.Error(), "composition") {
-		t.Errorf("error should mention composition, got: %v", err)
-	}
-	if !strings.Contains(err.Error(), "v6") {
-		t.Errorf("error should mention v6 deferral, got: %v", err)
+	if got := unsupportedCount(t, "composition") - before; got != 1 {
+		t.Fatalf("atropos_rules_unsupported_total{composition} += %v, want 1", got)
 	}
 }
 

@@ -9,6 +9,12 @@ const (
 	CapNetwork  = "network"
 	CapResource = "resource"
 	CapCacheBox = "cachebox"
+
+	// CapComposition is the atropos_rules_unsupported_total{category} label
+	// for composition rules. No host advertises it yet: the decoder skips
+	// compositions per rule under this label until manteion expands them
+	// into phases (design review §5).
+	CapComposition = "composition"
 )
 
 // Host names.

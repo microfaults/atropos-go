@@ -104,7 +104,7 @@ func decodeCompiledRules(compiled []wire.CompiledRule, opts ...decodeOption) ([]
 				// Skip this rule only: one rule this host cannot execute must
 				// not wedge the whole desired state (D7: counted + logged).
 				metrics.RulesUnsupportedTotal.WithLabelValues(unsup.Category).Inc()
-				slog.Default().Warn("rule skipped: fault category not supported by this host",
+				slog.Default().Warn("rule skipped: not executable by this host",
 					"rule", cr.Name, "category", unsup.Category, "fault_type", unsup.FaultType)
 				continue
 			}
@@ -130,21 +130,19 @@ func decodeCompiledRule(cr wire.CompiledRule, opts ...decodeOption) (evaluator.S
 	sr.Decision.Name = cr.Name
 	sr.Decision.StartPolicy = parseStartPolicy(cr.StartPolicy)
 
+	if cr.Composition != nil {
+		// Carried on the wire, not executable here yet (v6: parallel /
+		// sequential dispatch with direction inheritance). Skipped per rule
+		// like an unsupported category, never failing the set.
+		return evaluator.StaticRule{}, &UnsupportedFaultError{Category: CapComposition, FaultType: cr.Composition.ExecutionMode}
+	}
+
 	if cr.Fault != nil {
 		f, err := decodeFault(cr.Name, cr.Fault, cfg)
 		if err != nil {
 			return evaluator.StaticRule{}, err
 		}
 		sr.Decision.Fault = f
-	}
-
-	if cr.Composition != nil {
-		// v6 work: SDK-side composition execution (parallel/sequential
-		// fault dispatch with direction inheritance). Today manteion can
-		// compose and validate, but the SDK can't run them.
-		return evaluator.StaticRule{}, fmt.Errorf(
-			"composition rules are not yet supported by the SDK evaluator (v6)",
-		)
 	}
 
 	if cr.CacheBox != nil {
