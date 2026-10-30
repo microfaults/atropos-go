@@ -53,22 +53,26 @@ func armDecision(arm armFunc, point evaluator.InjectionPoint, d *evaluator.Decis
 }
 
 // rulesAdminHandler serves runtime rule management on the host evaluator
-// (mounted at /admin/rules).
+// (mounted at /admin/rules). It is the push side of the single rule-apply
+// path: POST goes through applyRules exactly as a polled set does, so
+// decode, atomic replace, stop-by-name, eager arming and drain observation
+// happen once per delivery. The push body carries no version, so the
+// poll's ruleVersion (manteion_client.go, fetchRules) is left untouched.
 //
 // Supported methods:
 //   - GET:  200 + JSON-encoded current rule list (empty array if nil)
-//   - POST: decode body as []wire.CompiledRule (wire format), convert via
-//     decodeCompiledRules, atomically replace via SetRules, 204
+//   - POST: body is []wire.CompiledRule; null clears the set (teardown);
+//     204 on success, 400 on bad JSON or a rule set that does not apply
 //   - Other: 405
 //
-// opts are forwarded to decodeCompiledRules (e.g. withNetworkResolver).
-func rulesAdminHandler(eval *evaluator.StaticEvaluator, reg *interceptor.FaultRegistry, arm armFunc, opts ...decodeOption) http.Handler {
+// targets.Evaluator is required.
+func rulesAdminHandler(targets applyTargets) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
 		switch r.Method {
 		case http.MethodGet:
-			rules := eval.Rules()
+			rules := targets.Evaluator.Rules()
 			if rules == nil {
 				rules = []evaluator.StaticRule{}
 			}
@@ -81,16 +85,12 @@ func rulesAdminHandler(eval *evaluator.StaticEvaluator, reg *interceptor.FaultRe
 				return
 			}
 			if compiled == nil {
-				applyRuleSet(reg, eval, nil, arm)
-				w.WriteHeader(http.StatusNoContent)
+				compiled = []wire.CompiledRule{} // null = authoritative clear
+			}
+			if err := applyRules(compiled, targets); err != nil {
+				jsonError(w, fmt.Sprintf("apply rules: %s", err), http.StatusBadRequest)
 				return
 			}
-			rules, err := decodeCompiledRules(compiled, opts...)
-			if err != nil {
-				jsonError(w, fmt.Sprintf("decode rules: %s", err), http.StatusBadRequest)
-				return
-			}
-			applyRuleSet(reg, eval, rules, arm)
 			w.WriteHeader(http.StatusNoContent)
 
 		default:

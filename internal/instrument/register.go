@@ -119,23 +119,9 @@ func (t applyTargets) decodeOpts() []decodeOption {
 // can filter a single bootstrap phase without ambiguity.
 func apply(resp wire.RegisterResponse, targets applyTargets) error {
 	if resp.Rules != nil {
-		if targets.Evaluator == nil && len(resp.Rules) > 0 {
-			return fmt.Errorf("apply rules: no Evaluator target for %d rules", len(resp.Rules))
+		if err := applyRules(resp.Rules, targets); err != nil {
+			return fmt.Errorf("apply rules: %w", err)
 		}
-		if targets.Evaluator != nil {
-			rules, err := decodeCompiledRules(resp.Rules, targets.decodeOpts()...)
-			if err != nil {
-				return fmt.Errorf("apply rules: %w", err)
-			}
-			applyRuleSet(targets.Registry, targets.Evaluator, rules, targets.Arm)
-		}
-
-		// Observe every authoritative rule set, INCLUDING empty: the
-		// recording phase whose rule drops out of the set most often leaves
-		// it empty (a baseline service has no other rules), and that
-		// transition is exactly what triggers the flush + drain report. A
-		// nil set is skipped -- it carries no information to diff against.
-		targets.CacheDrain.Observe(resp.Rules)
 	}
 
 	if len(resp.ActiveFaults) > 0 {
@@ -189,6 +175,31 @@ func apply(resp wire.RegisterResponse, targets applyTargets) error {
 		}
 	}
 
+	return nil
+}
+
+// applyRules installs an authoritative (non-nil, possibly empty) compiled
+// rule set: decode with the targets' options, atomic replace with
+// stop-by-name and eager arming (applyRuleSet), then drain observation.
+// It is the only rule-application path -- poll and register call it
+// through apply, the push endpoint directly -- so those side effects
+// happen exactly once per delivery whichever way the set arrives
+// (design review §5; desired-state protocol §3).
+func applyRules(rules []wire.CompiledRule, targets applyTargets) error {
+	if targets.Evaluator == nil && len(rules) > 0 {
+		return fmt.Errorf("no Evaluator target for %d rules", len(rules))
+	}
+	if targets.Evaluator != nil {
+		decoded, err := decodeCompiledRules(rules, targets.decodeOpts()...)
+		if err != nil {
+			return err
+		}
+		applyRuleSet(targets.Registry, targets.Evaluator, decoded, targets.Arm)
+	}
+	// Observe every authoritative rule set, INCLUDING empty: the recording
+	// phase whose rule drops out most often leaves the set empty, and that
+	// transition is exactly what triggers the flush + drain report.
+	targets.CacheDrain.Observe(rules)
 	return nil
 }
 

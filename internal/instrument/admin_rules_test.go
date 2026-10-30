@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 
+	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
@@ -14,7 +17,7 @@ import (
 func TestRulesAdminHandler(t *testing.T) {
 	t.Run("GET on empty evaluator returns 200 with empty array", func(t *testing.T) {
 		eval := evaluator.NewStaticEvaluator()
-		handler := rulesAdminHandler(eval, nil, nil)
+		handler := rulesAdminHandler(applyTargets{Evaluator: eval})
 
 		req := httptest.NewRequest(http.MethodGet, "/admin/rules", nil)
 		rec := httptest.NewRecorder()
@@ -35,7 +38,7 @@ func TestRulesAdminHandler(t *testing.T) {
 
 	t.Run("POST with valid compiled rules replaces evaluator rules", func(t *testing.T) {
 		eval := evaluator.NewStaticEvaluator()
-		handler := rulesAdminHandler(eval, nil, nil)
+		handler := rulesAdminHandler(applyTargets{Evaluator: eval})
 
 		compiled := wire.CompiledRule{
 			Name:           "freeze-productcatalog",
@@ -73,7 +76,7 @@ func TestRulesAdminHandler(t *testing.T) {
 
 	t.Run("POST with malformed JSON returns 400", func(t *testing.T) {
 		eval := evaluator.NewStaticEvaluator()
-		handler := rulesAdminHandler(eval, nil, nil)
+		handler := rulesAdminHandler(applyTargets{Evaluator: eval})
 
 		req := httptest.NewRequest(http.MethodPost, "/admin/rules", bytes.NewReader([]byte(`"not json"`)))
 		rec := httptest.NewRecorder()
@@ -84,9 +87,34 @@ func TestRulesAdminHandler(t *testing.T) {
 		}
 	})
 
+	t.Run("POST with a set that does not apply returns 400 and keeps the current rules", func(t *testing.T) {
+		eval := evaluator.NewStaticEvaluator(wire.StaticRule{Name: "keep", Point: evaluator.Ingress})
+		handler := rulesAdminHandler(applyTargets{Evaluator: eval})
+
+		// An unknown category is a malformed set, not an unsupported rule:
+		// it fails the whole delivery and replaces nothing.
+		body, err := json.Marshal([]wire.CompiledRule{{
+			Name: "bad", Mode: "inline",
+			Fault: &wire.CompiledFault{Category: "quantum", FaultType: "entangle", Params: json.RawMessage(`{}`)},
+		}})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/rules", bytes.NewReader(body)))
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+		}
+		if rules := eval.Rules(); len(rules) != 1 || rules[0].Name != "keep" {
+			t.Fatalf("a rejected set must leave the current rules untouched, got %+v", rules)
+		}
+	})
+
 	t.Run("DELETE returns 405", func(t *testing.T) {
 		eval := evaluator.NewStaticEvaluator()
-		handler := rulesAdminHandler(eval, nil, nil)
+		handler := rulesAdminHandler(applyTargets{Evaluator: eval})
 
 		req := httptest.NewRequest(http.MethodDelete, "/admin/rules", nil)
 		rec := httptest.NewRecorder()
@@ -96,4 +124,90 @@ func TestRulesAdminHandler(t *testing.T) {
 			t.Fatalf("expected 405, got %d: %s", rec.Code, rec.Body.String())
 		}
 	})
+}
+
+// TestRulesAdminHandler_PostObservesDrainTracker pins the single-apply-path
+// contract (design review §5): a rule set pushed to /admin/rules drives the
+// drain tracker exactly as a polled set does. Teardown pushes `null`
+// (clear everything), which is the common drain trigger.
+func TestRulesAdminHandler_PostObservesDrainTracker(t *testing.T) {
+	var drains atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/cache/ingest":
+			w.WriteHeader(http.StatusCreated)
+		case "/api/v1/sdk/cachebox/drain":
+			drains.Add(1)
+			_ = json.NewEncoder(w).Encode(wire.DrainReportResponse{Accepted: true})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	pusher := newCachePushClient(cachePushConfig{BaseURL: server.URL, Service: "cart", Instance: "pod-1"})
+	defer pusher.Stop()
+	cb := cachebox.New(cachebox.Config{Push: pusher.PushFunc()})
+	defer cb.Stop()
+	pusher.BindFidelity(cb.Fidelity())
+
+	eval := evaluator.NewStaticEvaluator()
+	handler := rulesAdminHandler(applyTargets{Evaluator: eval, CacheDrain: newCacheDrainTracker(cb, pusher, nil)})
+	post := func(body string) int {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/rules", strings.NewReader(body)))
+		return rec.Code
+	}
+	recording, _ := json.Marshal([]wire.CompiledRule{recordingRule("r1", "exp-1", "phase-1")})
+
+	if code := post(string(recording)); code != http.StatusNoContent {
+		t.Fatalf("push recording rule: %d", code)
+	}
+	if got := drains.Load(); got != 0 {
+		t.Fatalf("no phase ended yet, got %d drain reports", got)
+	}
+	// Teardown: manteion pushes null. The set is cleared AND the phase's
+	// recording ends, exactly as the empty authoritative set does on poll.
+	if code := post("null"); code != http.StatusNoContent {
+		t.Fatalf("push null: %d", code)
+	}
+	if got := len(eval.Rules()); got != 0 {
+		t.Fatalf("null push must clear the rule set, still %d rules", got)
+	}
+	if got := drains.Load(); got != 1 {
+		t.Fatalf("null push must fire the drain report once, got %d", got)
+	}
+	// An explicit empty array is the same authoritative clear.
+	if code := post(string(recording)); code != http.StatusNoContent {
+		t.Fatalf("re-push recording rule: %d", code)
+	}
+	if code := post("[]"); code != http.StatusNoContent {
+		t.Fatalf("push []: %d", code)
+	}
+	if got := drains.Load(); got != 2 {
+		t.Fatalf("[] push must fire the drain report, got %d in total", got)
+	}
+}
+
+// TestRulesAdminHandler_PostArmsEagerly: eager arming rides the same apply
+// path, so an eagerly-arming host (the sidecar) gets its background faults
+// started by a push exactly as by a poll -- once.
+func TestRulesAdminHandler_PostArmsEagerly(t *testing.T) {
+	var armed []string
+	arm := func(point evaluator.InjectionPoint, d *evaluator.Decision) {
+		armed = append(armed, point.String()+":"+d.Name)
+	}
+	eval := evaluator.NewStaticEvaluator()
+	handler := rulesAdminHandler(applyTargets{Evaluator: eval, Arm: arm})
+	body, _ := json.Marshal([]wire.CompiledRule{{
+		Name: "burn", InjectionPoint: "ingress", Mode: "background",
+		Fault: &wire.CompiledFault{Category: "resource", FaultType: "cpu", DurationMs: 1000, Params: json.RawMessage(`{"target_load":0.1}`)},
+	}})
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/rules", bytes.NewReader(body)))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("push: %d %s", rec.Code, rec.Body.String())
+	}
+	if len(armed) != 1 || armed[0] != "ingress:burn" {
+		t.Fatalf("armed = %v, want exactly [ingress:burn]", armed)
+	}
 }
