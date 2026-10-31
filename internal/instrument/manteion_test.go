@@ -489,10 +489,12 @@ type pollSeen struct{ Version, IfNoneMatch, Wait string }
 
 // fakeManteion answers the SDK endpoints the way the branch manteion does --
 // init, register, deregister, the rules poll and the status report -- and
-// records what every poll asked for and every status report it received.
+// records every register body, what every poll asked for and every status
+// report it received.
 type fakeManteion struct {
 	srv        *httptest.Server
 	mu         sync.Mutex
+	registers  []wire.RegisterRequest
 	polls      []pollSeen
 	statuses   []wire.StatusReport
 	rawStatus  [][]byte
@@ -515,6 +517,11 @@ func newFakeManteion(t *testing.T) *fakeManteion {
 		case r.URL.Path == "/api/v1/sdk/init":
 			w.WriteHeader(http.StatusOK)
 		case r.URL.Path == "/api/v1/sdk/register" && r.Method == http.MethodPost:
+			var reg wire.RegisterRequest
+			_ = json.NewDecoder(r.Body).Decode(&reg)
+			f.mu.Lock()
+			f.registers = append(f.registers, reg)
+			f.mu.Unlock()
 			w.WriteHeader(http.StatusCreated)
 			io.WriteString(w, f.register)
 		case strings.HasPrefix(r.URL.Path, "/api/v1/sdk/register/") && r.Method == http.MethodDelete:
@@ -578,6 +585,30 @@ func (f *fakeManteion) waitStatuses(t *testing.T, n int) []wire.StatusReport {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// waitPolls waits up to 5 s for at least n rules polls and returns every poll
+// seen.
+func (f *fakeManteion) waitPolls(t *testing.T, n int) []pollSeen {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		polls, _ := f.snapshot()
+		if len(polls) >= n {
+			return polls
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("got %d polls, want %d: %+v", len(polls), n, polls)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// registered copies the register bodies seen so far.
+func (f *fakeManteion) registered() []wire.RegisterRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]wire.RegisterRequest(nil), f.registers...)
 }
 
 func respond304(gen, etag string) func(http.ResponseWriter, *http.Request) {
@@ -929,5 +960,609 @@ func TestClose_CancelsThenClosesThePullerThenWaits(t *testing.T) {
 	}
 	if !<-cancelledFirst {
 		t.Fatal("Close must cancel the poll context before closing the puller")
+	}
+}
+
+// ---------- long-poll loop ----------
+
+func TestPollLoop_LongPollRepollsImmediately(t *testing.T) {
+	pollFloor = 0
+	t.Cleanup(func() { pollFloor = time.Second })
+	f := newFakeManteion(t)
+	f.setRules(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond) // the server "holds" the request
+		respond304("3", "3-c")(w, r)
+	})
+	c := f.client(applyTargets{Evaluator: newTestEvaluator()})
+	c.cfg.pollWait = 2 * time.Second
+	c.pollClient = &http.Client{Timeout: 17 * time.Second}
+	ctx, cancel := context.WithCancel(t.Context())
+	c.pollCtx = ctx
+	trigger := make(chan struct{}, 1)
+	c.wg.Go(func() { c.pollLoopWithTrigger(ctx, trigger) })
+	time.Sleep(650 * time.Millisecond)
+	cancel()
+	c.wg.Wait()
+	polls, _ := f.snapshot()
+	if len(polls) < 4 {
+		t.Fatalf("got %d polls in 650ms with a 100ms hold and pollInterval=10s; the loop must re-poll immediately", len(polls))
+	}
+	if polls[0].Wait != "2" {
+		t.Fatalf("wait query = %q, want 2 (seconds)", polls[0].Wait)
+	}
+	if c.ruleVersion.Load() != 3 {
+		t.Fatalf("generation = %d, want 3 adopted from the 304 headers", c.ruleVersion.Load())
+	}
+}
+
+func TestPollLoop_SSETriggerPollsImmediately(t *testing.T) {
+	f := newFakeManteion(t)
+	f.setRules(respond304("1", "1-a"))
+	c := f.client(applyTargets{Evaluator: newTestEvaluator()}) // pollWait 0: ticker semantics, 10s interval
+	ctx, cancel := context.WithCancel(t.Context())
+	c.pollCtx = ctx
+	trigger := make(chan struct{}, 1)
+	c.wg.Go(func() { c.pollLoopWithTrigger(ctx, trigger) })
+	time.Sleep(50 * time.Millisecond)
+	trigger <- struct{}{}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if p, _ := f.snapshot(); len(p) >= 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	c.wg.Wait()
+	if p, _ := f.snapshot(); len(p) < 1 {
+		t.Fatal("SSE trigger must cause an immediate poll")
+	}
+}
+
+func TestPollLoop_ResendsPendingStatus(t *testing.T) {
+	f := newFakeManteion(t)
+	f.statusCode = http.StatusInternalServerError
+	var n atomic.Int32
+	f.setRules(func(w http.ResponseWriter, r *http.Request) {
+		if n.Add(1) == 1 {
+			respond200(wire.RuleSync{Version: 1, Etag: "1-a", Rules: []wire.CompiledRule{}, ActiveFaults: []wire.FaultRequest{}})(w, r)
+			return
+		}
+		respond304("1", "1-a")(w, r)
+	})
+	c := f.client(applyTargets{Evaluator: newTestEvaluator()})
+	c.cfg.pollInterval = 50 * time.Millisecond
+	ctx, cancel := context.WithCancel(t.Context())
+	c.pollCtx = ctx
+	trigger := make(chan struct{}, 1)
+	trigger <- struct{}{}
+	c.wg.Go(func() { c.pollLoopWithTrigger(ctx, trigger) })
+	f.waitStatuses(t, 1) // first attempt, rejected
+	f.mu.Lock()
+	f.statusCode = 0
+	f.mu.Unlock()
+	statuses := f.waitStatuses(t, 2) // resent before a later poll
+	cancel()
+	c.wg.Wait()
+	if statuses[1].AppliedGeneration != 1 {
+		t.Fatalf("resent status = %+v", statuses[1])
+	}
+}
+
+// startLoop runs c's poll loop on a context of its own until stop (also
+// registered as a cleanup) cancels it; stop waits for the loop and for any
+// register it started.
+func startLoop(t *testing.T, c *ManteionClient, trigger chan struct{}) (stop func()) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	c.pollCtx = ctx
+	c.wg.Go(func() { c.pollLoopWithTrigger(ctx, trigger) })
+	var once sync.Once
+	stop = func() { once.Do(func() { cancel(); c.wg.Wait() }) }
+	t.Cleanup(stop)
+	return stop
+}
+
+// TestPollLoop_TickerFirstPollWaitsAnInterval: without a hold the loop keeps
+// the ticker cadence -- connectManteion's startup fetch has just run, so the
+// loop's first poll comes one pollInterval later, not at once.
+func TestPollLoop_TickerFirstPollWaitsAnInterval(t *testing.T) {
+	f := newFakeManteion(t)
+	f.setRules(respond304("1", "1-a"))
+	c := f.client(applyTargets{Evaluator: newTestEvaluator()}) // pollWait 0, pollInterval 10s
+	stop := startLoop(t, c, make(chan struct{}, 1))
+	time.Sleep(300 * time.Millisecond)
+	stop()
+	if polls, _ := f.snapshot(); len(polls) != 0 {
+		t.Fatalf("got %d polls in the first 300ms with pollWait=0 and pollInterval=10s; the first poll waits an interval", len(polls))
+	}
+}
+
+// TestPollLoop_FloorPacesAServerThatDoesNotHold: a server that answers a
+// wait poll at once (one that ignores wait) is re-polled at pollFloor's pace,
+// not in a hot loop and not at pollInterval's.
+func TestPollLoop_FloorPacesAServerThatDoesNotHold(t *testing.T) {
+	pollFloor = 200 * time.Millisecond
+	t.Cleanup(func() { pollFloor = time.Second })
+	f := newFakeManteion(t)
+	f.setRules(respond304("1", "1-a")) // answers a wait poll at once
+	c := f.client(applyTargets{Evaluator: newTestEvaluator()})
+	c.cfg.pollWait = 2 * time.Second // pollInterval stays 10s
+	c.pollClient = &http.Client{Timeout: 17 * time.Second}
+	stop := startLoop(t, c, make(chan struct{}, 1))
+	time.Sleep(700 * time.Millisecond)
+	stop()
+	if polls, _ := f.snapshot(); len(polls) < 2 || len(polls) > 5 {
+		t.Fatalf("got %d polls in 700ms with a 200ms floor, want 2 to 5 (one every 200ms)", len(polls))
+	}
+}
+
+// holdingRules answers the rules poll the way manteion's long-poll does: a
+// poll that asks for a wait and whose If-None-Match names the current
+// document is held until the document changes (bump) or the wait elapses;
+// then a matching If-None-Match gets a 304, anything else the document.
+type holdingRules struct {
+	mu      sync.Mutex
+	doc     wire.RuleSync
+	changed chan struct{} // closed by the next bump
+}
+
+func newHoldingRules(doc wire.RuleSync) *holdingRules {
+	return &holdingRules{doc: doc, changed: make(chan struct{})}
+}
+
+func (h *holdingRules) current() (wire.RuleSync, chan struct{}) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.doc, h.changed
+}
+
+func (h *holdingRules) bump(doc wire.RuleSync) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.doc = doc
+	close(h.changed)
+	h.changed = make(chan struct{})
+}
+
+func (h *holdingRules) serve(w http.ResponseWriter, r *http.Request) {
+	doc, changed := h.current()
+	inm := r.Header.Get("If-None-Match")
+	if wait, _ := strconv.Atoi(r.URL.Query().Get("wait")); wait > 0 && inm == `"`+doc.Etag+`"` {
+		select {
+		case <-changed:
+		case <-time.After(time.Duration(wait) * time.Second):
+		case <-r.Context().Done():
+			return
+		}
+		doc, _ = h.current()
+	}
+	if inm == `"`+doc.Etag+`"` {
+		respond304(strconv.FormatUint(doc.Version, 10), doc.Etag)(w, r)
+		return
+	}
+	respond200(doc)(w, r)
+}
+
+// TestPollLoop_HeldPollAnswersOnABump: against a manteion that holds a poll
+// until the desired state changes, the loop sits in one held poll, applies
+// the bump the moment the hold ends and goes straight back into a poll held
+// on the new document. Cancelling ends a held poll at once.
+func TestPollLoop_HeldPollAnswersOnABump(t *testing.T) {
+	pollFloor = 0
+	t.Cleanup(func() { pollFloor = time.Second })
+	f := newFakeManteion(t)
+	h := newHoldingRules(wire.RuleSync{Version: 1, Etag: "1-a", Rules: []wire.CompiledRule{}, ActiveFaults: []wire.FaultRequest{}})
+	f.setRules(h.serve)
+	eval := newTestEvaluator()
+	c := f.client(applyTargets{Evaluator: eval}) // pollInterval 10s
+	c.cfg.pollWait = 5 * time.Second
+	c.pollClient = &http.Client{Timeout: 20 * time.Second}
+	if err := c.fetchRulesWait(t.Context(), 0); err != nil { // the startup fetch
+		t.Fatal(err)
+	}
+	stop := startLoop(t, c, make(chan struct{}, 1))
+
+	f.waitPolls(t, 2)
+	time.Sleep(200 * time.Millisecond)
+	polls, _ := f.snapshot()
+	want := []pollSeen{{Version: "0"}, {Version: "1", IfNoneMatch: `"1-a"`, Wait: "5"}}
+	if !reflect.DeepEqual(polls, want) {
+		t.Fatalf("polls = %+v, want the startup fetch, then one poll held on 1-a", polls)
+	}
+
+	h.bump(wire.RuleSync{Version: 2, Etag: "2-b", Rules: threeRules()[:1], ActiveFaults: []wire.FaultRequest{}})
+	polls = f.waitPolls(t, 3)
+	if got := polls[2]; got != (pollSeen{Version: "2", IfNoneMatch: `"2-b"`, Wait: "5"}) {
+		t.Fatalf("poll after the bump = %+v, want one held on 2-b at once", got)
+	}
+	if len(eval.Rules()) != 1 || c.ruleVersion.Load() != 2 {
+		t.Fatalf("rules=%d gen=%d, want the bumped document applied", len(eval.Rules()), c.ruleVersion.Load())
+	}
+
+	start := time.Now()
+	stop()
+	if el := time.Since(start); el > time.Second {
+		t.Fatalf("stopping took %v; cancelling must end a held poll at once", el)
+	}
+	if c.Status() != manteionConnected {
+		t.Fatalf("status = %v after stopping; a poll cut short by shutdown is not a failure", c.Status())
+	}
+}
+
+// TestPollLoop_FailuresBackOffAndReRegisterOnce: a failed poll is retried
+// after pollInterval·2^min(failures,6) -- with a long-poll hold too, never at
+// the floor's pace -- and the sixth consecutive failure re-registers, once.
+func TestPollLoop_FailuresBackOffAndReRegisterOnce(t *testing.T) {
+	pollFloor = 0
+	t.Cleanup(func() { pollFloor = time.Second })
+	f := newFakeManteion(t)
+	var mu sync.Mutex
+	var at []time.Time
+	f.setRules(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		at = append(at, time.Now())
+		mu.Unlock()
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	c := f.client(applyTargets{Evaluator: newTestEvaluator()})
+	c.cfg.pollInterval = 2 * time.Millisecond
+	c.cfg.pollWait = 2 * time.Second
+	c.pollClient = &http.Client{Timeout: 17 * time.Second}
+	stop := startLoop(t, c, make(chan struct{}, 1))
+	f.waitPolls(t, 9)
+	for deadline := time.Now().Add(5 * time.Second); len(f.registered()) == 0 && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
+	stop()
+
+	mu.Lock()
+	defer mu.Unlock()
+	for k := 1; k < 9; k++ {
+		if gap, want := at[k].Sub(at[k-1]), 2*time.Millisecond<<min(k, 6); gap < want {
+			t.Errorf("gap before poll %d = %v, want at least %v after %d failures", k+1, gap, want, k)
+		}
+	}
+	if n := len(f.registered()); n != 1 {
+		t.Fatalf("registers = %d, want exactly one, at the sixth consecutive failure", n)
+	}
+	if c.Status() != manteionDegraded {
+		t.Fatalf("status = %v, want degraded while polls fail", c.Status())
+	}
+}
+
+// TestPollLoop_RecoveryForgetsTheHeldDocument: when polls succeed again after
+// failures, the loop forgets the document it holds -- generation, ETag and
+// the atropos_sync_generation gauge together -- before it re-registers, so
+// the next poll is unconditional and its 200 is applied in full.
+func TestPollLoop_RecoveryForgetsTheHeldDocument(t *testing.T) {
+	doc := wire.RuleSync{Version: 5, Etag: "5-e", Rules: []wire.CompiledRule{}, ActiveFaults: []wire.FaultRequest{}}
+	f := newFakeManteion(t)
+	f.register = `{"status":"registered","version":0,"etag":"","rules":null,"active_faults":null}` // no document: the re-register keeps what the reset left
+	var n atomic.Int32
+	f.setRules(func(w http.ResponseWriter, r *http.Request) {
+		switch n.Add(1) {
+		case 2:
+			w.WriteHeader(http.StatusServiceUnavailable)
+		case 3:
+			respond304("5", "5-e")(w, r)
+		default:
+			respond200(doc)(w, r)
+		}
+	})
+	// pollInterval stays 10s: the test drives every poll with the trigger.
+	c := f.client(applyTargets{Evaluator: newTestEvaluator()})
+	if err := c.fetchRules(t.Context()); err != nil { // the instance holds generation 5
+		t.Fatal(err)
+	}
+	trigger := make(chan struct{}, 1)
+	startLoop(t, c, trigger)
+
+	trigger <- struct{}{}
+	f.waitPolls(t, 2) // 503
+	trigger <- struct{}{}
+	f.waitPolls(t, 3) // 304: the connection is restored
+	s := f.waitStatuses(t, 2)[1]
+	if s.AppliedGeneration != 0 || s.Etag != "" {
+		t.Fatalf("the re-register's report = %+v, want generation 0 and no ETag: the recovery forgets both before it re-registers", s)
+	}
+	if c.ruleVersion.Load() != 0 || c.currentEtag() != "" || syncGeneration(t) != 0 {
+		t.Fatalf("gen=%d etag=%q gauge=%v, want all three reset together", c.ruleVersion.Load(), c.currentEtag(), syncGeneration(t))
+	}
+
+	trigger <- struct{}{}
+	polls := f.waitPolls(t, 4)
+	if got := polls[3]; got != (pollSeen{Version: "0"}) {
+		t.Fatalf("poll after the recovery = %+v, want an unconditional poll at version 0", got)
+	}
+	f.waitStatuses(t, 3)
+	if c.ruleVersion.Load() != 5 || c.currentEtag() != "5-e" || syncGeneration(t) != 5 {
+		t.Fatalf("gen=%d etag=%q gauge=%v, want the full pull applied", c.ruleVersion.Load(), c.currentEtag(), syncGeneration(t))
+	}
+}
+
+// TestFetchRules_Late304AdoptsNothing: a 304 vouches for the document the
+// poll was conditional on. When a register applied a newer document while
+// the poll was out, the late 304 adopts nothing: the newer generation and
+// ETag stay.
+func TestFetchRules_Late304AdoptsNothing(t *testing.T) {
+	f := newFakeManteion(t)
+	f.register = `{"status":"registered","version":2,"etag":"2-b","rules":[],"active_faults":[]}`
+	f.setRules(respond200(wire.RuleSync{Version: 1, Etag: "1-a", Rules: []wire.CompiledRule{}, ActiveFaults: []wire.FaultRequest{}}))
+	c := f.client(applyTargets{Evaluator: newTestEvaluator()})
+	if err := c.fetchRules(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	f.setRules(func(w http.ResponseWriter, r *http.Request) {
+		if err := c.register(r.Context()); err != nil { // lands while the poll is out
+			t.Error(err)
+		}
+		respond304("1", "1-a")(w, r)
+	})
+	if err := c.fetchRules(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if c.ruleVersion.Load() != 2 || c.currentEtag() != "2-b" || syncGeneration(t) != 2 {
+		t.Fatalf("gen=%d etag=%q gauge=%v, want the register's 2 / 2-b kept", c.ruleVersion.Load(), c.currentEtag(), syncGeneration(t))
+	}
+}
+
+// backdateSlot sets one slot's last confirmation d in the past.
+func backdateSlot(demo *demoEvaluator, id string, d time.Duration) {
+	demo.mu.Lock()
+	defer demo.mu.Unlock()
+	demo.slots[id].lastConfirmedAt = time.Now().Add(-d)
+}
+
+// TestReapSlots_DroppingAConfirmedSlotForcesAFullPull: once the watchdog
+// drops a slot the last apply confirmed, the instance no longer holds the
+// document its ETag names. The reap forgets the slot and the ETag -- even
+// while a poll is out, whose late 304 then adopts nothing -- so the next
+// poll is unconditional and its 200 restores the slot. Dropping a slot the
+// document never named (an /admin/fault slot) keeps the ETag.
+func TestReapSlots_DroppingAConfirmedSlotForcesAFullPull(t *testing.T) {
+	doc := wire.RuleSync{Version: 1, Etag: "1-a", Rules: []wire.CompiledRule{},
+		ActiveFaults: []wire.FaultRequest{{ID: "slot-a", FaultType: "latency", Params: json.RawMessage(`{"delay":"1ms"}`)}}}
+	f := newFakeManteion(t)
+	f.setRules(respond200(doc))
+	demo := &demoEvaluator{}
+	c := f.client(applyTargets{Evaluator: newTestEvaluator(), DemoEval: demo})
+	if err := c.fetchRules(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	demo.Set(&evaluator.Decision{Name: "admin"}, &wire.FaultRequest{ID: "admin"})
+	backdateSlot(demo, "admin", time.Hour)
+	c.reapSlots(30 * time.Second)
+	if ids := demo.ActiveIDs(); !reflect.DeepEqual(ids, []string{"slot-a"}) || c.currentEtag() != "1-a" {
+		t.Fatalf("slots=%v etag=%q, want the admin slot dropped and the ETag kept", ids, c.currentEtag())
+	}
+
+	f.setRules(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("If-None-Match") == "" {
+			respond200(doc)(w, r)
+			return
+		}
+		backdateSlot(demo, "slot-a", time.Hour)
+		c.reapSlots(30 * time.Second) // the watchdog fires while the poll is out
+		respond304("1", "1-a")(w, r)
+	})
+	if err := c.fetchRules(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if ids := demo.ActiveIDs(); len(ids) != 0 || c.currentEtag() != "" {
+		t.Fatalf("slots=%v etag=%q, want slot-a dropped and the ETag forgotten, the late 304 adopting nothing", ids, c.currentEtag())
+	}
+
+	if err := c.fetchRules(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	polls, _ := f.snapshot()
+	if got := polls[len(polls)-1]; got != (pollSeen{Version: "1"}) {
+		t.Fatalf("poll after the reap = %+v, want an unconditional poll at version 1", got)
+	}
+	if ids := demo.ActiveIDs(); !reflect.DeepEqual(ids, []string{"slot-a"}) || c.currentEtag() != "1-a" {
+		t.Fatalf("slots=%v etag=%q, want slot-a restored by the 200", ids, c.currentEtag())
+	}
+}
+
+// TestReapSlots_WaitsForAnApplyInProgress: a watchdog pass and its
+// bookkeeping (the confirmed set, the ETag) wait for an apply in progress on
+// the client, so a slot that apply re-confirms is neither dropped from under
+// it nor its ETag forgotten.
+func TestReapSlots_WaitsForAnApplyInProgress(t *testing.T) {
+	f := newFakeManteion(t)
+	f.setRules(respond200(wire.RuleSync{Version: 1, Etag: "1-a", Rules: []wire.CompiledRule{},
+		ActiveFaults: []wire.FaultRequest{{ID: "slot-a", FaultType: "latency", Params: json.RawMessage(`{"delay":"1ms"}`)}}}))
+	demo := &demoEvaluator{}
+	c := f.client(applyTargets{Evaluator: newTestEvaluator(), DemoEval: demo})
+	if err := c.fetchRules(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	ageSlots(demo, time.Hour)
+
+	c.applyMu.Lock() // an apply in progress
+	reaped := make(chan struct{})
+	go func() {
+		defer close(reaped)
+		c.reapSlots(30 * time.Second)
+	}()
+	select {
+	case <-reaped:
+		t.Fatal("the reap ran while an apply held the client's applyMu")
+	case <-time.After(50 * time.Millisecond):
+	}
+	demo.Confirm("slot-a") // the apply re-confirms the slot
+	c.applyMu.Unlock()
+	<-reaped
+	if ids := demo.ActiveIDs(); !reflect.DeepEqual(ids, []string{"slot-a"}) || c.currentEtag() != "1-a" {
+		t.Fatalf("slots=%v etag=%q, want slot-a and its ETag kept: it was re-confirmed before the reap looked", ids, c.currentEtag())
+	}
+}
+
+// TestWatchdogGrace_CoversThreePollCadences: a slot is dropped after three
+// poll cadences unconfirmed, never sooner than 30 s; with a long-poll hold
+// the cadence is the hold, since a held poll answers about once per hold.
+func TestWatchdogGrace_CoversThreePollCadences(t *testing.T) {
+	for _, tc := range []struct{ interval, wait, want time.Duration }{
+		{10 * time.Second, 0, 30 * time.Second},
+		{50 * time.Millisecond, 0, 30 * time.Second},
+		{20 * time.Second, 0, time.Minute},
+		{10 * time.Second, 30 * time.Second, 90 * time.Second},
+		{time.Minute, 30 * time.Second, 3 * time.Minute},
+	} {
+		if got := watchdogGrace(tc.interval, tc.wait); got != tc.want {
+			t.Errorf("watchdogGrace(%v, %v) = %v, want %v", tc.interval, tc.wait, got, tc.want)
+		}
+	}
+}
+
+// TestConnectManteion_WatchdogGraceCoversThreeHolds: a desired slot is
+// re-confirmed about once per 30 s hold, so the watchdog the client starts
+// gives a slot three holds: one unconfirmed for 60 s survives a pass, one
+// unconfirmed for 100 s is dropped.
+func TestConnectManteion_WatchdogGraceCoversThreeHolds(t *testing.T) {
+	f := newFakeManteion(t)
+	f.register = `{"status":"registered","version":1,"etag":"1-a","rules":[],"active_faults":[]}`
+	f.setRules(respond304("1", "1-a"))
+	demo := &demoEvaluator{}
+	c, err := connectManteion(t.Context(), manteionConfig{
+		url: f.srv.URL, serviceName: "svc", instanceID: "pod-1",
+		initTimeout: 5 * time.Second, pollInterval: 10 * time.Second, pollWait: 30 * time.Second,
+		targets:    applyTargets{Evaluator: newTestEvaluator(), DemoEval: demo},
+		httpClient: &http.Client{Timeout: 5 * time.Second},
+		logger:     slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+
+	for id, age := range map[string]time.Duration{"slot-60s": 60 * time.Second, "slot-100s": 100 * time.Second} {
+		demo.Set(&evaluator.Decision{Name: id}, &wire.FaultRequest{ID: id})
+		backdateSlot(demo, id, age)
+	}
+	for deadline := time.Now().Add(5 * time.Second); slices.Contains(demo.ActiveIDs(), "slot-100s"); {
+		if time.Now().After(deadline) {
+			t.Fatal("the watchdog never dropped the slot unconfirmed for 100s")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !slices.Contains(demo.ActiveIDs(), "slot-60s") {
+		t.Fatal("the slot unconfirmed for 60s was dropped; the grace must cover three 30s holds")
+	}
+}
+
+// TestApplyDesired_HardErrorConfirmsNothing: a document the targets cannot
+// hold (a hard error) applies nothing and vouches for nothing: the slots the
+// last apply confirmed are not re-confirmed, so they age out under the
+// watchdog as if manteion had stopped answering.
+func TestApplyDesired_HardErrorConfirmsNothing(t *testing.T) {
+	slot := wire.FaultRequest{ID: "slot-a", FaultType: "latency", Params: json.RawMessage(`{"delay":"1ms"}`)}
+	f := newFakeManteion(t)
+	f.setRules(respond200(wire.RuleSync{Version: 1, Etag: "1-a", Rules: []wire.CompiledRule{}, ActiveFaults: []wire.FaultRequest{slot}}))
+	demo := &demoEvaluator{}
+	c := f.client(applyTargets{Evaluator: newTestEvaluator(), DemoEval: demo})
+	if err := c.fetchRules(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	ageSlots(demo, time.Hour)
+
+	// freeze_cfg with no CacheBox target: a hard error
+	f.setRules(respond200(wire.RuleSync{Version: 2, Etag: "2-b", Rules: []wire.CompiledRule{},
+		ActiveFaults: []wire.FaultRequest{slot}, FreezeCfg: &wire.DelayRequest{Mu: 1}}))
+	if err := c.fetchRules(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	reapStaleSlots(demo, nil, nil, 30*time.Second, nil)
+	if ids := demo.ActiveIDs(); len(ids) != 0 {
+		t.Fatalf("slots = %v; a hard error must not re-confirm the held slots", ids)
+	}
+}
+
+// TestRegister_AdvertisesThePollCadence: manteion counts an instance stale
+// after twice its advertised poll interval and dead after five times; a held
+// poll comes back about once per hold, so the instance advertises the longer
+// of its poll interval and its hold.
+func TestRegister_AdvertisesThePollCadence(t *testing.T) {
+	for _, tc := range []struct {
+		interval, wait time.Duration
+		want           int64
+	}{
+		{10 * time.Second, 0, 10000},
+		{10 * time.Second, 30 * time.Second, 30000},
+		{time.Minute, 30 * time.Second, 60000},
+	} {
+		f := newFakeManteion(t)
+		c := f.client(applyTargets{Evaluator: newTestEvaluator()})
+		c.cfg.pollInterval, c.cfg.pollWait = tc.interval, tc.wait
+		if err := c.register(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if got := f.registered()[0].PollIntervalMs; got != tc.want {
+			t.Errorf("interval %v, wait %v: poll_interval_ms = %d, want %d", tc.interval, tc.wait, got, tc.want)
+		}
+	}
+}
+
+// TestConnectManteion_LongPollsByDefault: the default configuration
+// long-polls with wait=30. The startup fetch is not held (no wait), so
+// connecting never waits out a hold; the loop then goes straight into the
+// held poll.
+func TestConnectManteion_LongPollsByDefault(t *testing.T) {
+	f := newFakeManteion(t)
+	f.register = `{"status":"registered","version":1,"etag":"1-a","rules":[],"active_faults":[]}`
+	f.setRules(respond304("1", "1-a"))
+	cfg := defaultManteionConfig("svc")
+	cfg.url, cfg.instanceID, cfg.initTimeout = f.srv.URL, "pod-1", 5*time.Second
+	cfg.targets = applyTargets{Evaluator: newTestEvaluator()}
+	cfg.logger = slog.New(slog.DiscardHandler)
+	c, err := connectManteion(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+	polls := f.waitPolls(t, 2)
+	want := []pollSeen{{Version: "1", IfNoneMatch: `"1-a"`}, {Version: "1", IfNoneMatch: `"1-a"`, Wait: "30"}}
+	if !reflect.DeepEqual(polls[:2], want) {
+		t.Fatalf("polls = %+v, want the startup fetch without a hold, then the loop's poll held for 30s", polls[:2])
+	}
+}
+
+// TestConnectManteion_OnlyAHeldPollGetsTheLongTimeout: manteion answers a
+// held poll after the hold and a little more (it re-materializes the
+// document), so a held poll goes through the poll client, whose timeout
+// outlasts the hold with room to spare, never through the short-call
+// client. A poll without a hold -- the startup fetch -- keeps the short-call
+// timeout: a server that sits on it cannot stall connecting past it.
+func TestConnectManteion_OnlyAHeldPollGetsTheLongTimeout(t *testing.T) {
+	f := newFakeManteion(t)
+	f.register = `{"status":"registered","version":1,"etag":"1-a","rules":[],"active_faults":[]}`
+	f.setRules(func(w http.ResponseWriter, r *http.Request) {
+		wait, _ := strconv.Atoi(r.URL.Query().Get("wait"))
+		select { // the hold, then half a second more
+		case <-time.After(time.Duration(wait)*time.Second + 500*time.Millisecond):
+		case <-r.Context().Done():
+			return
+		}
+		respond304("1", "1-a")(w, r)
+	})
+	c, err := connectManteion(t.Context(), manteionConfig{
+		url: f.srv.URL, serviceName: "svc", instanceID: "pod-1",
+		initTimeout: 5 * time.Second, pollInterval: 10 * time.Second, pollWait: time.Second,
+		targets:    applyTargets{Evaluator: newTestEvaluator()},
+		httpClient: &http.Client{Timeout: 200 * time.Millisecond},
+		logger:     slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+	if c.lastPollAt.Load() != 0 {
+		t.Fatal("the startup fetch outlived the short-call timeout; a poll without a hold must keep it")
+	}
+	polls := f.waitPolls(t, 3) // the startup fetch, a held poll answered, the next held poll
+	if polls[0].Wait != "" || polls[1].Wait != "1" || c.Status() != manteionConnected || c.lastPollAt.Load() == 0 {
+		t.Fatalf("polls=%+v status=%v, want an unheld startup fetch, then held polls answered without a timeout", polls, c.Status())
 	}
 }

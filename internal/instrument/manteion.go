@@ -16,7 +16,9 @@ import (
 // connectManteion connects this SDK to the manteion control plane.
 //
 // Blocks until manteion is ready, registers the instance, fetches initial
-// rules, configures the evaluator, and starts a background poll loop.
+// rules without a long-poll hold, configures the evaluator, and starts the
+// background poll loop (long-polling when cfg.pollWait > 0), the SSE
+// listener and, with a DemoEval target, the fault-slot watchdog.
 //
 // Returns (nil, nil) if cfg.url is empty (offline mode — tracing-only). All
 // methods on *ManteionClient are nil-receiver safe, so callers can
@@ -70,6 +72,11 @@ func connectManteion(ctx context.Context, cfg manteionConfig) (*ManteionClient, 
 		targets:    cfg.targets,
 		logger:     cfg.logger,
 	}
+	if cfg.pollWait > 0 {
+		// A held poll outlives httpClient's timeout: manteion answers it
+		// after up to pollWait, so its client allows the hold plus 15 s.
+		c.pollClient = &http.Client{Transport: cfg.httpClient.Transport, Timeout: cfg.pollWait + 15*time.Second}
+	}
 	c.status.Store(int32(manteionDisconnected))
 
 	if err := c.waitForReady(ctx); err != nil {
@@ -100,7 +107,9 @@ func connectManteion(ctx context.Context, cfg manteionConfig) (*ManteionClient, 
 		return nil, fmt.Errorf("connectManteion: register: %w", err)
 	}
 
-	if err := c.fetchRules(ctx); err != nil {
+	// Never held (wait=0): startup must not wait out a long-poll hold. The
+	// loop's polls are held.
+	if err := c.fetchRulesWait(ctx, 0); err != nil {
 		// Non-fatal: log and continue — poll loop will retry.
 		c.logger.Warn("initial rule fetch failed, starting with empty rules", "error", err)
 	} else {
@@ -124,9 +133,8 @@ func connectManteion(ctx context.Context, cfg manteionConfig) (*ManteionClient, 
 		})
 	})
 	if c.targets.DemoEval != nil {
-		c.wg.Go(func() {
-			startFaultWatchdog(pollCtx, c.targets.DemoEval, c.targets.Registry, c.targets.ApplyMu, cfg.pollInterval, c.logger)
-		})
+		grace := watchdogGrace(cfg.pollInterval, cfg.pollWait)
+		c.wg.Go(func() { c.watchSlots(pollCtx, grace) })
 	}
 	c.status.Store(int32(manteionConnected))
 
@@ -145,8 +153,8 @@ type manteionConfig struct {
 	host           string       // advertised instrument host (register payload)
 	capabilities   []string     // advertised fault categories (register payload)
 	initTimeout    time.Duration
-	pollInterval   time.Duration
-	pollWait       time.Duration // long-poll hold each rules poll asks manteion for (wait=<seconds>); 0 = answer at once
+	pollInterval   time.Duration // poll cadence without a hold; the failure backoff's base
+	pollWait       time.Duration // long-poll hold each loop poll asks manteion for (wait=<seconds>); 0 = answer at once
 	offline        bool
 	targets        applyTargets
 	httpClient     *http.Client
@@ -158,7 +166,8 @@ type manteionConfig struct {
 // MANTEION_URL, MANTEION_INSTANCE_ID (falling back to hostname, then the
 // service name), MANTEION_INIT_TIMEOUT (default 30s),
 // MANTEION_ADVERTISE_ADDR (falling back to the first non-loopback IPv4),
-// and MANTEION_SERVICE_VERSION.
+// and MANTEION_SERVICE_VERSION; the poll loop long-polls with a 30 s hold
+// (spec §3: wait=30) over a 10 s poll interval.
 func defaultManteionConfig(serviceName string) manteionConfig {
 	url := os.Getenv("MANTEION_URL")
 
@@ -191,6 +200,7 @@ func defaultManteionConfig(serviceName string) manteionConfig {
 		instanceID:     instanceID,
 		initTimeout:    initTimeout,
 		pollInterval:   10 * time.Second,
+		pollWait:       30 * time.Second,
 		httpClient:     &http.Client{Timeout: 10 * time.Second},
 		logger:         slog.Default(),
 	}
@@ -224,7 +234,8 @@ func localIPv4() string {
 
 // ConnectConfig is the host-facing input to ConnectManteion. Env-derived
 // defaults (MANTEION_ADVERTISE_ADDR, MANTEION_INIT_TIMEOUT, the 10s poll
-// interval) come from defaultManteionConfig; the fields here overlay them.
+// interval, the 30s long-poll hold) come from defaultManteionConfig; the
+// fields here overlay them.
 type ConnectConfig struct {
 	// Core is the instrument the control plane drives. Its identity
 	// (service, instance) is what registers.

@@ -401,41 +401,19 @@ func applyFreezeCfg(req wire.DelayRequest, cb *cachebox.CacheBox) error {
 	return nil
 }
 
-// startFaultWatchdog runs until ctx is cancelled. Every tick, drops any
-// fault slot whose lastConfirmedAt is older than the grace period
-// (reapStaleSlots, under applyMu, the core's apply mutex).
-//
-// Grace = max(3 * pollInterval, 30s). This is the only mechanism that
-// protects against zombie faults when duration_ms = 0 (infinite) AND
-// Manteion crashes.
-func startFaultWatchdog(ctx context.Context, eval *demoEvaluator, reg *interceptor.FaultRegistry, applyMu *sync.Mutex, pollInterval time.Duration, logger interface{ Warn(string, ...any) }) {
-	grace := 3 * pollInterval
-	if grace < 30*time.Second {
-		grace = 30 * time.Second
-	}
-	t := time.NewTicker(1 * time.Second)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			reapStaleSlots(eval, reg, applyMu, grace, logger)
-		}
-	}
-}
-
-// reapStaleSlots is one watchdog pass: every slot not confirmed within grace
-// is cleared and its running faults stopped. The pass holds applyMu, the
+// reapStaleSlots is one watchdog pass (the manteion client's watchSlots):
+// every slot not confirmed within grace is cleared and its running faults
+// stopped, and the ids cleared are returned. The pass holds applyMu, the
 // core's apply mutex (nil = no locking), from the staleness check to the last
 // clear, so a slot that an apply or the client's confirmSlots refreshes in
 // between is never dropped.
-func reapStaleSlots(eval *demoEvaluator, reg *interceptor.FaultRegistry, applyMu *sync.Mutex, grace time.Duration, logger interface{ Warn(string, ...any) }) {
+func reapStaleSlots(eval *demoEvaluator, reg *interceptor.FaultRegistry, applyMu *sync.Mutex, grace time.Duration, logger interface{ Warn(string, ...any) }) []string {
 	if applyMu != nil {
 		applyMu.Lock()
 		defer applyMu.Unlock()
 	}
-	for _, cat := range eval.StaleSlots(grace) {
+	stale := eval.StaleSlots(grace)
+	for _, cat := range stale {
 		eval.ClearSlot(cat)
 		// Clearing the slot only stops NEW starts; the zombie guard
 		// is only real if the running instance dies too.
@@ -444,6 +422,7 @@ func reapStaleSlots(eval *demoEvaluator, reg *interceptor.FaultRegistry, applyMu
 			logger.Warn("watchdog: dropped stale fault slot", "category", cat, "grace", grace)
 		}
 	}
+	return stale
 }
 
 // stopFaults cancels the running background faults started under keys.
