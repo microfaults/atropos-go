@@ -83,20 +83,33 @@ in-process host has no cgroup authority and rejects `quota` at decode. See
 
 Runtime cache-box control.
 
-| Method | Path                    | Body                                             | Response |
-|--------|-------------------------|--------------------------------------------------|----------|
-| GET    | `/admin/cachebox`       | —                                                | 200 `Stats` JSON |
-| POST   | `/admin/cachebox/delay` | `{"mu": float, "sigma": float, "seed"?: uint64}` | 204 (replaces delay source with lognormal distribution) |
-| DELETE | `/admin/cachebox`       | —                                                | 204 (clears store; preserves lifetime counters) |
+| Method | Path                    | Body                                                                          | Response |
+|--------|-------------------------|-------------------------------------------------------------------------------|----------|
+| GET    | `/admin/cachebox`       | —                                                                             | 200 `Stats` JSON |
+| POST   | `/admin/cachebox/delay` | `{"mu": float, "sigma": float, "seed"?: uint64, "context"?: CacheBoxContext}` | 204 (replaces delay source with lognormal distribution; `context` is accepted on the wire, not yet honoured) |
+| DELETE | `/admin/cachebox`       | —                                                                             | 204 (clears store; preserves lifetime counters) |
 
 ### /admin/rules
 
 Runtime rule-set management against the host evaluator.
 
-| Method | Path           | Body                | Response |
-|--------|----------------|---------------------|----------|
-| GET    | `/admin/rules` | —                   | 200 `[]StaticRule` JSON |
-| POST   | `/admin/rules` | `[]StaticRule` JSON | 204 (atomic replace) |
+| Method | Path           | Body                                            | Response |
+|--------|----------------|-------------------------------------------------|----------|
+| GET    | `/admin/rules` | —                                               | 200 `[]StaticRule` JSON (the installed, decoded rules) |
+| POST   | `/admin/rules` | `[]CompiledRule` JSON; `null` clears the set    | 204 (atomic replace) or 400 `{"error": ...}` |
+
+POST is the push side of the single rule-apply path the manteion sync uses
+(`applyRules` in `internal/instrument/register.go`): decode against this
+host's capabilities, atomic replace, stop of background faults whose rule
+vanished, eager arming (sidecar) and cache-box drain observation happen
+exactly once per delivery. Rules this host cannot execute — categories
+outside its capabilities (unknown categories included), `mechanism: quota`
+resource faults on the in-process host, and composition rules — are skipped
+per rule, logged at WARN and counted in
+`atropos_rules_unsupported_total{category}` (`category="composition"` for
+compositions); the rest of the set still applies. Malformed params of a
+known category reject the whole set with 400. The push body carries no
+version, so the poll's rule version is left untouched.
 
 ## SDK Bootstrap
 
@@ -109,10 +122,10 @@ imports them.
 
 ### Types
 
-- `RegisterRequest{ID, Service, Version, Address, PollIntervalMs, Routes}` — the POST body. `Routes` is the optional HTTP route inventory for manteion's workflow-builder catalog.
+- `RegisterRequest{ID, Service, Version, Address, PollIntervalMs, Routes, Host, Capabilities}` — the POST body. `Routes` is the optional HTTP route inventory for manteion's workflow-builder catalog; `Host` (`in-process` | `sidecar`) and `Capabilities` (the fault categories this host executes) are additive.
 - `Route{Method, Path, Description, DependsOn}` — one published HTTP route. `DependsOn` entries are `"METHOD /path"` (same service) or `"service METHOD /path"` (fully qualified).
-- `RegisterResponse{Status, Rules, ActiveFault, FreezeCfg}` — the response. Rules/ActiveFault/FreezeCfg are populated when manteion has intent tracked for the service.
-- `CompiledRule`, `CompiledFault`, `CompiledComposition`, `CompiledCompositionMember` — the JSON wire format for rules, mirroring `manteion-go/internal/ruleconv`. `CompiledComposition` is carried on the wire but not yet executable on the SDK side; `DecodeCompiledRules` errors on composition rules.
+- `RegisterResponse{Status, RuleSync}` — the response embeds `RuleSync{Version, Rules, ActiveFaults, FreezeCfg}`, the same desired-state payload `GET /api/v1/sdk/rules` serves, so the SDK converges before its first poll. `Rules` and `ActiveFaults` are never omitted: `[]` clears the category, a `null`/absent `rules` means no change.
+- `CompiledRule`, `CompiledFault`, `CompiledComposition`, `CompiledCompositionMember` — the JSON wire format for rules, mirroring `manteion-go/internal/ruleconv`. `CompiledComposition` is carried on the wire but not yet executable on the SDK side; the decoder skips composition rules per rule and counts them (see `/admin/rules`).
 
 ### Typical Usage
 
@@ -136,10 +149,11 @@ and the fidelity endpoint alike.
 
 ### Limitations (current)
 
-- The rule decoder supports all three fault categories: inline (latency, error, hang), network (latency, retransmit_delay, blackhole, drip, rst, throttle), and resource (cpu, disk, io, memory). Network faults require `Config.NetworkResolver`.
+- The rule decoder supports all three fault categories: inline (latency, error, hang), network (latency, retransmit_delay, blackhole, drip, rst, throttle), and resource (cpu, disk, io, memory). Network faults require `Config.NetworkResolver`. A host executes only the categories in its capability set; a rule outside it, an unknown category included, is skipped per rule and counted (see `/admin/rules`).
 - The `host=inline` path on network faults (per-request response shaping via RoundTripper) is recognized by the wire format but rejected with a v6 deferral error until `ToxicTransport` is implemented.
-- Composition rules are rejected on decode with a v6 deferral error — the SDK has no composition evaluator yet (parallel/sequential fault dispatch with direction inheritance is future work).
+- Composition rules are skipped per rule on decode (logged at WARN, counted under `atropos_rules_unsupported_total{category="composition"}`) — the SDK has no composition evaluator yet (parallel/sequential fault dispatch with direction inheritance is future work).
 - `DecodeCompiledRules` sorts decoded rules by `Priority` descending (higher = evaluated first). Equal-priority rules preserve input order.
+- Transient (taxonomy 1.3) is implemented for HTTP ingress. Once the response is complete — the handler returned, or an inline error fault short-circuited it — the Transient point is evaluated with the ingress labels plus `atropos.http.status_code`, and a matching fault is started asynchronously on its own goroutine, so the response is never delayed by it (a failed start is only logged). A matching fault always runs in background mode through the fault registry (inline mode is meaningless after the response and is not honoured), detached from the request's cancellation but with its span parented on the request's server span. Armed `/admin/fault` slots and eager arming do not apply at Transient. The gRPC interceptors and `Hook` do not evaluate it.
 
 ## atroposd (sidecar host)
 

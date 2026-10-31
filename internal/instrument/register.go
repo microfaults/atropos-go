@@ -74,8 +74,9 @@ type applyTargets struct {
 	// NetworkResolver maps logical targets to listen/upstream pairs for network
 	// fault proxies. Required if rules or active_fault contain network-category faults.
 	NetworkResolver wire.NetworkResolver
-	// CacheDrain, if set, is notified with the applied rule set on every
-	// Apply that carries a non-empty rules list. It diffs against the
+	// CacheDrain, if set, observes every authoritative rule set applyRules
+	// installs -- polled, registered or pushed, and the empty set included
+	// (it is the common drain trigger). It diffs against the
 	// previously-seen active recording phases and fires a flush + W3 drain
 	// report for any that just ended (design doc Q2). Optional — nil means
 	// this SDK doesn't need automatic drain-report generation (e.g. it

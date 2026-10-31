@@ -121,9 +121,10 @@ func (f *afterHandlerFault) Start(ctx context.Context) (*fault.Handle, error) {
 }
 
 // slowStartFault blocks inside Start, like the sidecar's agent fault (a
-// unix-socket round trip) or a disk stress writing its files. Through the
-// registry, Start also runs under the registry lock, so a slow one must stay
-// off the response path.
+// unix-socket round trip) or the I/O stress (internal/fault/resource/io),
+// which writes all its files before Start returns. Through the registry,
+// Start also runs under the registry lock, so a slow one must stay off the
+// response path.
 type slowStartFault struct {
 	delay   time.Duration
 	started chan struct{}

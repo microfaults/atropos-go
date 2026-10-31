@@ -39,7 +39,9 @@ type CompiledFault = FaultRequest //@name atropos.CompiledFault
 
 // CompiledComposition is a resolved FaultComposition tree with all specs
 // inlined. Composition execution is not yet supported by the SDK evaluator
-// (deferred to v6); the decoder errors if a rule references one.
+// (deferred to v6); the decoder skips a rule that references one (logged at
+// WARN, counted under atropos_rules_unsupported_total{category="composition"})
+// instead of failing the set.
 type CompiledComposition struct {
 	Name          string                      `json:"name"`
 	ExecutionMode string                      `json:"execution_mode"`

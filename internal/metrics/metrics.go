@@ -79,10 +79,12 @@ var (
 	}, []string{"point"})
 
 	// RulesUnsupportedTotal counts rules a host skipped because it cannot
-	// execute their fault category (design doc §5.3, D7: no silent drops).
+	// execute their category or rule kind: a fault category outside its
+	// capabilities, or a composition. The category label carries that
+	// category or kind (design doc §5.3, D7: no silent drops).
 	RulesUnsupportedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "atropos_rules_unsupported_total",
-		Help: "Rules skipped because this host cannot execute their fault category.",
+		Help: "Rules skipped because this host cannot execute their category or rule kind.",
 	}, []string{"category"})
 )
 

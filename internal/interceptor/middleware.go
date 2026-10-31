@@ -63,13 +63,14 @@ func (i *Interceptor) IngressMiddleware(next http.Handler) http.Handler {
 // ingress labels plus atropos.http.status_code. The evaluation is
 // synchronous (a rule match); the start is not. A fault's Start can block --
 // the sidecar's agent fault waits on a unix-socket round trip, the
-// in-process disk stress writes its files -- and the registry runs it under
-// its lock, so a matching fault is started on its own goroutine
-// (StartTransient) and the response is never delayed by it. The goroutine
-// gets the request's context snapshotted here and detached from the
-// request's cancellation, keeping the trace parent; it never touches r, so
-// the request may finish while the fault starts. A start failure is only
-// logged. Cache-box decisions have no meaning here and are ignored.
+// in-process I/O stress (internal/fault/resource/io) writes all its files
+// first -- and the registry runs it under its lock, so a matching fault is
+// started on its own goroutine (StartTransient) and the response is never
+// delayed by it. The goroutine gets the request's context snapshotted here
+// and detached from the request's cancellation, keeping the trace parent;
+// it never touches r, so the request may finish while the fault starts. A
+// start failure is only logged. Cache-box decisions have no meaning here
+// and are ignored.
 func (i *Interceptor) transient(r *http.Request, labels map[string]string, status int) {
 	tl := maps.Clone(labels)
 	tl[trace.AttrHTTPStatusCode] = strconv.Itoa(status)

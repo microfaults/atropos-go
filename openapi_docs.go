@@ -153,7 +153,7 @@ func swaggerRulesAdminGet() {}
 // @Tags     admin
 // @Accept   json
 // @Produce  json
-// @Param    rules  body  []StaticRule  true  "replacement rules"
+// @Param    rules  body  []CompiledRule  true  "replacement rules (null clears the set)"
 // @Success  204    "rules replaced"
 // @Failure  400    {object}  ErrorResponse  "invalid rules"
 // @Failure  405    {object}  ErrorResponse  "method not allowed"
