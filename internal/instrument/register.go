@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
@@ -192,11 +193,13 @@ func applyRules(rules []wire.CompiledRule, targets applyTargets) error {
 		return fmt.Errorf("no Evaluator target for %d rules", len(rules))
 	}
 	if targets.Evaluator != nil {
-		decoded, err := decodeCompiledRules(rules, targets.decodeOpts()...)
-		if err != nil {
-			return err
+		out := decodeRuleSet(rules, targets.decodeOpts()...)
+		if len(out.Errors) > 0 {
+			// A rule that does not decode still fails the delivery and
+			// replaces nothing, until apply() reports it per rule.
+			return errors.New(strings.Join(out.Errors, "; "))
 		}
-		applyRuleSet(targets.Registry, targets.Evaluator, decoded, targets.Arm)
+		applyRuleSet(targets.Registry, targets.Evaluator, out.Rules, targets.Arm)
 	}
 	// Observe every authoritative rule set, INCLUDING empty: the recording
 	// phase whose rule drops out most often leaves the set empty, and that

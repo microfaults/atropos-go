@@ -54,9 +54,11 @@ func resourceMechanism(params json.RawMessage) string {
 
 // InlineToxicHost builds the fault that hosts a network toxic whose
 // NetworkEnvelope.Host is "inline". A host that owns the proxied
-// connections (the atroposd sidecar) supplies one; the in-process host does
-// not, and skips inline network rules per rule (an UnsupportedFaultError).
-// name is the rule or slot the fault belongs to (its fault-registry key).
+// connections (the atroposd sidecar) supplies one, and an empty
+// NetworkEnvelope.Host then means "inline" (design §5.6); the in-process host
+// does not, keeps the "proxy" default, and skips inline network rules per
+// rule (an UnsupportedFaultError). name is the rule or slot the fault
+// belongs to (its fault-registry key).
 type InlineToxicHost func(name string, env *wire.NetworkEnvelope, toxic network.Toxic, base fault.FaultConfig) (fault.Fault, error)
 
 // DecodeOption is the exported name of decodeOption, for hosts that supply
@@ -68,13 +70,14 @@ func WithInlineToxicHost(h InlineToxicHost) DecodeOption {
 	return func(c *decodeConfig) { c.inlineToxic = h }
 }
 
-// decodeOption configures the behaviour of decodeCompiledRule(s).
+// decodeOption configures the behaviour of decodeCompiledRule and decodeRuleSet.
 type decodeOption func(*decodeConfig)
 
 // withNetworkResolver supplies the resolver that maps a logical target name
 // (e.g. "redis") to a listen and upstream address pair for network fault
-// proxies. Rules whose Network.Host is "proxy" (the default) need it;
-// without one they are skipped per rule (an UnsupportedFaultError).
+// proxies. Rules whose Network.Host is "proxy" (the default, unless the host
+// supplies an InlineToxicHost) need it; without one they are skipped per
+// rule (an UnsupportedFaultError).
 func withNetworkResolver(r wire.NetworkResolver) decodeOption {
 	return func(c *decodeConfig) { c.resolve = r }
 }
@@ -87,33 +90,60 @@ func buildDecodeConfig(opts []decodeOption) *decodeConfig {
 	return cfg
 }
 
-// decodeCompiledRules converts wire-format CompiledRules into evaluator
-// StaticRules that can be loaded into the host StaticEvaluator.
-func decodeCompiledRules(compiled []wire.CompiledRule, opts ...decodeOption) ([]evaluator.StaticRule, error) {
+// ruleSetDecode is the per-rule outcome of decoding a compiled rule set. No
+// single rule fails the set: each one either decodes into Rules, or is
+// reported -- as Unsupported when this host cannot execute it, as Errors when
+// it is malformed -- and the rest still apply. All three slices are non-nil
+// (empty, not null), so a status report built from them marshals [].
+type ruleSetDecode struct {
+	// Rules holds every rule that decoded, ordered by Priority descending
+	// (higher = evaluated first; equal priorities keep input order).
+	Rules []evaluator.StaticRule
+	// Unsupported lists the rules this host cannot execute, in the order they
+	// were decoded: a fault category outside its capabilities, something a
+	// supported category needs that the host lacks (a quota resource host, a
+	// network resolver, an inline toxic host), or a composition (reported
+	// under CapComposition). Each is also counted in
+	// atropos_rules_unsupported_total{category}.
+	Unsupported []wire.UnsupportedRule
+	// Errors holds one "rule <name>: decode: <cause>" entry per malformed rule.
+	Errors []string
+}
+
+// decodeRuleSet converts wire-format CompiledRules into evaluator
+// StaticRules that can be loaded into the host StaticEvaluator, rule by rule
+// (see ruleSetDecode): one rule this host cannot execute, or cannot decode,
+// must not wedge the whole desired state (D7: counted, logged and reported).
+func decodeRuleSet(compiled []wire.CompiledRule, opts ...decodeOption) ruleSetDecode {
 	sorted := make([]wire.CompiledRule, len(compiled))
 	copy(sorted, compiled)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		return sorted[i].Priority > sorted[j].Priority
 	})
 
-	rules := make([]evaluator.StaticRule, 0, len(sorted))
+	out := ruleSetDecode{
+		Rules:       make([]evaluator.StaticRule, 0, len(sorted)),
+		Unsupported: []wire.UnsupportedRule{},
+		Errors:      []string{},
+	}
 	for _, cr := range sorted {
 		sr, err := decodeCompiledRule(cr, opts...)
 		if err != nil {
 			var unsup *UnsupportedFaultError
 			if errors.As(err, &unsup) {
-				// Skip this rule only: one rule this host cannot execute must
-				// not wedge the whole desired state (D7: counted + logged).
 				metrics.RulesUnsupportedTotal.WithLabelValues(unsup.Category).Inc()
 				slog.Default().Warn("rule skipped: not executable by this host",
 					"rule", cr.Name, "category", unsup.Category, "fault_type", unsup.FaultType)
+				out.Unsupported = append(out.Unsupported, wire.UnsupportedRule{Rule: cr.Name, Category: unsup.Category})
 				continue
 			}
-			return nil, fmt.Errorf("rule %q: %w", cr.Name, err)
+			slog.Default().Warn("rule skipped: decode error", "rule", cr.Name, "error", err)
+			out.Errors = append(out.Errors, fmt.Sprintf("rule %s: decode: %v", cr.Name, err))
+			continue
 		}
-		rules = append(rules, sr)
+		out.Rules = append(out.Rules, sr)
 	}
-	return rules, nil
+	return out
 }
 
 // decodeCompiledRule converts a single wire.CompiledRule into a wire.StaticRule.
@@ -133,9 +163,10 @@ func decodeCompiledRule(cr wire.CompiledRule, opts ...decodeOption) (evaluator.S
 
 	if cr.Composition != nil {
 		// Carried on the wire, not executable here yet (v6: parallel /
-		// sequential dispatch with direction inheritance). Skipped per rule
-		// like an unsupported category, never failing the set.
-		return evaluator.StaticRule{}, &UnsupportedFaultError{Category: CapComposition, FaultType: cr.Composition.ExecutionMode}
+		// sequential dispatch with direction inheritance). Reported and
+		// skipped per rule like an unsupported category, never failing the
+		// set; FaultType names the composition for the log.
+		return evaluator.StaticRule{}, &UnsupportedFaultError{Category: CapComposition, FaultType: cr.Composition.Name}
 	}
 
 	if cr.Fault != nil {
@@ -416,7 +447,14 @@ func decodeResourceFault(faultType string, params json.RawMessage, baseCfg fault
 func decodeNetworkFault(name, faultType string, env *wire.NetworkEnvelope, params json.RawMessage, baseCfg fault.FaultConfig, cfg *decodeConfig) (fault.Fault, error) {
 	host := env.Host
 	if host == "" {
+		// The default follows the host: one that owns the proxied
+		// connections (the atroposd sidecar, via WithInlineToxicHost) runs
+		// the toxic inline -- design §5.6 makes inline the daemon default --
+		// and the in-process host, which has none, keeps the proxy default.
 		host = "proxy"
+		if cfg.inlineToxic != nil {
+			host = "inline"
+		}
 	}
 
 	switch host {

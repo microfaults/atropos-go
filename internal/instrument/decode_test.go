@@ -3,6 +3,9 @@ package instrument
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,10 +31,11 @@ func TestDecodeCompiledRules_Latency(t *testing.T) {
 		},
 	}}
 
-	rules, err := decodeCompiledRules(compiled)
-	if err != nil {
-		t.Fatalf("decodeCompiledRules: %v", err)
+	out := decodeRuleSet(compiled)
+	if len(out.Errors) != 0 || len(out.Unsupported) != 0 {
+		t.Fatalf("decode: errors=%v unsupported=%v", out.Errors, out.Unsupported)
 	}
+	rules := out.Rules
 	if len(rules) != 1 {
 		t.Fatalf("expected 1 rule, got %d", len(rules))
 	}
@@ -73,10 +77,11 @@ func TestDecodeCompiledRules_Error(t *testing.T) {
 		},
 	}}
 
-	rules, err := decodeCompiledRules(compiled)
-	if err != nil {
-		t.Fatalf("decodeCompiledRules: %v", err)
+	out := decodeRuleSet(compiled)
+	if len(out.Errors) != 0 || len(out.Unsupported) != 0 {
+		t.Fatalf("decode: errors=%v unsupported=%v", out.Errors, out.Unsupported)
 	}
+	rules := out.Rules
 
 	errFault, ok := rules[0].Decision.Fault.(*inline.Error)
 	if !ok {
@@ -98,10 +103,11 @@ func TestDecodeCompiledRules_Hang(t *testing.T) {
 		},
 	}}
 
-	rules, err := decodeCompiledRules(compiled)
-	if err != nil {
-		t.Fatalf("decodeCompiledRules: %v", err)
+	out := decodeRuleSet(compiled)
+	if len(out.Errors) != 0 || len(out.Unsupported) != 0 {
+		t.Fatalf("decode: errors=%v unsupported=%v", out.Errors, out.Unsupported)
 	}
+	rules := out.Rules
 
 	_, ok := rules[0].Decision.Fault.(*inline.Hang)
 	if !ok {
@@ -116,10 +122,11 @@ func TestDecodeCompiledRules_NoFault(t *testing.T) {
 		Mode:           "background",
 	}}
 
-	rules, err := decodeCompiledRules(compiled)
-	if err != nil {
-		t.Fatalf("decodeCompiledRules: %v", err)
+	out := decodeRuleSet(compiled)
+	if len(out.Errors) != 0 || len(out.Unsupported) != 0 {
+		t.Fatalf("decode: errors=%v unsupported=%v", out.Errors, out.Unsupported)
 	}
+	rules := out.Rules
 	if rules[0].Decision.Fault != nil {
 		t.Error("expected nil Fault for metadata-only rule")
 	}
@@ -153,10 +160,11 @@ func TestDecodeCompiledRules_JSONRoundtrip(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	rules, err := decodeCompiledRules(decoded)
-	if err != nil {
-		t.Fatalf("decode: %v", err)
+	out := decodeRuleSet(decoded)
+	if len(out.Errors) != 0 || len(out.Unsupported) != 0 {
+		t.Fatalf("decode: errors=%v unsupported=%v", out.Errors, out.Unsupported)
 	}
+	rules := out.Rules
 
 	if rules[0].Name != "roundtrip-test" {
 		t.Errorf("Name lost in roundtrip: %q", rules[0].Name)
@@ -181,9 +189,9 @@ func TestDecodeCompiledRules_UnknownCategory(t *testing.T) {
 		},
 	}}
 
-	_, err := decodeCompiledRules(compiled)
-	if err == nil {
-		t.Fatal("expected error for unknown category")
+	out := decodeRuleSet(compiled)
+	if len(out.Rules) != 0 || len(out.Errors) != 1 {
+		t.Fatalf("rules=%d errors=%v, want the rule skipped with one error", len(out.Rules), out.Errors)
 	}
 }
 
@@ -215,10 +223,11 @@ func TestDecodeCompiledRules_ResourceTypes(t *testing.T) {
 					RampDownMs: tc.rampDownMs,
 				},
 			}}
-			rules, err := decodeCompiledRules(compiled)
-			if err != nil {
-				t.Fatalf("decodeCompiledRules: %v", err)
+			out := decodeRuleSet(compiled)
+			if len(out.Errors) != 0 || len(out.Unsupported) != 0 {
+				t.Fatalf("decode: errors=%v unsupported=%v", out.Errors, out.Unsupported)
 			}
+			rules := out.Rules
 			if rules[0].Decision.Fault == nil {
 				t.Fatal("expected Fault to be set")
 			}
@@ -241,9 +250,9 @@ func TestDecodeCompiledRules_UnknownResourceType(t *testing.T) {
 		},
 	}}
 
-	_, err := decodeCompiledRules(compiled)
-	if err == nil {
-		t.Fatal("expected error for unknown resource type")
+	out := decodeRuleSet(compiled)
+	if len(out.Rules) != 0 || len(out.Errors) != 1 {
+		t.Fatalf("rules=%d errors=%v, want the rule skipped with one error", len(out.Rules), out.Errors)
 	}
 }
 
@@ -280,10 +289,11 @@ func TestDecodeCompiledRules_NetworkTypes(t *testing.T) {
 					DurationMs: 10000,
 				},
 			}}
-			rules, err := decodeCompiledRules(compiled, withNetworkResolver(stubResolver(tc.listen, "localhost:6379")))
-			if err != nil {
-				t.Fatalf("decodeCompiledRules: %v", err)
+			out := decodeRuleSet(compiled, withNetworkResolver(stubResolver(tc.listen, "localhost:6379")))
+			if len(out.Errors) != 0 || len(out.Unsupported) != 0 {
+				t.Fatalf("decode: errors=%v unsupported=%v", out.Errors, out.Unsupported)
 			}
+			rules := out.Rules
 			if rules[0].Decision.Fault == nil {
 				t.Fatal("expected Fault to be set")
 			}
@@ -302,9 +312,9 @@ func TestDecodeCompiledRules_NetworkRequiresEnvelope(t *testing.T) {
 			DurationMs: 5000,
 		},
 	}}
-	_, err := decodeCompiledRules(compiled, withNetworkResolver(stubResolver(":1", "localhost:6379")))
-	if err == nil {
-		t.Fatal("expected error: missing network envelope")
+	out := decodeRuleSet(compiled, withNetworkResolver(stubResolver(":1", "localhost:6379")))
+	if len(out.Rules) != 0 || len(out.Errors) != 1 {
+		t.Fatalf("rules=%d errors=%v, want the rule skipped with one error", len(out.Rules), out.Errors)
 	}
 }
 
@@ -319,9 +329,9 @@ func TestDecodeCompiledRules_NonNetworkRejectsEnvelope(t *testing.T) {
 			Params:    json.RawMessage(`{"delay":"10ms"}`),
 		},
 	}}
-	_, err := decodeCompiledRules(compiled)
-	if err == nil {
-		t.Fatal("expected error: envelope on non-network category")
+	out := decodeRuleSet(compiled)
+	if len(out.Rules) != 0 || len(out.Errors) != 1 {
+		t.Fatalf("rules=%d errors=%v, want the rule skipped with one error", len(out.Rules), out.Errors)
 	}
 }
 
@@ -371,16 +381,22 @@ func TestDecodeCompiledRules_NetworkRulesTheHostCannotRunAreSkippedAndCounted(t 
 
 			// In a set it is skipped and counted; the rest of the set applies.
 			before := unsupportedCount(t, "network")
-			rules, err := decodeCompiledRules([]wire.CompiledRule{tc.rule, sibling}, tc.opts...)
-			if err != nil {
-				t.Fatalf("a rule the host cannot run must not fail the set: %v", err)
+			out := decodeRuleSet([]wire.CompiledRule{tc.rule, sibling}, tc.opts...)
+			if len(out.Errors) != 0 {
+				t.Fatalf("a rule the host cannot run must not fail the set: errors=%v", out.Errors)
 			}
+			rules := out.Rules
 			wantRules, wantCount := 2, 0.0
+			wantUnsupported := []wire.UnsupportedRule{}
 			if tc.wantSkipped != "" {
 				wantRules, wantCount = 1, 1
+				wantUnsupported = []wire.UnsupportedRule{{Rule: "net-rule", Category: "network"}}
 			}
 			if len(rules) != wantRules || rules[len(rules)-1].Name != "lat" {
 				t.Fatalf("rules = %+v, want %d with the sibling applied", rules, wantRules)
+			}
+			if !reflect.DeepEqual(out.Unsupported, wantUnsupported) {
+				t.Fatalf("unsupported = %+v, want %+v", out.Unsupported, wantUnsupported)
 			}
 			if got := unsupportedCount(t, "network") - before; got != wantCount {
 				t.Fatalf("atropos_rules_unsupported_total{network} += %v, want %v", got, wantCount)
@@ -401,9 +417,9 @@ func TestDecodeCompiledRules_UnknownNetworkType(t *testing.T) {
 			DurationMs: 5000,
 		},
 	}}
-	_, err := decodeCompiledRules(compiled, withNetworkResolver(stubResolver(":19099", "localhost:6379")))
-	if err == nil {
-		t.Fatal("expected error for unknown network type")
+	out := decodeRuleSet(compiled, withNetworkResolver(stubResolver(":19099", "localhost:6379")))
+	if len(out.Rules) != 0 || len(out.Errors) != 1 {
+		t.Fatalf("rules=%d errors=%v, want the rule skipped with one error", len(out.Rules), out.Errors)
 	}
 }
 
@@ -427,15 +443,150 @@ func TestDecodeCompiledRules_CompositionSkippedAndCounted(t *testing.T) {
 			Category: "inline", FaultType: "error", Params: json.RawMessage(`{"status_code":500}`)}},
 	}
 
-	rules, err := decodeCompiledRules(compiled)
-	if err != nil {
-		t.Fatalf("a composition must not fail the set: %v", err)
+	out := decodeRuleSet(compiled)
+	if len(out.Errors) != 0 {
+		t.Fatalf("a composition must not fail the set: errors=%v", out.Errors)
 	}
+	rules := out.Rules
 	if len(rules) != 2 || rules[0].Name != "lat" || rules[1].Name != "err" {
 		t.Fatalf("rules = %+v, want [lat err] with the composition skipped", rules)
 	}
 	if got := unsupportedCount(t, "composition") - before; got != 1 {
 		t.Fatalf("atropos_rules_unsupported_total{composition} += %v, want 1", got)
+	}
+}
+
+// TestDecodeRuleSet_CompositionSkippedAndCounted: a composition rule lands in
+// Unsupported under "composition" (and in the metric), never in Errors, and
+// the rest of the set applies.
+func TestDecodeRuleSet_CompositionSkippedAndCounted(t *testing.T) {
+	before := unsupportedCount(t, "composition")
+	compiled := []wire.CompiledRule{{
+		Name: "comp-rule", Mode: "inline",
+		Composition: &wire.CompiledComposition{Name: "x", ExecutionMode: "parallel", Members: []wire.CompiledCompositionMember{
+			{Fault: &wire.CompiledFault{Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"10ms"}`)}},
+		}},
+	}, {
+		Name: "lat", InjectionPoint: "ingress", Mode: "inline",
+		Fault: &wire.CompiledFault{Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"1ms"}`)},
+	}}
+	out := decodeRuleSet(compiled)
+	if len(out.Rules) != 1 || out.Rules[0].Name != "lat" || len(out.Errors) != 0 {
+		t.Fatalf("out = %+v, want only lat applied and no errors", out)
+	}
+	if len(out.Unsupported) != 1 || out.Unsupported[0] != (wire.UnsupportedRule{Rule: "comp-rule", Category: CapComposition}) {
+		t.Fatalf("unsupported = %+v", out.Unsupported)
+	}
+	if got := unsupportedCount(t, "composition") - before; got != 1 {
+		t.Fatalf("atropos_rules_unsupported_total{composition} += %v, want 1", got)
+	}
+}
+
+// TestDecodeRuleSet_DecodeErrorSkipsOnlyThatRule: a malformed rule is
+// reported in Errors and skipped; it never fails the set it arrives in.
+func TestDecodeRuleSet_DecodeErrorSkipsOnlyThatRule(t *testing.T) {
+	compiled := []wire.CompiledRule{
+		{Name: "bad", Mode: "inline", Fault: &wire.CompiledFault{Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"bogus"}`)}},
+		{Name: "good", Mode: "inline", Fault: &wire.CompiledFault{Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"1ms"}`)}},
+	}
+	out := decodeRuleSet(compiled)
+	if len(out.Rules) != 1 || out.Rules[0].Name != "good" {
+		t.Fatalf("rules = %+v, want only good", out.Rules)
+	}
+	if len(out.Errors) != 1 || !strings.HasPrefix(out.Errors[0], "rule bad: decode: ") || !strings.Contains(out.Errors[0], "bogus") {
+		t.Fatalf("errors = %v", out.Errors)
+	}
+	if out.Unsupported == nil || out.Errors == nil {
+		t.Fatal("slices must be non-nil so the status report marshals [] not null")
+	}
+}
+
+// TestDecodeRuleSet_MixedSetReportsEachRuleOnItsOwn: one set holds a rule the
+// host does not support, a composition, a malformed rule and two good ones.
+// Each gets its own outcome -- the good ones apply (priority sorted), the
+// unsupported one and the composition are reported and counted under their
+// own categories, the malformed one is reported as an error -- and none of
+// them fails the set or takes a neighbour down.
+func TestDecodeRuleSet_MixedSetReportsEachRuleOnItsOwn(t *testing.T) {
+	latLow := wire.CompiledRule{Name: "lat-low", Mode: "inline", Priority: 1, Fault: &wire.CompiledFault{
+		Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"1ms"}`)}}
+	bad := wire.CompiledRule{Name: "bad", Mode: "inline", Priority: 4, Fault: &wire.CompiledFault{
+		Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"bogus"}`)}}
+	comp := wire.CompiledRule{Name: "comp", Mode: "inline", Priority: 6, Composition: &wire.CompiledComposition{
+		Name: "c", ExecutionMode: "sequential", Members: []wire.CompiledCompositionMember{
+			{Fault: &wire.CompiledFault{Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"1ms"}`)}},
+		}}}
+	cpu := wire.CompiledRule{Name: "cpu", Mode: "background", Priority: 8, Fault: &wire.CompiledFault{
+		Category: "resource", FaultType: "cpu", DurationMs: 1000, Params: json.RawMessage(`{"target_load":0.1}`)}}
+	errHigh := wire.CompiledRule{Name: "err-high", Mode: "inline", Priority: 10, Fault: &wire.CompiledFault{
+		Category: "inline", FaultType: "error", Params: json.RawMessage(`{"status_code":503}`)}}
+
+	caps := WithCapabilities(CapInline, CapCacheBox)
+	resourceBefore, compositionBefore := unsupportedCount(t, "resource"), unsupportedCount(t, "composition")
+
+	out := decodeRuleSet([]wire.CompiledRule{latLow, bad, comp, cpu, errHigh}, caps)
+
+	var applied []string
+	for _, r := range out.Rules {
+		applied = append(applied, r.Name)
+	}
+	if want := []string{"err-high", "lat-low"}; !reflect.DeepEqual(applied, want) {
+		t.Fatalf("applied rules = %v, want %v", applied, want)
+	}
+
+	wantUnsupported := []wire.UnsupportedRule{
+		{Rule: "cpu", Category: "resource"},
+		{Rule: "comp", Category: CapComposition},
+	}
+	if !reflect.DeepEqual(out.Unsupported, wantUnsupported) {
+		t.Fatalf("unsupported = %+v, want %+v", out.Unsupported, wantUnsupported)
+	}
+
+	// The error entry is the rule's own decode failure, named and prefixed.
+	_, cause := decodeCompiledRule(bad, caps)
+	if cause == nil || !strings.Contains(cause.Error(), "bogus") {
+		t.Fatalf("decodeCompiledRule(bad) error = %v, want one that names the bad value", cause)
+	}
+	if want := []string{fmt.Sprintf("rule %s: decode: %v", "bad", cause)}; !reflect.DeepEqual(out.Errors, want) {
+		t.Fatalf("errors = %q, want %q", out.Errors, want)
+	}
+
+	if got := unsupportedCount(t, "resource") - resourceBefore; got != 1 {
+		t.Fatalf("atropos_rules_unsupported_total{resource} += %v, want 1", got)
+	}
+	if got := unsupportedCount(t, "composition") - compositionBefore; got != 1 {
+		t.Fatalf("atropos_rules_unsupported_total{composition} += %v, want 1", got)
+	}
+}
+
+// TestDecodeRuleSet_EmptyOutcomesAreNonNil: the status report carries these
+// slices as they are, and an empty one must read [] (it clears the previous
+// report), never null.
+func TestDecodeRuleSet_EmptyOutcomesAreNonNil(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		compiled []wire.CompiledRule
+	}{
+		{"no rules", nil},
+		{"only good rules", []wire.CompiledRule{{Name: "lat", Mode: "inline", Fault: &wire.CompiledFault{
+			Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"1ms"}`)}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := decodeRuleSet(tc.compiled)
+			if out.Rules == nil {
+				t.Fatal("Rules must be non-nil")
+			}
+			b, err := json.Marshal(struct {
+				Unsupported []wire.UnsupportedRule `json:"unsupported"`
+				Errors      []string               `json:"errors"`
+			}{out.Unsupported, out.Errors})
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if got, want := string(b), `{"unsupported":[],"errors":[]}`; got != want {
+				t.Fatalf("report slices marshal as %s, want %s", got, want)
+			}
+		})
 	}
 }
 
@@ -452,10 +603,11 @@ func TestDecodeCompiledRules_PrioritySorted(t *testing.T) {
 		}},
 	}
 
-	rules, err := decodeCompiledRules(compiled)
-	if err != nil {
-		t.Fatalf("decodeCompiledRules: %v", err)
+	out := decodeRuleSet(compiled)
+	if len(out.Errors) != 0 || len(out.Unsupported) != 0 {
+		t.Fatalf("decode: errors=%v unsupported=%v", out.Errors, out.Unsupported)
 	}
+	rules := out.Rules
 	if len(rules) != 3 {
 		t.Fatalf("expected 3 rules, got %d", len(rules))
 	}
@@ -478,10 +630,11 @@ func TestDecodeCompiledRules_PriorityStable(t *testing.T) {
 		}},
 	}
 
-	rules, err := decodeCompiledRules(compiled)
-	if err != nil {
-		t.Fatalf("decodeCompiledRules: %v", err)
+	out := decodeRuleSet(compiled)
+	if len(out.Errors) != 0 || len(out.Unsupported) != 0 {
+		t.Fatalf("decode: errors=%v unsupported=%v", out.Errors, out.Unsupported)
 	}
+	rules := out.Rules
 
 	if rules[0].Name != "first" || rules[1].Name != "second" {
 		t.Errorf("equal priority should preserve input order: got %q, %q", rules[0].Name, rules[1].Name)
@@ -500,15 +653,16 @@ func TestDecode_InlineToxicHostReceivesRuleNameEnvelopeAndToxic(t *testing.T) {
 		gotName, gotTarget, gotToxic = name, env.Target, toxic
 		return stub, nil
 	}
-	rules, err := decodeCompiledRules([]wire.CompiledRule{{
+	out := decodeRuleSet([]wire.CompiledRule{{
 		Name: "throttle-redis", InjectionPoint: "egress", Mode: "background",
 		Fault: &wire.CompiledFault{Category: "network", FaultType: "throttle", DurationMs: 5000,
 			Network: &wire.NetworkEnvelope{Host: "inline", Target: "redis:6379", Direction: "downstream"},
 			Params:  json.RawMessage(`{"bytes_per_sec":1024}`)},
 	}}, WithInlineToxicHost(hook))
-	if err != nil {
-		t.Fatalf("decode: %v", err)
+	if len(out.Errors) != 0 || len(out.Unsupported) != 0 {
+		t.Fatalf("decode: errors=%v unsupported=%v", out.Errors, out.Unsupported)
 	}
+	rules := out.Rules
 	if gotName != "throttle-redis" || gotTarget != "redis:6379" {
 		t.Fatalf("hook got name=%q target=%q", gotName, gotTarget)
 	}
@@ -518,4 +672,62 @@ func TestDecode_InlineToxicHostReceivesRuleNameEnvelopeAndToxic(t *testing.T) {
 	if rules[0].Decision.Fault != stub {
 		t.Fatal("the hook's fault must be what the decoded rule carries")
 	}
+}
+
+// TestDecode_NetworkHostDefaultFollowsTheHost: an empty network.host is
+// "inline" on a host that owns proxied connections -- the sidecar, which
+// installs WithInlineToxicHost; design §5.6 makes inline the daemon default --
+// and "proxy" on the in-process host, which has no such connection.
+func TestDecode_NetworkHostDefaultFollowsTheHost(t *testing.T) {
+	rule := wire.CompiledRule{Name: "net-default-host", Mode: "background", Fault: &wire.CompiledFault{
+		Category: "network", FaultType: "blackhole", DurationMs: 5000, Params: json.RawMessage(`{}`),
+		Network: &wire.NetworkEnvelope{Target: "redis"}, // Host deliberately left empty
+	}}
+	hosted := &inline.Latency{FaultConfig: fault.FaultConfig{Duration: time.Second}, Delay: time.Millisecond}
+	var hostedFor []string
+	toxicHost := WithInlineToxicHost(func(name string, env *wire.NetworkEnvelope, toxic network.Toxic, base fault.FaultConfig) (fault.Fault, error) {
+		hostedFor = append(hostedFor, name)
+		return hosted, nil
+	})
+	resolver := withNetworkResolver(stubResolver(":19097", "localhost:6379"))
+
+	t.Run("with an inline toxic host the default is inline", func(t *testing.T) {
+		hostedFor = nil
+		sr, err := decodeCompiledRule(rule, toxicHost)
+		if err != nil {
+			t.Fatalf("decodeCompiledRule: %v", err)
+		}
+		if sr.Decision.Fault != hosted || len(hostedFor) != 1 || hostedFor[0] != "net-default-host" {
+			t.Fatalf("fault = %T, hosted for %v; want the inline toxic host to build it for net-default-host", sr.Decision.Fault, hostedFor)
+		}
+	})
+
+	t.Run("inline wins over proxy when the host has both", func(t *testing.T) {
+		hostedFor = nil
+		sr, err := decodeCompiledRule(rule, toxicHost, resolver)
+		if err != nil {
+			t.Fatalf("decodeCompiledRule: %v", err)
+		}
+		if sr.Decision.Fault != hosted || len(hostedFor) != 1 {
+			t.Fatalf("fault = %T, hosted for %v; want the inline toxic host", sr.Decision.Fault, hostedFor)
+		}
+	})
+
+	t.Run("without one the default stays proxy", func(t *testing.T) {
+		hostedFor = nil
+		sr, err := decodeCompiledRule(rule, resolver)
+		if err != nil {
+			t.Fatalf("decodeCompiledRule: %v", err)
+		}
+		if _, ok := sr.Decision.Fault.(*network.Proxy); !ok || len(hostedFor) != 0 {
+			t.Fatalf("fault = %T, hosted for %v; want a *network.Proxy", sr.Decision.Fault, hostedFor)
+		}
+
+		// And with nothing to resolve the proxy it is skipped as a proxy rule.
+		_, err = decodeCompiledRule(rule)
+		var unsup *UnsupportedFaultError
+		if !errors.As(err, &unsup) || unsup.Category != "network" || unsup.FaultType != "blackhole/proxy" {
+			t.Fatalf("decodeCompiledRule error = %v, want *UnsupportedFaultError{network, blackhole/proxy}", err)
+		}
+	})
 }

@@ -37,10 +37,10 @@ func AllCapabilities() []string {
 // resource quota (FaultType "<type>/quota"), an inline toxic host for a
 // network host=inline fault ("<type>/inline"), a NetworkResolver for a
 // network host=proxy fault ("<type>/proxy") -- or the rule is a composition
-// (Category is then CapComposition and FaultType the execution mode).
-// Rule decoding skips such rules per rule (counted, logged) instead of
-// failing the whole sync (design §5.3, D7); a single admin slot reports the
-// error as a 400.
+// (Category is then CapComposition and FaultType the composition's name).
+// Rule decoding skips such rules per rule (counted, logged, reported)
+// instead of failing the whole sync (design §5.3, D7); a single admin slot
+// reports the error as a 400.
 type UnsupportedFaultError struct {
 	Category  string
 	FaultType string

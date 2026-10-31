@@ -41,12 +41,16 @@ func threeRules() []wire.CompiledRule {
 
 func TestDecode_UnsupportedCategoryIsSkippedAndCounted(t *testing.T) {
 	before := unsupportedCount(t, "resource")
-	rules, err := decodeCompiledRules(threeRules(), WithCapabilities(CapInline, CapCacheBox))
-	if err != nil {
-		t.Fatalf("decode: %v", err)
+	out := decodeRuleSet(threeRules(), WithCapabilities(CapInline, CapCacheBox))
+	if len(out.Errors) != 0 {
+		t.Fatalf("decode: errors=%v", out.Errors)
 	}
+	rules := out.Rules
 	if len(rules) != 2 || rules[0].Name != "lat" || rules[1].Name != "cb" {
 		t.Fatalf("rules = %+v, want the resource rule skipped", rules)
+	}
+	if len(out.Unsupported) != 1 || out.Unsupported[0] != (wire.UnsupportedRule{Rule: "cpu", Category: "resource"}) {
+		t.Fatalf("unsupported = %+v, want the cpu rule reported under resource", out.Unsupported)
 	}
 	if got := unsupportedCount(t, "resource") - before; got != 1 {
 		t.Fatalf("atropos_rules_unsupported_total{resource} += %v, want 1", got)
@@ -54,9 +58,9 @@ func TestDecode_UnsupportedCategoryIsSkippedAndCounted(t *testing.T) {
 }
 
 func TestDecode_NoCapabilitiesMeansEverythingSupported(t *testing.T) {
-	rules, err := decodeCompiledRules(threeRules())
-	if err != nil || len(rules) != 3 {
-		t.Fatalf("rules=%d err=%v, want all three", len(rules), err)
+	out := decodeRuleSet(threeRules())
+	if len(out.Errors) != 0 || len(out.Unsupported) != 0 || len(out.Rules) != 3 {
+		t.Fatalf("rules=%d errors=%v unsupported=%v, want all three", len(out.Rules), out.Errors, out.Unsupported)
 	}
 }
 
@@ -135,9 +139,13 @@ func TestDecode_QuotaMechanismNeedsAResourceHost(t *testing.T) {
 
 	// In-process: skipped and counted, not executed, not a sync failure.
 	before := unsupportedCount(t, "resource")
-	rules, err := decodeCompiledRules(rule)
-	if err != nil || len(rules) != 0 || unsupportedCount(t, "resource")-before != 1 {
-		t.Fatalf("rules=%d err=%v counted=%v", len(rules), err, unsupportedCount(t, "resource")-before)
+	out := decodeRuleSet(rule)
+	counted := unsupportedCount(t, "resource") - before
+	if len(out.Errors) != 0 || len(out.Rules) != 0 || counted != 1 {
+		t.Fatalf("rules=%d errors=%v counted=%v", len(out.Rules), out.Errors, counted)
+	}
+	if len(out.Unsupported) != 1 || out.Unsupported[0] != (wire.UnsupportedRule{Rule: "cpu-quota", Category: "resource"}) {
+		t.Fatalf("unsupported = %+v, want the quota rule reported under resource", out.Unsupported)
 	}
 
 	// With a resource host every resource fault goes through it.
@@ -146,8 +154,8 @@ func TestDecode_QuotaMechanismNeedsAResourceHost(t *testing.T) {
 		gotName, gotMech = name, resourceMechanism(req.Params)
 		return &inline.Latency{FaultConfig: base, Delay: time.Millisecond}, nil
 	}
-	rules, err = decodeCompiledRules(rule, WithResourceHost(host))
-	if err != nil || len(rules) != 1 || gotName != "cpu-quota" || gotMech != "quota" {
-		t.Fatalf("rules=%d err=%v name=%q mech=%q", len(rules), err, gotName, gotMech)
+	out = decodeRuleSet(rule, WithResourceHost(host))
+	if len(out.Errors) != 0 || len(out.Unsupported) != 0 || len(out.Rules) != 1 || gotName != "cpu-quota" || gotMech != "quota" {
+		t.Fatalf("rules=%d errors=%v unsupported=%v name=%q mech=%q", len(out.Rules), out.Errors, out.Unsupported, gotName, gotMech)
 	}
 }
