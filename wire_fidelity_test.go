@@ -380,4 +380,23 @@ func TestWireContract_JSONRoundTrip(t *testing.T) {
 			t.Errorf("snapshot round-trip mismatch: got %+v, want %+v", decoded, snap)
 		}
 	})
+
+	t.Run("StatusReport", func(t *testing.T) {
+		// Empty lists are emitted, not omitted: an empty report clears the previous one.
+		raw, err := json.Marshal(StatusReport{
+			InstanceID: "i", Service: "s", AppliedGeneration: 1, Etag: "1-a",
+			Unsupported: []UnsupportedRule{}, Errors: []string{},
+		})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		for _, key := range []string{`"instance_id"`, `"applied_generation"`, `"unsupported"`, `"errors"`} {
+			if !strings.Contains(string(raw), key) {
+				t.Errorf("status report missing %s in %s", key, raw)
+			}
+		}
+		if strings.Contains(string(raw), `"replay_set"`) {
+			t.Errorf("absent replay_set must be omitted: %s", raw)
+		}
+	})
 }

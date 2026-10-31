@@ -30,6 +30,10 @@ type (
 	CompiledComposition       = wire.CompiledComposition
 	CompiledCompositionMember = wire.CompiledCompositionMember
 	RuleSync                  = wire.RuleSync
+	ReplaySetRef              = wire.ReplaySetRef
+	ReplaySetStatus           = wire.ReplaySetStatus
+	StatusReport              = wire.StatusReport
+	UnsupportedRule           = wire.UnsupportedRule
 	StaticRule                = wire.StaticRule
 )
 
