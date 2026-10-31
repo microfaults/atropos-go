@@ -667,7 +667,8 @@ func TestStartFault_JoinLinksRequestToFaultSpan(t *testing.T) {
 	}
 }
 
-// Review Focus 5: Core.Arm starts from context.Background().
+// Review Focus 5: Core.Arm starts from context.Background() (marked by
+// ArmedContext); without a request span there is no trigger to link.
 func TestStartFault_ArmWithoutRequestSpan(t *testing.T) {
 	exp := installRecordingProvider(t)
 	reg := NewFaultRegistry()
@@ -744,8 +745,9 @@ func TestStartTransient_SpanLinksTriggerRequest(t *testing.T) {
 }
 
 // Ruling (Review Focus 5): an armed run (Core.Arm starts from
-// context.Background(), so there is no request span) links the recent
-// requests and nothing else -- newest first, at most ringLinks of them.
+// ArmedContext(context.Background()): no request is behind it) links the
+// recent requests and nothing else -- newest first, at most ringLinks of
+// them.
 func TestStartFault_ArmLinksOnlyRecentRequests(t *testing.T) {
 	exp := installRecordingProvider(t)
 	reg := NewFaultRegistry()
@@ -759,7 +761,7 @@ func TestStartFault_ArmLinksOnlyRecentRequests(t *testing.T) {
 		seen = append(seen, s.SpanContext())
 		s.End()
 	}
-	cr, err := i.StartFault(context.Background(), evaluator.Request{Point: evaluator.Egress, Labels: map[string]string{}}, backgroundDecision("armed"))
+	cr, err := i.StartFault(ArmedContext(context.Background()), evaluator.Request{Point: evaluator.Egress, Labels: map[string]string{}}, backgroundDecision("armed"))
 	if err != nil || cr.Handle == nil || cr.RunID == "" {
 		t.Fatalf("cr=%+v err=%v", cr, err)
 	}
@@ -908,12 +910,14 @@ func faultSpanOf(t *testing.T, spans tracetest.SpanStubs, runID string) tracetes
 	return tracetest.SpanStub{}
 }
 
-// Eager arming (Core.Arm, from context.Background()) re-arms every
-// background rule on each delivery. A re-arm that meets the running fault is
-// reported to the caller as a join (no handle, the running run's id), but no
-// request made it, so it is not counted on the fault span. A request that
-// joins an armed fault is counted, and its span gets the run id and the link;
-// so is an unsampled request, whose span is merely not stored.
+// Eager arming (Core.Arm, through ArmedContext) re-arms every background
+// rule on each delivery. A re-arm that meets the running fault is reported
+// to the caller as a join (no handle, the running run's id), but no request
+// made it, so it is not counted on the fault span. A request that joins an
+// armed fault is counted, and its span gets the run id and the link; so is
+// an unsampled request, whose span is merely not stored, and a request with
+// no span context at all (a gRPC call without otelgrpc), which has no span
+// to stamp or link.
 func TestStartFault_RearmsAreNotCountedAsJoins(t *testing.T) {
 	exp := installRecordingProvider(t)
 	reg := NewFaultRegistry()
@@ -921,7 +925,7 @@ func TestStartFault_RearmsAreNotCountedAsJoins(t *testing.T) {
 	i := New(nil, trace.NewOTelTracer(), WithRegistry(reg))
 	arm := func(name string) CheckResult {
 		t.Helper()
-		cr, err := i.StartFault(context.Background(), evaluator.Request{Point: evaluator.Ingress, Labels: map[string]string{}}, heldDecision(name))
+		cr, err := i.StartFault(ArmedContext(context.Background()), evaluator.Request{Point: evaluator.Ingress, Labels: map[string]string{}}, heldDecision(name))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -952,7 +956,12 @@ func TestStartFault_RearmsAreNotCountedAsJoins(t *testing.T) {
 		t.Fatalf("unsampled request join = %+v %v", cr, err)
 	}
 
-	for _, run := range []CheckResult{rearmed, joined, unsampledJoin} {
+	bareJoin := arm("bare-join")
+	if cr, err := i.StartFault(context.Background(), evaluator.Request{Point: evaluator.Ingress}, heldDecision("bare-join")); err != nil || !cr.Joined || cr.RunID != bareJoin.RunID {
+		t.Fatalf("request join without a span context = %+v %v, want a join on run %s", cr, err, bareJoin.RunID)
+	}
+
+	for _, run := range []CheckResult{rearmed, joined, unsampledJoin, bareJoin} {
 		reg.Stop(run.Decision.Name)
 		<-run.Handle.Done()
 	}
@@ -973,6 +982,94 @@ func TestStartFault_RearmsAreNotCountedAsJoins(t *testing.T) {
 	}
 	if us := faultSpanOf(t, spans, unsampledJoin.RunID); !hasAttr(us.Attributes, trace.AttrFaultJoined, "1") {
 		t.Fatalf("fault span attrs = %v, want %s=1: an unsampled request is still a request", us.Attributes, trace.AttrFaultJoined)
+	}
+	if bs := faultSpanOf(t, spans, bareJoin.RunID); !hasAttr(bs.Attributes, trace.AttrFaultJoined, "1") {
+		t.Fatalf("fault span attrs = %v, want %s=1: a request without a span context is still a request", bs.Attributes, trace.AttrFaultJoined)
+	}
+}
+
+// The armed marker, not the span context, says that no request is behind a
+// call. An arm whose context carries a sampled span (an arm made while
+// serving an admin request, say) is no request either: its start neither
+// links that span as the trigger nor stamps it with the run id, and its
+// re-arm is not counted, stamps nothing and links nothing.
+func TestStartFault_ArmedCallIsNoRequestWhateverItsSpanContext(t *testing.T) {
+	exp := installRecordingProvider(t)
+	reg := NewFaultRegistry()
+	defer reg.Close()
+	i := New(nil, trace.NewOTelTracer(), WithRegistry(reg))
+	ctx, admin := otel.Tracer("test").Start(context.Background(), "admin")
+	armed := ArmedContext(ctx)
+	req := evaluator.Request{Point: evaluator.Egress, Labels: map[string]string{}}
+
+	start, err := i.StartFault(armed, req, heldDecision("armed"))
+	if err != nil || start.Handle == nil || start.Joined {
+		t.Fatalf("arm = %+v %v, want a start", start, err)
+	}
+	again, err := i.StartFault(armed, req, heldDecision("armed"))
+	if err != nil || !again.Joined || again.Handle != nil || again.RunID != start.RunID {
+		t.Fatalf("re-arm = %+v %v, want a join on run %s with no handle", again, err, start.RunID)
+	}
+	admin.End()
+	reg.Stop("armed")
+	<-start.Handle.Done()
+
+	spans := exp.GetSpans()
+	fs := faultSpanOf(t, spans, start.RunID)
+	if len(fs.Links) != 0 {
+		t.Fatalf("armed fault span links = %+v, want none: the arm's span is no trigger and the ring is empty", fs.Links)
+	}
+	for _, a := range fs.Attributes {
+		if a.Key == trace.AttrFaultJoined {
+			t.Fatalf("armed fault span carries %s=%s, want none: only a re-arm met it", a.Key, a.Value.Emit())
+		}
+	}
+	as := findSpan(t, spans, "admin")
+	if len(as.Links) != 0 {
+		t.Fatalf("the arm's span links = %+v, want none", as.Links)
+	}
+	for _, a := range as.Attributes {
+		if a.Key == trace.AttrFaultID {
+			t.Fatalf("the arm's span carries %s=%s, want none: it is no request", a.Key, a.Value.Emit())
+		}
+	}
+}
+
+// The direct path honours the mark too: an armed inline start (no registry)
+// stamps no run id on the span its context carries.
+func TestStartFault_ArmedDirectStartStampsNoSpan(t *testing.T) {
+	exp := installRecordingProvider(t)
+	i := New(nil, trace.NewOTelTracer())
+	ctx, admin := otel.Tracer("test").Start(context.Background(), "admin")
+	cr, err := i.StartFault(ArmedContext(ctx), evaluator.Request{Point: evaluator.Ingress, Labels: map[string]string{}},
+		&evaluator.Decision{Name: "lat", Fault: &inline.Latency{Delay: time.Millisecond}, Mode: evaluator.Inline, Reason: "test"})
+	if err != nil || cr.Handle == nil || cr.RunID == "" {
+		t.Fatalf("cr=%+v err=%v", cr, err)
+	}
+	<-cr.Handle.Done()
+	admin.End()
+	for _, a := range findSpan(t, exp.GetSpans(), "admin").Attributes {
+		if a.Key == trace.AttrFaultID {
+			t.Fatalf("the arm's span carries %s=%s, want none: it is no request", a.Key, a.Value.Emit())
+		}
+	}
+}
+
+// ArmedContext keeps the context it marks: its values, deadline and
+// cancellation.
+func TestArmedContext_MarksWithoutDroppingTheContext(t *testing.T) {
+	type key struct{}
+	base, cancel := context.WithCancel(context.WithValue(context.Background(), key{}, "v"))
+	armed := ArmedContext(base)
+	if !isArmed(armed) || isArmed(base) || isArmed(context.Background()) {
+		t.Fatalf("isArmed: armed=%v base=%v background=%v, want only the marked context armed", isArmed(armed), isArmed(base), isArmed(context.Background()))
+	}
+	if armed.Value(key{}) != "v" {
+		t.Fatal("ArmedContext dropped the context's values")
+	}
+	cancel()
+	if armed.Err() == nil {
+		t.Fatal("ArmedContext dropped the context's cancellation")
 	}
 }
 

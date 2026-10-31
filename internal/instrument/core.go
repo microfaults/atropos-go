@@ -188,10 +188,14 @@ func (c *Core) armFn() armFunc {
 
 // Arm starts d's background fault now, through the interceptor (so the
 // fault span, the injection counter and the registry entry are exactly
-// what a request-triggered start would produce). Failures are logged: a
-// rule set must still apply when one fault cannot start.
+// what a request-triggered start would produce). Its context is marked
+// interceptor.ArmedContext: no request is behind an arm, so a re-arm that
+// meets the running fault (every delivery re-arms) is not counted as a join.
+// Failures are logged: a rule set must still apply when one fault cannot
+// start.
 func (c *Core) Arm(point evaluator.InjectionPoint, d *evaluator.Decision) {
-	if _, err := c.ic.StartFault(context.Background(), evaluator.Request{Point: point, Labels: map[string]string{}}, d); err != nil {
+	ctx := interceptor.ArmedContext(context.Background())
+	if _, err := c.ic.StartFault(ctx, evaluator.Request{Point: point, Labels: map[string]string{}}, d); err != nil {
 		c.logger.Warn("eager arm failed", "fault", d.Name, "error", err)
 	}
 }

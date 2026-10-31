@@ -14,8 +14,14 @@ import (
 	"time"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
 	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
+	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
+
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 func TestNewCore_OfflineHasNoPushAndSharesFidelity(t *testing.T) {
@@ -261,5 +267,68 @@ func TestApply_NetworkIOGoesOutWithNoApplyLockHeld(t *testing.T) {
 	}
 	if len(held) != 0 {
 		t.Fatalf("POSTs that found an apply lock held: %v, want none", held)
+	}
+}
+
+// heldFault is a background fault that runs until it is stopped. It hands
+// each handle it starts to the test.
+type heldFault struct{ started chan *fault.Handle }
+
+func (f heldFault) Validate() error { return nil }
+func (f heldFault) Start(ctx context.Context) (*fault.Handle, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	h := fault.NewHandle(cancel)
+	go func() {
+		<-ctx.Done()
+		h.Send(fault.Result{})
+	}()
+	f.started <- h
+	return h, nil
+}
+
+// Core.Arm marks its start as an arm (interceptor.ArmedContext): no request
+// is behind it. Re-arming the running fault, as every rule delivery does, is
+// not counted as a join; a request that joins the armed fault is, even one
+// that carries no span context.
+func TestCore_ArmIsNoRequest(t *testing.T) {
+	exp := tracetest.NewInMemoryExporter()
+	prev := otel.GetTracerProvider()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp)))
+	t.Cleanup(func() { otel.SetTracerProvider(prev) })
+	c := NewCore(CoreConfig{Service: "svc", Instance: "pod-1", Logger: slog.New(slog.DiscardHandler), EagerArm: true})
+	t.Cleanup(c.Stop)
+
+	f := heldFault{started: make(chan *fault.Handle, 2)}
+	d := &evaluator.Decision{Name: "held", Fault: f, Mode: evaluator.Background, Reason: "test"}
+	c.Arm(evaluator.Ingress, d)
+	c.Arm(evaluator.Ingress, d) // the next delivery re-arms it
+	cr, err := c.Interceptor().StartFault(context.Background(), evaluator.Request{Point: evaluator.Ingress}, d)
+	if err != nil || !cr.Joined || cr.RunID == "" {
+		t.Fatalf("request = %+v %v, want a join on the armed run", cr, err)
+	}
+	h := <-f.started
+	if len(f.started) != 0 {
+		t.Fatal("the re-arm started a second run, want a join on the first")
+	}
+	c.registry.Stop("held")
+	<-h.Done()
+
+	var faultSpans []tracetest.SpanStub
+	for _, s := range exp.GetSpans() {
+		if s.Name == trace.SpanFaultInject {
+			faultSpans = append(faultSpans, s)
+		}
+	}
+	if len(faultSpans) != 1 {
+		t.Fatalf("fault spans = %d, want 1", len(faultSpans))
+	}
+	joined := int64(-1) // absent
+	for _, a := range faultSpans[0].Attributes {
+		if a.Key == trace.AttrFaultJoined {
+			joined = a.Value.AsInt64()
+		}
+	}
+	if joined != 1 {
+		t.Fatalf("%s = %d, want 1: the request joined, the re-arm did not (-1: absent)", trace.AttrFaultJoined, joined)
 	}
 }

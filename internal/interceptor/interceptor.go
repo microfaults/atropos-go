@@ -117,13 +117,34 @@ func (i *Interceptor) Logger() *slog.Logger {
 // reports that the call joined a background run already in progress instead
 // of starting one: Handle is then nil, so no caller waits on a run it did
 // not start, while Decision still describes the fault. A join is reported
-// whatever made it; the run counts it only when a request did (see
-// startRegistered).
+// whatever made it; the run counts it only when a request did -- any call
+// whose context ArmedContext did not mark, with or without a span context
+// (see startRegistered).
 type CheckResult struct {
 	Handle   *fault.Handle
 	Decision *evaluator.Decision
 	RunID    string
 	Joined   bool
+}
+
+// armedKey is the context key ArmedContext sets.
+type armedKey struct{}
+
+// ArmedContext returns ctx marked as an eager arm's: a fault start that no
+// request made (Core.Arm starts a rule's background fault when the rule
+// applies, and re-arms it on every delivery). The interceptor treats a
+// marked call as no request, whatever span context ctx carries: the span is
+// not the run's trigger, it is not stamped with the run id or linked to the
+// fault span, and a join the call makes is not counted. A call without the
+// mark is a request, with or without a span context.
+func ArmedContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, armedKey{}, true)
+}
+
+// isArmed reports whether ArmedContext marked ctx.
+func isArmed(ctx context.Context) bool {
+	armed, _ := ctx.Value(armedKey{}).(bool)
+	return armed
 }
 
 // Evaluate records the request in the interceptor's ring of recent requests
@@ -228,9 +249,11 @@ func faultSpanAttrs(req evaluator.Request, decision *evaluator.Decision, faultTy
 // startDirect is the inline-fault path. It mints the run's id, creates a
 // span (a child of the request's), wires up events, starts the fault, hooks
 // the result callback, and stamps the run id on the request's span once the
-// fault has started.
+// fault has started -- unless the call is an arm (ArmedContext), which has
+// no request span.
 func (i *Interceptor) startDirect(ctx context.Context, req evaluator.Request, decision *evaluator.Decision, faultType string, mode evaluator.Mode) (CheckResult, error) {
 	runID := NewRunID()
+	armed := isArmed(ctx)
 	reqSpan := oteltrace.SpanFromContext(ctx) // before ctx becomes the fault span's
 	ctx, span := i.tracer.Start(ctx, trace.SpanFaultInject, faultSpanAttrs(req, decision, faultType, runID)...)
 	for k, v := range req.Labels {
@@ -247,7 +270,9 @@ func (i *Interceptor) startDirect(ctx context.Context, req evaluator.Request, de
 		span.EndWithError(err)
 		return CheckResult{}, fmt.Errorf("interceptor: fault start failed: %w", err)
 	}
-	reqSpan.SetAttributes(attribute.String(trace.AttrFaultID, runID))
+	if !armed {
+		reqSpan.SetAttributes(attribute.String(trace.AttrFaultID, runID))
+	}
 	if i.onInject != nil {
 		i.onInject(faultType, req.Point.String())
 	}
@@ -269,15 +294,22 @@ func (i *Interceptor) startDirect(ctx context.Context, req evaluator.Request, de
 // request's server span) -- and links the request (trigger) and the
 // requests this interceptor saw before it (recent). Started or joined, the
 // request's span carries the run id; a joiner's span also links the run's
-// fault span, and the run counts the join. A join with no request span
-// (Core.Arm re-arming from context.Background() on every rule delivery) is
-// reported to the caller but not counted: no request made it.
+// fault span, and the run counts the join. A request is any call that
+// ArmedContext did not mark: one without a span context (a gRPC call without
+// otelgrpc) is counted too, it just has no span to stamp or link. An arm
+// (Core.Arm, on every rule delivery) is no request, whatever its context
+// carries: it has no trigger and no request span, and its join is reported
+// to the caller but not counted.
 func (i *Interceptor) startRegistered(ctx, spanParent context.Context, req evaluator.Request, decision *evaluator.Decision, faultType string, mode evaluator.Mode) (CheckResult, error) {
 	key := decision.Name
 	if key == "" {
 		key = faultType
 	}
-	trigger := oteltrace.SpanContextFromContext(ctx)
+	armed := isArmed(ctx)
+	var trigger oteltrace.SpanContext // an arm has none
+	if !armed {
+		trigger = oteltrace.SpanContextFromContext(ctx)
+	}
 
 	run, joined, err := i.registry.StartRun(key, decision.StartPolicy, func(regCtx context.Context, runID string) (*fault.Handle, trace.Span, error) {
 		_, span := i.tracer.StartLinked(spanParent, trace.SpanFaultInject, i.faultLinks(trigger),
@@ -309,9 +341,9 @@ func (i *Interceptor) startRegistered(ctx, spanParent context.Context, req evalu
 	d.Mode = mode
 	if joined {
 		// Only a request joins: an eager re-arm meeting its own running
-		// fault carries no span context and must not inflate
-		// atropos.fault.joined. An unsampled request still counts.
-		if trigger.IsValid() {
+		// fault must not inflate atropos.fault.joined. Every request counts,
+		// sampled, unsampled or without a span context.
+		if !armed {
 			reqSpan.SetAttributes(attribute.String(trace.AttrFaultID, run.ID))
 			if run.Span != nil {
 				if sc := run.Span.SpanContext(); linkable(sc) {
@@ -324,7 +356,9 @@ func (i *Interceptor) startRegistered(ctx, spanParent context.Context, req evalu
 		}
 		return CheckResult{Decision: &d, RunID: run.ID, Joined: true}, nil
 	}
-	reqSpan.SetAttributes(attribute.String(trace.AttrFaultID, run.ID))
+	if !armed {
+		reqSpan.SetAttributes(attribute.String(trace.AttrFaultID, run.ID))
+	}
 	if i.onInject != nil {
 		i.onInject(faultType, req.Point.String())
 	}
@@ -334,10 +368,10 @@ func (i *Interceptor) startRegistered(ctx, spanParent context.Context, req evalu
 // faultLinks are a background fault span's links: the triggering request
 // (kind trigger), then up to ringLinks of the requests this interceptor saw,
 // newest first, without the trigger (kind recent). A trigger that is not
-// linkable is left out: Core.Arm starts from context.Background(), whose
-// invalid span context the SDK would still record as a link because the
-// link carries an attribute, and an unsampled request's trace is never
-// stored.
+// linkable is left out: an arm has none (the zero span context), a request
+// may carry none, and the SDK would still record an invalid span context as
+// a link because the link carries an attribute; an unsampled request's trace
+// is never stored.
 func (i *Interceptor) faultLinks(trigger oteltrace.SpanContext) []oteltrace.Link {
 	recent := i.recent.Links(ringLinks, trigger.SpanID())
 	if !linkable(trigger) {
