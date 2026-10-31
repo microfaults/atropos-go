@@ -100,8 +100,7 @@ func TestRuleSync_WireRoundTripAndApply(t *testing.T) {
 	cb := cachebox.New(cachebox.Config{})
 	defer cb.Stop()
 
-	resp := wire.RegisterResponse{Status: "poll", RuleSync: decoded}
-	if err := apply(resp, applyTargets{Evaluator: eval, DemoEval: demo, CacheBox: cb}); err != nil {
+	if _, err := apply(decoded, applyTargets{Evaluator: eval, DemoEval: demo, CacheBox: cb}, scopeAll); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	if got := len(eval.Rules()); got != 2 {
@@ -113,52 +112,72 @@ func TestRuleSync_WireRoundTripAndApply(t *testing.T) {
 	}
 }
 
-// TestRuleSync_EmptyVsAbsentSemantics pins Apply's reconciliation contract:
-// an empty rules list is "no change", but an empty active_faults list means
-// "clear all manual faults" — which is why wire.RuleSync marshals both fields
-// explicitly instead of omitempty.
+// TestRuleSync_EmptyVsAbsentSemantics pins apply's reconciliation contract at
+// the wire: a null rules or active_faults list means "no change", while an
+// explicit [] is authoritative desired state and clears the category -- which
+// is why wire.RuleSync marshals both fields instead of omitting them. (These
+// bodies carry an etag: one with neither an etag nor rules is the no-document
+// register answer, which applies nothing at all.)
 func TestRuleSync_EmptyVsAbsentSemantics(t *testing.T) {
 	// Arm one slot first.
 	demo := &demoEvaluator{}
-	armed := wire.RegisterResponse{RuleSync: wire.RuleSync{
-		ActiveFaults: []wire.FaultRequest{{
-			ID:        "f1",
-			FaultType: "latency",
-			Params:    json.RawMessage(`{"delay":"100ms"}`),
-		}},
-	}}
-	if err := apply(armed, applyTargets{DemoEval: demo}); err != nil {
+	armed := wire.RuleSync{Version: 7, Etag: "7-a", ActiveFaults: []wire.FaultRequest{{
+		ID:        "f1",
+		FaultType: "latency",
+		Params:    json.RawMessage(`{"delay":"100ms"}`),
+	}}}
+	if _, err := apply(armed, applyTargets{DemoEval: demo}, scopeAll); err != nil {
 		t.Fatalf("arm: %v", err)
 	}
 	if len(demo.Active()) != 1 {
 		t.Fatal("expected one armed slot")
 	}
-
-	// Pre-existing rules must survive an empty rules list.
 	eval := evaluator.NewStaticEvaluator(wire.StaticRule{Name: "keep", Point: evaluator.Ingress})
+	targets := applyTargets{Evaluator: eval, DemoEval: demo}
 
-	// A marshalled empty wire.RuleSync carries explicit empty arrays.
-	raw, _ := json.Marshal(wire.RuleSync{Version: 8})
-	for _, key := range []string{`"rules"`, `"active_faults"`} {
-		if !strings.Contains(string(raw), key) {
-			t.Fatalf("empty wire.RuleSync must still carry %s explicitly: %s", key, raw)
+	// roundTrip marshals s, checks the wire carries keys, and decodes it the
+	// way the poll does.
+	roundTrip := func(s wire.RuleSync, keys ...string) wire.RuleSync {
+		t.Helper()
+		raw, err := json.Marshal(s)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
 		}
-	}
-	var decoded wire.RuleSync
-	if err := json.Unmarshal(raw, &decoded); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+		for _, key := range keys {
+			if !strings.Contains(string(raw), key) {
+				t.Fatalf("wire.RuleSync must carry %s explicitly: %s", key, raw)
+			}
+		}
+		var decoded wire.RuleSync
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		return decoded
 	}
 
-	resp := wire.RegisterResponse{Status: "poll", RuleSync: decoded}
-	if err := apply(resp, applyTargets{Evaluator: eval, DemoEval: demo}); err != nil {
+	// Null lists: no change.
+	absent := roundTrip(wire.RuleSync{Version: 8, Etag: "8-b"}, `"rules":null`, `"active_faults":null`)
+	if _, err := apply(absent, targets, scopeAll); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-
 	if got := eval.Rules(); len(got) != 1 || got[0].Name != "keep" {
-		t.Errorf("empty rules list must be a no-op, got %+v", got)
+		t.Errorf("a null rules list must be a no-op, got %+v", got)
+	}
+	if got := demo.Active(); len(got) != 1 {
+		t.Errorf("a null active_faults list must be a no-op, got %+v", got)
+	}
+
+	// Explicit empty lists: authoritative clears.
+	empty := roundTrip(wire.RuleSync{Version: 9, Etag: "9-c", Rules: []wire.CompiledRule{}, ActiveFaults: []wire.FaultRequest{}},
+		`"rules":[]`, `"active_faults":[]`)
+	if _, err := apply(empty, targets, scopeAll); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if got := eval.Rules(); len(got) != 0 {
+		t.Errorf("an empty rules list must clear the rule set, got %+v", got)
 	}
 	if got := demo.Active(); len(got) != 0 {
-		t.Errorf("empty active_faults must clear manual slots, got %+v", got)
+		t.Errorf("an empty active_faults list must clear manual slots, got %+v", got)
 	}
 }
 

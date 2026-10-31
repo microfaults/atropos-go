@@ -74,6 +74,48 @@ func TestCacheBoxAdminHandler(t *testing.T) {
 		}
 	})
 
+	t.Run("POST /delay with context scopes the delay source", func(t *testing.T) {
+		cb := newCB(t)
+		handler := cacheBoxAdminHandler(cb)
+
+		body := `{"mu":1.0,"sigma":0.5,"seed":42,"context":{"experiment_id":"exp-1","phase_id":"phase-1","key_strategy":"canonical_v2","strategy_version":2}}`
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/cachebox/delay", strings.NewReader(body)))
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("expected 204, got %d: %s", rec.Code, rec.Body.String())
+		}
+
+		rec = httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/admin/cachebox", nil))
+		var got struct {
+			Delay struct {
+				Installed             bool
+				ExperimentID, PhaseID string
+			}
+		}
+		if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+			t.Fatalf("failed to decode stats: %v", err)
+		}
+		if !got.Delay.Installed || got.Delay.ExperimentID != "exp-1" || got.Delay.PhaseID != "phase-1" {
+			t.Fatalf("stats delay = %+v, want installed and scoped to exp-1/phase-1", got.Delay)
+		}
+	})
+
+	t.Run("POST /delay with half a context returns 400 and installs nothing", func(t *testing.T) {
+		cb := newCB(t)
+		handler := cacheBoxAdminHandler(cb)
+
+		body := `{"mu":1.0,"sigma":0.5,"seed":42,"context":{"experiment_id":"exp-1"}}`
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/cachebox/delay", strings.NewReader(body)))
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "context needs both experiment_id and phase_id") {
+			t.Fatalf("expected 400 naming the partial context, got %d: %s", rec.Code, rec.Body.String())
+		}
+		if d := cb.Stats().Delay; d.Installed {
+			t.Fatalf("a rejected freeze must install nothing, got %+v", d)
+		}
+	})
+
 	t.Run("DELETE returns 204 and clears the store", func(t *testing.T) {
 		cb := newCB(t)
 		handler := cacheBoxAdminHandler(cb)

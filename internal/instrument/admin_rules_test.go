@@ -3,6 +3,7 @@ package instrument
 import (
 	"bytes"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -87,29 +88,15 @@ func TestRulesAdminHandler(t *testing.T) {
 		}
 	})
 
-	t.Run("POST with a set that does not apply returns 400 and keeps the current rules", func(t *testing.T) {
-		eval := evaluator.NewStaticEvaluator(wire.StaticRule{Name: "keep", Point: evaluator.Ingress})
-		handler := rulesAdminHandler(applyTargets{Evaluator: eval})
-
-		// Malformed params of a known category make the set unusable: it
-		// fails the whole delivery and replaces nothing. (An unknown category
-		// is not an example: a capability-gated host skips those per rule.)
-		body, err := json.Marshal([]wire.CompiledRule{{
-			Name: "bad", Mode: "inline",
-			Fault: &wire.CompiledFault{Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"notaduration"}`)},
-		}})
-		if err != nil {
-			t.Fatalf("marshal: %v", err)
-		}
+	t.Run("POST without an Evaluator target is a 500", func(t *testing.T) {
+		handler := rulesAdminHandler(applyTargets{}) // a host that cannot hold rules
+		body := `[{"name":"r","injection_point":"egress","mode":"inline"}]`
 
 		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/rules", bytes.NewReader(body)))
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/rules", strings.NewReader(body)))
 
-		if rec.Code != http.StatusBadRequest {
-			t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
-		}
-		if rules := eval.Rules(); len(rules) != 1 || rules[0].Name != "keep" {
-			t.Fatalf("a rejected set must leave the current rules untouched, got %+v", rules)
+		if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "apply rules: ") {
+			t.Fatalf("expected 500 naming the hard error, got %d: %s", rec.Code, rec.Body.String())
 		}
 	})
 
@@ -158,6 +145,66 @@ func TestRulesAdminHandler(t *testing.T) {
 			t.Fatalf("expected 405, got %d: %s", rec.Code, rec.Body.String())
 		}
 	})
+}
+
+// TestRulesAdmin_PostPartialDecodeIs422ButAppliesTheRest: a pushed rule
+// that does not decode is skipped per rule, as a polled one is. The rules
+// that decode replace the set, and the 422 names the ones that did not.
+func TestRulesAdmin_PostPartialDecodeIs422ButAppliesTheRest(t *testing.T) {
+	eval := evaluator.NewStaticEvaluator(wire.StaticRule{Name: "old", Point: evaluator.Ingress})
+	handler := rulesAdminHandler(applyTargets{Evaluator: eval})
+	body, err := json.Marshal([]wire.CompiledRule{
+		{Name: "good", Mode: "inline", Fault: &wire.CompiledFault{
+			Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"10ms"}`)}},
+		{Name: "bad", Mode: "inline", Fault: &wire.CompiledFault{
+			Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"notaduration"}`)}},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/rules", bytes.NewReader(body)))
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil || !strings.Contains(resp.Error, "rule bad: decode:") {
+		t.Fatalf("body = %s (%v), want the skipped rule named", rec.Body.String(), err)
+	}
+	if rules := eval.Rules(); len(rules) != 1 || rules[0].Name != "good" {
+		t.Fatalf("rules = %+v, want only the decodable rule, replacing the old set", rules)
+	}
+}
+
+// TestRulesAdmin_PostTouchesOnlyRules pins the push's scope (Review Focus 5):
+// a rule set pushed to /admin/rules goes through apply, but only its rules
+// branch -- admin fault slots, the delay source and the installed replay set
+// stay exactly as they were.
+func TestRulesAdmin_PostTouchesOnlyRules(t *testing.T) {
+	cb := cachebox.New(cachebox.Config{})
+	t.Cleanup(cb.Stop)
+	cb.InstallReplaySet(cachebox.PhaseKey("exp-1", "phase-1"), map[string]*cachebox.Entry{"k": {Key: "k", StatusCode: 200}})
+	cb.SetDelaySource(cachebox.NewDistributionDelaySource(1, 0.5, 1))
+	demo := &demoEvaluator{}
+	demo.Set(&evaluator.Decision{Name: "admin", Reason: "admin"}, &wire.FaultRequest{ID: "admin"})
+	// A puller too: under any wider scope its Reconcile(nil) would clear the set.
+	p := newReplaySetPuller(replaySetPullerConfig{BaseURL: "http://manteion.invalid", CacheBox: cb, Logger: slog.New(slog.DiscardHandler)})
+	t.Cleanup(p.Close)
+	handler := rulesAdminHandler(applyTargets{Evaluator: evaluator.NewStaticEvaluator(), DemoEval: demo, CacheBox: cb, ReplaySet: p})
+
+	body, _ := json.Marshal([]wire.CompiledRule{{Name: "r", InjectionPoint: "egress", Mode: "inline", CacheBox: &wire.CompiledCacheBox{Mode: "replay", KeyStrategy: "exact"}}})
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/rules", bytes.NewReader(body)))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("code = %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(demo.ActiveIDs()) != 1 || cb.ReplaySetLen() != 1 || !cb.Stats().Delay.Installed {
+		t.Fatalf("rules push must not touch slots/replay set/delay: slots=%v replay=%d delay=%+v", demo.ActiveIDs(), cb.ReplaySetLen(), cb.Stats().Delay)
+	}
 }
 
 // TestRulesAdminHandler_PostObservesDrainTracker pins the single-apply-path

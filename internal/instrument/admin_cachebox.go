@@ -15,7 +15,10 @@ import (
 //
 // Supported routes (matched on method + last path segment):
 //   - GET  /admin/cachebox          → 200 with JSON stats snapshot
-//   - POST /admin/cachebox/delay    → 204; body: {mu, sigma, seed}
+//   - POST /admin/cachebox/delay    → 204; body: {mu, sigma, seed, context?}
+//     (wire.DelayRequest). A context scopes the delay source to its
+//     (experiment_id, phase_id), exactly as freeze_cfg does; 400 when the
+//     body does not validate (applyFreezeCfg)
 //   - DELETE /admin/cachebox        → 204; clears the record-side store and
 //     the installed replay set (freeze-clear/thaw hygiene, ATRO-6)
 //
@@ -62,14 +65,9 @@ func handleCacheBoxDelay(w http.ResponseWriter, r *http.Request, cb *cachebox.Ca
 		jsonError(w, fmt.Sprintf("invalid json: %s", err), http.StatusBadRequest)
 		return
 	}
-	if req.Mu < 0 {
-		jsonError(w, "mu must be >= 0", http.StatusBadRequest)
+	if err := applyFreezeCfg(req, cb); err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if req.Sigma < 0 {
-		jsonError(w, "sigma must be >= 0", http.StatusBadRequest)
-		return
-	}
-	cb.SetDelaySource(cachebox.NewDistributionDelaySource(req.Mu, req.Sigma, req.Seed))
 	w.WriteHeader(http.StatusNoContent)
 }

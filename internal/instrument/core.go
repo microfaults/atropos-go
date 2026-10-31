@@ -3,6 +3,7 @@ package instrument
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
@@ -71,6 +72,11 @@ type Core struct {
 	eagerArm     bool
 	hostName     string
 	capabilities []string
+
+	// applyMu serializes every apply against this core's targets: the
+	// manteion client's and the /admin/rules push's (targets hands both the
+	// same pointer).
+	applyMu sync.Mutex
 }
 
 // NewCore wires the instrument. The construction order is what the
@@ -144,6 +150,8 @@ func (c *Core) Service() string  { return c.service }
 func (c *Core) Instance() string { return c.instance }
 
 // targets is the applyTargets the control plane mutates for this core.
+// Every call carries the core's one apply mutex, so applies through any of
+// them serialize.
 func (c *Core) targets(resolver wire.NetworkResolver) applyTargets {
 	return applyTargets{
 		Evaluator:       c.host,
@@ -154,6 +162,7 @@ func (c *Core) targets(resolver wire.NetworkResolver) applyTargets {
 		Registry:        c.registry,
 		DecodeOpts:      c.decodeOpts,
 		Arm:             c.armFn(),
+		ApplyMu:         &c.applyMu,
 	}
 }
 

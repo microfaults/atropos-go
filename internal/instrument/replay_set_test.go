@@ -504,11 +504,13 @@ func TestReplaySetPuller_RefetchesWhenInstalledSetWasClearedUnderneath(t *testin
 	waitState(t, p, wire.ReplaySetCommitted)
 	first := len(f.requests())
 
-	cb.ClearReplaySet() // thaw via DELETE /admin/cachebox
+	cb.ClearReplaySet()  // thaw via DELETE /admin/cachebox
+	release := f.hold(t) // the refetch stays in flight until its state is read
 	p.Reconcile(ptr(refFor(f, entries)), scope1)
 	if st, _ := p.Status(); st == nil || st.State != wire.ReplaySetFetching {
 		t.Fatalf("state after Reconcile over a cleared set = %+v, want fetching", st)
 	}
+	release()
 	waitState(t, p, wire.ReplaySetCommitted)
 	if cb.ReplaySetLen() != 5 {
 		t.Fatalf("installed %d entries after the refetch, want 5", cb.ReplaySetLen())

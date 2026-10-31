@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -77,7 +78,8 @@ func TestApply_UnsupportedActiveFaultDoesNotWedgeSync(t *testing.T) {
 			{ID: "slot-lat", Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"1ms"}`)},
 		},
 	}}
-	if err := apply(resp, targets); err != nil {
+	report, err := apply(resp.RuleSync, targets, scopeAll)
+	if err != nil {
 		t.Fatalf("apply must not fail on an unsupported category: %v", err)
 	}
 	if ids := demo.ActiveIDs(); len(ids) != 1 || ids[0] != "slot-lat" {
@@ -85,6 +87,11 @@ func TestApply_UnsupportedActiveFaultDoesNotWedgeSync(t *testing.T) {
 	}
 	if got := len(targets.Evaluator.Rules()); got != 2 {
 		t.Fatalf("rules applied = %d, want 2 (resource rule skipped)", got)
+	}
+	// Rules first, then slots; a slot is reported under its id.
+	want := []wire.UnsupportedRule{{Rule: "cpu", Category: "resource"}, {Rule: "slot-cpu", Category: "resource"}}
+	if !reflect.DeepEqual(report.Unsupported, want) || len(report.Errors) != 0 {
+		t.Fatalf("report = %+v, want unsupported %+v and no errors", report, want)
 	}
 }
 

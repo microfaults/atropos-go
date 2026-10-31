@@ -97,7 +97,7 @@ func TestCacheDrainTracker_ObservesPhaseEnd(t *testing.T) {
 	first := wire.RegisterResponse{RuleSync: wire.RuleSync{
 		Rules: []wire.CompiledRule{recordingRule("r1", "exp-1", "phase-1")},
 	}}
-	if err := apply(first, targets); err != nil {
+	if _, err := apply(first.RuleSync, targets, scopeAll); err != nil {
 		t.Fatalf("first apply: %v", err)
 	}
 	if drainCalls != 0 {
@@ -109,7 +109,7 @@ func TestCacheDrainTracker_ObservesPhaseEnd(t *testing.T) {
 	second := wire.RegisterResponse{RuleSync: wire.RuleSync{
 		Rules: []wire.CompiledRule{recordingRule("r2", "exp-9", "phase-9")},
 	}}
-	if err := apply(second, targets); err != nil {
+	if _, err := apply(second.RuleSync, targets, scopeAll); err != nil {
 		t.Fatalf("second apply: %v", err)
 	}
 
@@ -120,10 +120,10 @@ func TestCacheDrainTracker_ObservesPhaseEnd(t *testing.T) {
 		t.Fatalf("expected exactly 1 drain report for the ended phase, got %d", got)
 	}
 
-	// Third poll: an EMPTY rules list means "no change" (wire.RuleSync's
+	// Third poll: a NULL rules list means "no change" (wire.RuleSync's
 	// documented semantics), not "every phase ended" -- must not misfire.
-	empty := wire.RegisterResponse{RuleSync: wire.RuleSync{}}
-	if err := apply(empty, targets); err != nil {
+	empty := wire.RegisterResponse{RuleSync: wire.RuleSync{Version: 3, Etag: "3-c"}}
+	if _, err := apply(empty.RuleSync, targets, scopeAll); err != nil {
 		t.Fatalf("empty apply: %v", err)
 	}
 	mu.Lock()

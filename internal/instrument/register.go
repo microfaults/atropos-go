@@ -9,7 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"strings"
+	"sync"
 	"time"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
@@ -62,21 +62,26 @@ func registerWith(ctx context.Context, hc *http.Client, baseURL string, req wire
 	return resp, nil
 }
 
-// applyTargets names the SDK objects Apply mutates. Nil targets mean "this SDK
-// instance doesn't support that capability"; if the response references that
-// capability, Apply returns an error.
+// applyTargets names the SDK objects apply mutates. A nil target means "this
+// SDK instance doesn't support that capability"; a document that needs a
+// missing one is a hard error (see apply), except the replay-set puller,
+// whose absence is reported per document.
 type applyTargets struct {
-	// Evaluator receives the decoded rule set. Required if resp.Rules is non-empty.
+	// Evaluator receives the decoded rule set. Required if the rules are non-empty.
 	Evaluator *evaluator.StaticEvaluator
-	// DemoEval receives the active faults. Required if resp.ActiveFaults is non-empty.
+	// DemoEval receives the active faults. Required if active_faults is non-empty.
 	DemoEval *demoEvaluator
-	// CacheBox receives the freeze config. Required if resp.FreezeCfg is non-nil.
+	// CacheBox receives the freeze config. Required if freeze_cfg is present.
 	CacheBox *cachebox.CacheBox
+	// ReplaySet converges the cache box's installed replay set on the one the
+	// document names. Nil means no replay-set support: a document naming a
+	// replay set is reported, and an installed set is left alone.
+	ReplaySet *replaySetPuller
 	// NetworkResolver maps logical targets to listen/upstream pairs for network
 	// fault proxies. Without one, rules and active faults with network
 	// host=proxy are skipped per rule and counted.
 	NetworkResolver wire.NetworkResolver
-	// CacheDrain, if set, observes every authoritative rule set applyRules
+	// CacheDrain, if set, observes every authoritative rule set apply
 	// installs -- polled, registered or pushed, and the empty set included
 	// (it is the common drain trigger). It diffs against the
 	// previously-seen active recording phases and fires a flush + W3 drain
@@ -93,6 +98,11 @@ type applyTargets struct {
 	// Arm, when set, starts a decoded background fault as soon as its rule
 	// or slot applies (eager arming, design §3.D1). Nil keeps lazy arming.
 	Arm armFunc
+	// ApplyMu serializes apply calls against these targets. Core.targets
+	// hands every applyTargets it builds the one mutex the core owns, so the
+	// manteion client's applies and the /admin/rules push never interleave.
+	// Nil (targets built by hand) means no locking.
+	ApplyMu *sync.Mutex
 }
 
 // decodeOpts is the option set every decode under these targets uses.
@@ -104,10 +114,41 @@ func (t applyTargets) decodeOpts() []decodeOption {
 	return opts
 }
 
-// apply installs the register response's intent state onto the supplied
-// targets. Each category (rules, active fault, freeze config) is independent.
-// Returns an error if the response carries a category but the corresponding
-// target is nil, or if any component fails to apply.
+// applyScope selects the categories one apply call reconciles; the others
+// stay exactly as they are.
+type applyScope uint8
+
+const (
+	scopeRules applyScope = 1 << iota
+	scopeFaults
+	scopeFreeze
+	scopeReplaySet
+	scopeAll = scopeRules | scopeFaults | scopeFreeze | scopeReplaySet
+)
+
+// applyReport is what one apply could not hold, in the shape the status
+// report carries (spec §2): Unsupported lists the rules and active-fault
+// slots this host cannot execute; Errors the rules that did not decode, the
+// slots that did not build, a freeze config that did not validate and a
+// replay set no puller here can fetch. Both lists are non-nil (empty, not
+// null): an empty list clears manteion's previous report.
+type applyReport struct {
+	Unsupported []wire.UnsupportedRule
+	Errors      []string
+}
+
+// apply reconciles targets with one desired-state document. It is the only
+// place rules, active faults, the freeze config and the replay set are
+// applied: the manteion client calls it for the register answer and every
+// 200 poll, the /admin/rules push for every pushed rule set, so decode,
+// atomic replace, stop-by-name, eager arming and drain observation happen
+// once per delivery whichever way it arrives (design review §5;
+// desired-state protocol §3). Calls are serialized on targets.ApplyMu.
+//
+// scope selects the categories apply touches; the rest stay exactly as they
+// are. The client applies scopeAll. The /admin/rules push applies scopeRules,
+// so a pushed rule set never clears an admin fault slot, the delay source or
+// the installed replay set.
 //
 // Rules contract: a nil slice means 'no change' (absent field -- a legacy
 // manteion, or a payload that doesn't carry rules); a non-nil slice is
@@ -115,30 +156,77 @@ func (t applyTargets) decodeOpts() []decodeOption {
 // makes the poll loop a true reconciler: phase teardown clears rules via
 // a push fanout that can miss instances (deregistered, filtered, down),
 // and an instance that missed it must converge to zero rules on its next
-// poll -- otherwise it keeps replaying/faulting forever.
+// poll -- otherwise it keeps replaying/faulting forever. Active faults
+// follow the same contract: nil is no change, [] clears every slot.
 //
-// Error messages are prefixed by category ("apply rules: ...",
-// "apply active_fault: ...", "apply freeze_cfg: ...") so log grepping
+// Freeze config and replay set: absent means none desired. A document
+// without freeze_cfg clears the delay source; one without replay_set clears
+// the installed set (through the puller). freeze_cfg.context scopes the
+// delay source to its (experiment_id, phase_id); the replay set is installed
+// under the pair replayScope picks.
+//
+// No document: a body with neither an etag nor rules is manteion's degraded
+// register answer -- it could not materialize the desired state. Under
+// scopeAll apply applies nothing at all and returns an empty report: the
+// instance keeps its rules, slots, delay source and replay set.
+//
+// An item this host cannot hold never fails the document: it is reported
+// and the rest still applies. Rules and slots it cannot execute go to
+// Unsupported (and are counted in atropos_rules_unsupported_total); a rule
+// that does not decode ("rule <name>: decode: ..."), a slot that does not
+// build ("active_fault <id>: ..."), a freeze config that does not validate
+// ("freeze_cfg: ...") and a replay set with no puller to fetch it
+// ("replay_set <id>: ...") go to Errors. A rejected slot or freeze config
+// installs nothing: an earlier slot under the same id stays armed but
+// unconfirmed, so the watchdog reaps it; an earlier delay source stays.
+//
+// Hard errors -- a category present with no target to apply it to: rules
+// without an Evaluator, active faults without a DemoEval, a freeze config
+// without a CacheBox -- are returned before anything is applied, so the
+// targets keep what they held. They are prefixed by category ("apply rules:
+// ...", "apply active_faults: ...", "apply freeze_cfg: ...") so log grepping
 // can filter a single bootstrap phase without ambiguity.
-func apply(resp wire.RegisterResponse, targets applyTargets) error {
-	if resp.Rules != nil {
-		if err := applyRules(resp.Rules, targets); err != nil {
-			return fmt.Errorf("apply rules: %w", err)
-		}
+func apply(sync wire.RuleSync, targets applyTargets, scope applyScope) (applyReport, error) {
+	if targets.ApplyMu != nil {
+		targets.ApplyMu.Lock()
+		defer targets.ApplyMu.Unlock()
+	}
+	report := applyReport{Unsupported: []wire.UnsupportedRule{}, Errors: []string{}}
+
+	if scope == scopeAll && sync.Etag == "" && sync.Rules == nil {
+		slog.Default().Warn("desired state: manteion sent no document; keeping the current state")
+		return report, nil
 	}
 
-	if len(resp.ActiveFaults) > 0 {
-		if targets.DemoEval == nil {
-			return fmt.Errorf("apply active_faults: no DemoEval target")
-		}
+	if scope&scopeRules != 0 && len(sync.Rules) > 0 && targets.Evaluator == nil {
+		return report, fmt.Errorf("apply rules: no Evaluator target for %d rules", len(sync.Rules))
+	}
+	if scope&scopeFaults != 0 && len(sync.ActiveFaults) > 0 && targets.DemoEval == nil {
+		return report, errors.New("apply active_faults: no DemoEval target")
+	}
+	if scope&scopeFreeze != 0 && sync.FreezeCfg != nil && targets.CacheBox == nil {
+		return report, errors.New("apply freeze_cfg: no CacheBox target")
 	}
 
-	if targets.DemoEval != nil {
+	if scope&scopeRules != 0 && sync.Rules != nil {
+		if targets.Evaluator != nil {
+			out := decodeRuleSet(sync.Rules, targets.decodeOpts()...)
+			applyRuleSet(targets.Registry, targets.Evaluator, out.Rules, targets.Arm)
+			report.Unsupported = append(report.Unsupported, out.Unsupported...)
+			report.Errors = append(report.Errors, out.Errors...)
+		}
+		// Observe every authoritative rule set, INCLUDING empty: the recording
+		// phase whose rule drops out most often leaves the set empty, and that
+		// transition is exactly what triggers the flush + drain report.
+		targets.CacheDrain.Observe(sync.Rules)
+	}
+
+	if scope&scopeFaults != 0 && sync.ActiveFaults != nil && targets.DemoEval != nil {
 		// Manteion is authoritative: reconciliation drops any locally-armed slot
 		// not present in active_faults. This includes admin-set slots, which is
-		// intentional — see the doc on FaultAdminHandlerWith.
+		// intentional — see the doc on faultAdminHandler.
 		activeIDs := make(map[string]bool)
-		for _, req := range resp.ActiveFaults {
+		for _, req := range sync.ActiveFaults {
 			id := req.ID
 			if id == "" {
 				id = req.EffectiveCategory()
@@ -155,61 +243,82 @@ func apply(resp wire.RegisterResponse, targets applyTargets) error {
 			}
 		}
 
-		// Apply / refresh slots that ARE in the response. Confirm refreshes the
-		// watchdog heartbeat so the slot survives until its server-side lifetime ends.
-		for _, req := range resp.ActiveFaults {
+		// Apply / refresh slots that ARE in the document. Confirm refreshes the
+		// watchdog heartbeat so the slot survives until its server-side lifetime
+		// ends; a slot that cannot be held is reported and never confirmed.
+		for _, req := range sync.ActiveFaults {
 			id := req.ID
 			if id == "" {
 				id = req.EffectiveCategory()
 			}
 			if err := applyActiveFault(req, targets); err != nil {
-				return fmt.Errorf("apply active_faults[%s]: %w", id, err)
+				var unsup *UnsupportedFaultError
+				if errors.As(err, &unsup) {
+					report.Unsupported = append(report.Unsupported, wire.UnsupportedRule{Rule: id, Category: unsup.Category})
+				} else {
+					report.Errors = append(report.Errors, fmt.Sprintf("active_fault %s: %v", id, err))
+				}
+				continue
 			}
 			targets.DemoEval.Confirm(id)
 		}
 	}
 
-	if resp.FreezeCfg != nil {
-		if targets.CacheBox == nil {
-			return fmt.Errorf("apply freeze_cfg: no CacheBox target")
-		}
-		if err := applyFreezeCfg(*resp.FreezeCfg, targets.CacheBox); err != nil {
-			return fmt.Errorf("apply freeze_cfg: %w", err)
+	if scope&scopeFreeze != 0 {
+		switch {
+		case sync.FreezeCfg != nil:
+			if err := applyFreezeCfg(*sync.FreezeCfg, targets.CacheBox); err != nil {
+				report.Errors = append(report.Errors, "freeze_cfg: "+err.Error())
+			}
+		case targets.CacheBox != nil:
+			targets.CacheBox.ClearDelaySource() // none desired
 		}
 	}
 
-	return nil
+	if scope&scopeReplaySet != 0 {
+		if sync.ReplaySet != nil && targets.ReplaySet == nil {
+			report.Errors = append(report.Errors, fmt.Sprintf("replay_set %s: this host has no replay-set puller", sync.ReplaySet.ID))
+		} else {
+			targets.ReplaySet.Reconcile(sync.ReplaySet, replayScope(sync))
+		}
+	}
+
+	return report, nil
 }
 
-// applyRules installs an authoritative (non-nil, possibly empty) compiled
-// rule set: decode with the targets' options, atomic replace with
-// stop-by-name and eager arming (applyRuleSet), then drain observation.
-// It is the only rule-application path -- poll and register call it
-// through apply, the push endpoint directly -- so those side effects
-// happen exactly once per delivery whichever way the set arrives
-// (design review §5; desired-state protocol §3).
-func applyRules(rules []wire.CompiledRule, targets applyTargets) error {
-	if targets.Evaluator == nil && len(rules) > 0 {
-		return fmt.Errorf("no Evaluator target for %d rules", len(rules))
+// replayScope is the (experiment_id, phase_id) pair the document's replay
+// set is installed under. The cache-box serves an installed set only to a
+// replay rule whose context names that pair (replayLookup in
+// internal/interceptor/cachebox.go), so the pair is the set's address. In
+// order: the ref's own pair (spec §2: replay_set names the pair it is
+// installed under), then the context of the first replay or
+// replay_with_delay rule, then freeze_cfg's context. Each counts only with
+// both ids set. With none the zero pair comes back and the puller reports
+// the set failed instead of guessing.
+func replayScope(sync wire.RuleSync) cachebox.PhasePair {
+	if ref := sync.ReplaySet; ref != nil && ref.ExperimentID != "" && ref.PhaseID != "" {
+		return cachebox.PhasePair{ExperimentID: ref.ExperimentID, PhaseID: ref.PhaseID}
 	}
-	if targets.Evaluator != nil {
-		out := decodeRuleSet(rules, targets.decodeOpts()...)
-		if len(out.Errors) > 0 {
-			// A rule that does not decode still fails the delivery and
-			// replaces nothing, until apply() reports it per rule.
-			return errors.New(strings.Join(out.Errors, "; "))
+	for _, r := range sync.Rules {
+		if cb := r.CacheBox; cb != nil && (cb.Mode == "replay" || cb.Mode == "replay_with_delay") {
+			if c := cb.Context; c != nil && c.ExperimentID != "" && c.PhaseID != "" {
+				return cachebox.PhasePair{ExperimentID: c.ExperimentID, PhaseID: c.PhaseID}
+			}
 		}
-		applyRuleSet(targets.Registry, targets.Evaluator, out.Rules, targets.Arm)
 	}
-	// Observe every authoritative rule set, INCLUDING empty: the recording
-	// phase whose rule drops out most often leaves the set empty, and that
-	// transition is exactly what triggers the flush + drain report.
-	targets.CacheDrain.Observe(rules)
-	return nil
+	if fc := sync.FreezeCfg; fc != nil {
+		if c := fc.Context; c != nil && c.ExperimentID != "" && c.PhaseID != "" {
+			return cachebox.PhasePair{ExperimentID: c.ExperimentID, PhaseID: c.PhaseID}
+		}
+	}
+	return cachebox.PhasePair{}
 }
 
 // applyActiveFault builds a Fault from a wire.FaultRequest and installs it on the
-// demoEvaluator. Uses the shared buildFault dispatcher.
+// demoEvaluator. Uses the shared buildFault dispatcher. A fault this host
+// cannot execute is counted and logged here and returned as the
+// *UnsupportedFaultError, for apply to report; nothing is installed for it,
+// nor for a fault that does not build.
 //
 // Decision.Name is the slot id (the same key Set stores under): it becomes
 // the fault registry's key, so ClearSlot(id) can stop the running fault by
@@ -228,7 +337,6 @@ func applyActiveFault(req wire.FaultRequest, targets applyTargets) error {
 			metrics.RulesUnsupportedTotal.WithLabelValues(unsup.Category).Inc()
 			slog.Default().Warn("active fault skipped: not executable by this host",
 				"slot", id, "category", unsup.Category, "fault_type", unsup.FaultType)
-			return nil
 		}
 		return err
 	}
@@ -249,8 +357,12 @@ func applyActiveFault(req wire.FaultRequest, targets applyTargets) error {
 	return nil
 }
 
-// applyFreezeCfg installs a distribution delay source on the CacheBox from a
-// wire.DelayRequest. Mirrors cachebox_admin.go's handleCacheBoxDelay.
+// applyFreezeCfg validates a wire.DelayRequest and installs its distribution
+// delay source on the CacheBox: scoped to the context's (experiment_id,
+// phase_id) when the request carries a context, unscoped otherwise. A
+// context naming only one of the pair is rejected rather than installed
+// unscoped, which would delay every replay. A rejected request installs
+// nothing. Shared by apply (freeze_cfg) and POST /admin/cachebox/delay.
 func applyFreezeCfg(req wire.DelayRequest, cb *cachebox.CacheBox) error {
 	if req.Mu < 0 {
 		return fmt.Errorf("mu must be >= 0, got %f", req.Mu)
@@ -258,7 +370,15 @@ func applyFreezeCfg(req wire.DelayRequest, cb *cachebox.CacheBox) error {
 	if req.Sigma < 0 {
 		return fmt.Errorf("sigma must be >= 0, got %f", req.Sigma)
 	}
-	cb.SetDelaySource(cachebox.NewDistributionDelaySource(req.Mu, req.Sigma, req.Seed))
+	if c := req.Context; c != nil && (c.ExperimentID == "") != (c.PhaseID == "") {
+		return errors.New("context needs both experiment_id and phase_id")
+	}
+	src := cachebox.NewDistributionDelaySource(req.Mu, req.Sigma, req.Seed)
+	if c := req.Context; c != nil {
+		cb.SetScopedDelaySource(src, cachebox.PhasePair{ExperimentID: c.ExperimentID, PhaseID: c.PhaseID})
+		return nil
+	}
+	cb.SetDelaySource(src)
 	return nil
 }
 

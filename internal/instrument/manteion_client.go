@@ -159,7 +159,14 @@ func (c *ManteionClient) register(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return apply(resp, c.targets)
+	report, err := apply(resp.RuleSync, c.targets, scopeAll)
+	if err != nil {
+		return err
+	}
+	for _, e := range report.Errors {
+		c.logger.Warn("register: desired state not fully applied", "error", e)
+	}
+	return nil
 }
 
 // pollLoopWithTrigger runs until ctx is cancelled. It fetches rules every
@@ -256,12 +263,16 @@ func (c *ManteionClient) fetchRules(ctx context.Context) error {
 		}
 
 		// Single application path: apply decodes rules with the configured
-		// wire.NetworkResolver, reconciles active faults, and installs freeze config.
-		// On error we keep stale state — manteion is alive, the issue is data.
-		applyResp := wire.RegisterResponse{Status: "poll", RuleSync: payload}
-		if err := apply(applyResp, c.targets); err != nil {
+		// wire.NetworkResolver, reconciles active faults, the freeze config
+		// and the replay set. On a hard error we keep stale state — manteion
+		// is alive, the issue is data; items it could not hold are reported.
+		report, err := apply(payload, c.targets, scopeAll)
+		if err != nil {
 			c.logger.Error("apply failed, keeping stale state", "error", err)
 			return nil
+		}
+		for _, e := range report.Errors {
+			c.logger.Warn("poll: desired state not fully applied", "error", e)
 		}
 		c.ruleVersion.Store(payload.Version)
 

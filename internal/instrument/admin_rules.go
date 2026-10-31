@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
@@ -12,11 +13,11 @@ import (
 
 // applyRuleSet atomically replaces eval's rules and stops any running
 // background fault whose owning rule dropped out of the set. This is the
-// single rule-application path (poll/register Apply and the push endpoint
-// both funnel here): a background fault must not outlive the rule that
-// started it, and the rule's removal -- however it arrives -- is the stop
-// signal. Replacement happens before the stops so a re-evaluated request
-// cannot restart a fault under the outgoing rule set.
+// single rule-application path (apply's rules branch, which poll, register
+// and the push endpoint all go through): a background fault must not
+// outlive the rule that started it, and the rule's removal -- however it
+// arrives -- is the stop signal. Replacement happens before the stops so a
+// re-evaluated request cannot restart a fault under the outgoing rule set.
 func applyRuleSet(reg *interceptor.FaultRegistry, eval *evaluator.StaticEvaluator, rules []evaluator.StaticRule, arm armFunc) {
 	prev := eval.Rules()
 	eval.SetRules(rules)
@@ -56,16 +57,20 @@ func armDecision(arm armFunc, point evaluator.InjectionPoint, d *evaluator.Decis
 }
 
 // rulesAdminHandler serves runtime rule management on the host evaluator
-// (mounted at /admin/rules). It is the push side of the single rule-apply
-// path: POST goes through applyRules exactly as a polled set does, so
-// decode, atomic replace, stop-by-name, eager arming and drain observation
-// happen once per delivery. The push body carries no version, so the
-// poll's ruleVersion (manteion_client.go, fetchRules) is left untouched.
+// (mounted at /admin/rules). It is the push side of the single apply path:
+// POST goes through apply exactly as a polled document does, scoped to its
+// rules (scopeRules), so decode, atomic replace, stop-by-name, eager arming
+// and drain observation happen once per delivery while admin fault slots,
+// the delay source and the installed replay set stay untouched. The push
+// body carries no version, so the poll's ruleVersion (manteion_client.go,
+// fetchRules) is left untouched.
 //
 // Supported methods:
 //   - GET:  200 + JSON-encoded current rule list (empty array if nil)
-//   - POST: body is []wire.CompiledRule; null clears the set (teardown);
-//     204 on success, 400 on bad JSON or a rule set that does not apply
+//   - POST: body is []wire.CompiledRule; null clears the set (teardown).
+//     204 when every rule applied or was skipped as unsupported; 400 on bad
+//     JSON; 422 when some rules did not decode -- the rest were applied, and
+//     the body names the skipped ones; 500 when this host cannot hold rules
 //   - Other: 405
 //
 // targets.Evaluator is required.
@@ -90,8 +95,13 @@ func rulesAdminHandler(targets applyTargets) http.Handler {
 			if compiled == nil {
 				compiled = []wire.CompiledRule{} // null = authoritative clear
 			}
-			if err := applyRules(compiled, targets); err != nil {
-				jsonError(w, fmt.Sprintf("apply rules: %s", err), http.StatusBadRequest)
+			report, err := apply(wire.RuleSync{Rules: compiled}, targets, scopeRules)
+			if err != nil {
+				jsonError(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if len(report.Errors) > 0 {
+				jsonError(w, strings.Join(report.Errors, "; "), http.StatusUnprocessableEntity)
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
