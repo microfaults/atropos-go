@@ -288,9 +288,10 @@ var pollFloor = time.Second
 // absent or zero, or ahead after a database reset) 304 at once with the
 // generation to adopt, and anything else 200 at once; the next poll goes out
 // as soon as the answer is handled -- at once, or once pollFloor has passed
-// since the last one started. Without a hold the loop polls every pollInterval, the
-// first time one interval after it starts (connectManteion's startup fetch
-// has just run). A trigger (an SSE rules_changed nudge) ends any wait.
+// since the last one started. Without a hold the loop polls every
+// pollInterval, the first time one interval after it starts (connectManteion's
+// startup fetch has just run). A trigger (an SSE rules_changed nudge) ends any
+// wait.
 //
 // Before each poll a status report that did not reach manteion is re-sent
 // (resendStatus), so manteion's convergence barrier never starves on one lost
@@ -410,9 +411,10 @@ func (c *ManteionClient) recoverRegistration(ctx context.Context, source string)
 }
 
 // recoverRegistrations runs the recovery a status report's 404 queued
-// (postStatus), until ctx is cancelled. A wake-up whose recovery is no longer
-// queued -- a report landed since, so manteion knows the instance again, or
-// the poll loop is recovering already -- is dropped.
+// (postStatus), until ctx is cancelled. A wake-up that finds the recovery no
+// longer queued is dropped: a report landed after the 404 that queued it, so
+// manteion knew the instance again, whatever 404 may have come since (the
+// poll loop recovers its own).
 func (c *ManteionClient) recoverRegistrations(ctx context.Context) {
 	for {
 		select {
@@ -447,12 +449,13 @@ func (c *ManteionClient) fetchRules(ctx context.Context) error {
 // timeout outlasts the hold; one without a hold through httpClient.
 //
 // 304: the document is provably unchanged; the generation and ETag manteion
-// confirmed are adopted without applying (unless the 304 is late: an apply,
-// forget or reap ran while the poll was out; see adoptGeneration), and the
-// held slots re-confirmed. 200: the body is the
-// desired state (1 MiB cap); its etag, falling back to the ETag header, is
-// what applyDesired records. Other statuses are errors, for the poll loop's
-// backoff.
+// confirmed are adopted without applying (unless the 304 is late: the record
+// of the document held changed while the poll was out; see adoptGeneration),
+// and the held slots re-confirmed. 200: the body is the desired state (1 MiB
+// cap); its etag, falling back to the ETag header, is what applyDesired
+// records. 404 is errUnknownInstance: manteion no longer knows this instance,
+// and the poll loop recovers the registration. Other statuses are errors, for
+// the poll loop's backoff.
 func (c *ManteionClient) fetchRulesWait(ctx context.Context, wait time.Duration) error {
 	c.syncMu.Lock()
 	gen, etag, seq := c.ruleVersion.Load(), c.etag, c.applySeq
@@ -529,9 +532,9 @@ func (c *ManteionClient) fetchRulesWait(ctx context.Context, wait time.Duration)
 // ETag it was conditional on, and the 304 vouches only for that record. When
 // the record changed while the poll was out -- a register applied a document
 // (a newer generation of the same content keeps the ETag), the record was
-// forgotten, or the watchdog dropped a confirmed slot and cleared the ETag --
-// the 304 is late and adopts nothing: the generation never goes back, and the
-// next poll is conditional on what the instance holds now. Called with
+// forgotten, or the watchdog's reap or an /admin/rules push cleared the ETag
+// -- the 304 is late and adopts nothing: the generation never goes back, and
+// the next poll is conditional on what the instance holds now. Called with
 // applyMu held.
 func (c *ManteionClient) adoptGeneration(h http.Header, sent uint64) {
 	c.syncMu.Lock()
