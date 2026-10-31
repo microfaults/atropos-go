@@ -631,11 +631,13 @@ func TestStartFault_BackgroundSpanLinksTriggerAndRecent(t *testing.T) {
 	}
 }
 
+// The fault runs until reg.Stop, so the second request meets it running
+// however long the first one took.
 func TestStartFault_JoinLinksRequestToFaultSpan(t *testing.T) {
 	exp := installRecordingProvider(t)
 	reg := NewFaultRegistry()
 	defer reg.Close()
-	i := New(&mockEvaluator{decision: backgroundDecision("bg")}, trace.NewOTelTracer(), WithRegistry(reg))
+	i := New(&mockEvaluator{decision: heldDecision("bg")}, trace.NewOTelTracer(), WithRegistry(reg))
 	tr := otel.Tracer("test")
 
 	ctx1, s1 := tr.Start(context.Background(), "first")
@@ -650,6 +652,7 @@ func TestStartFault_JoinLinksRequestToFaultSpan(t *testing.T) {
 		t.Fatalf("second: %+v %v (first run %s)", second, err, first.RunID)
 	}
 	s2.End()
+	reg.Stop("bg")
 	<-first.Handle.Done()
 
 	spans := exp.GetSpans()
