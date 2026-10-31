@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -29,6 +30,21 @@ const (
 	manteionConnected                          // poll succeeding normally
 	manteionDegraded                           // recent poll failures; using stale rules
 )
+
+// recoveryState is where the client stands on recovering a registration
+// manteion has lost (a poll or a status report answered 404).
+type recoveryState int
+
+const (
+	recoveryNone   recoveryState = iota // no recovery: manteion knows the instance, as far as the client can tell
+	recoveryQueued                      // a status report's 404 claimed it; recoverRegistrations has not started it yet
+	recoveryActive                      // a re-register is under way or done, and no status report has landed since
+)
+
+// errUnknownInstance is a poll answered 404: manteion no longer knows this
+// instance (its registration was lost), so the poll loop takes the recovery
+// path (recoverRegistration).
+var errUnknownInstance = errors.New("manteion does not know this instance (404)")
 
 // ManteionClient manages the lifecycle of the SDK's connection to manteion:
 // startup polling, registration, desired-state sync with its status report,
@@ -57,7 +73,8 @@ type ManteionClient struct {
 	// etag and the atropos_sync_generation gauge, all three written under
 	// syncMu: applyDesired sets them after a successful apply,
 	// adoptGeneration after a 304 that is not late, and forgetDocument zeroes
-	// them when the poll loop recovers from failed polls. The one write of
+	// them when the poll loop recovers from failed polls and when manteion
+	// has lost the registration (recoverRegistration). The one write of
 	// etag alone is reapSlots clearing it when the watchdog drops a slot the
 	// last apply confirmed: the next poll is then unconditional, while the
 	// generation stays the one held.
@@ -77,11 +94,16 @@ type ManteionClient struct {
 	// by applyMu.
 	confirmed []string
 
-	// syncMu guards what the status report snapshots.
+	// syncMu guards what the status report snapshots, and the recovery state.
 	syncMu        sync.Mutex
 	etag          string      // ETag of the document held, sent as If-None-Match; "" = none (writers: see ruleVersion)
 	lastReport    applyReport // what the last apply could not hold
 	statusPending bool        // the last status report failed; retryStatus re-sends it, and so does the poll loop before its next poll
+	// recovery is the recovery of a lost registration (claimRecovery). It
+	// stays active from the re-register until a status report lands, so a
+	// manteion that goes on answering 404 is registered with once per loss,
+	// not in a loop.
+	recovery recoveryState
 
 	statusMu sync.Mutex // serializes sending: reports go out one at a time, in order
 	// statusRetry wakes retryStatus once a status report has failed (capacity
@@ -89,6 +111,10 @@ type ManteionClient struct {
 	// built by connectManteion, which has no retry: the poll loop's resend
 	// is its only one.
 	statusRetry chan struct{}
+	// recoverWake wakes recoverRegistrations once a status report's 404 has
+	// queued the recovery of the registration (capacity 1). Nil in a client
+	// not built by connectManteion, which has no recovery goroutine.
+	recoverWake chan struct{}
 
 	// puller converges the cache box's replay set; nil when this host has no
 	// cache box (no replay-set support). Closed by Close.
@@ -250,6 +276,12 @@ var pollFloor = time.Second
 // forgets the document held (forgetDocument) and only then re-registers:
 // manteion may have restarted or moved on meanwhile, so the next poll is a
 // full pull. A poll cut short by ctx is not a failure.
+//
+// A poll answered 404 means manteion no longer knows this instance: the loop
+// takes the recovery path at once (recoverRegistration: forget the document
+// held, register again, apply the answer) and resumes polling without a
+// failure's backoff. Once per loss: a 404 while an earlier recovery's report
+// has not landed is an ordinary failed poll (claimRecovery).
 func (c *ManteionClient) pollLoopWithTrigger(ctx context.Context, trigger <-chan struct{}) {
 	var delay time.Duration // with a hold, straight into the held poll
 	if c.cfg.pollWait == 0 {
@@ -267,7 +299,16 @@ func (c *ManteionClient) pollLoopWithTrigger(ctx context.Context, trigger <-chan
 		}
 		c.resendStatus(ctx)
 		start := time.Now()
-		if err := c.fetchRules(ctx); err != nil {
+		err := c.fetchRules(ctx)
+		if errors.Is(err, errUnknownInstance) && c.claimRecovery(recoveryActive) {
+			if err = c.recoverRegistration(ctx, "poll"); err == nil {
+				consecutiveFailures = 0
+				c.status.Store(int32(manteionConnected))
+				delay = c.nextPollDelay(start)
+				continue
+			}
+		}
+		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
@@ -293,10 +334,71 @@ func (c *ManteionClient) pollLoopWithTrigger(ctx context.Context, trigger <-chan
 		}
 		c.lastPollAt.Store(time.Now().UnixNano())
 		c.status.Store(int32(manteionConnected))
-		if c.cfg.pollWait > 0 {
-			delay = max(0, pollFloor-time.Since(start))
-		} else {
-			delay = c.cfg.pollInterval
+		delay = c.nextPollDelay(start)
+	}
+}
+
+// nextPollDelay is the wait before the poll after one that started at start
+// and was answered: with a hold, none once pollFloor has passed since start;
+// without one, a pollInterval.
+func (c *ManteionClient) nextPollDelay(start time.Time) time.Duration {
+	if c.cfg.pollWait > 0 {
+		return max(0, pollFloor-time.Since(start))
+	}
+	return c.cfg.pollInterval
+}
+
+// claimRecovery claims the recovery of a registration manteion has lost, as
+// next (recoveryQueued for a status report's 404, which recoverRegistrations
+// takes up; recoveryActive for the poll loop, which recovers at once). It
+// reports false while another recovery is queued or active: one recovery per
+// loss, until a status report lands (postStatus) or the re-register fails.
+func (c *ManteionClient) claimRecovery(next recoveryState) bool {
+	c.syncMu.Lock()
+	defer c.syncMu.Unlock()
+	if c.recovery != recoveryNone {
+		return false
+	}
+	c.recovery = next
+	return true
+}
+
+// recoverRegistration is the recovery path for a registration manteion has
+// lost: forget the document held (forgetDocument), then register again,
+// applying the answer in full and reporting it (register, applyDesired). A
+// register that fails releases the claim, so a later 404 tries again.
+func (c *ManteionClient) recoverRegistration(ctx context.Context, source string) error {
+	c.logger.Warn("manteion does not know this instance; registering again", "source", source)
+	c.forgetDocument()
+	if err := c.register(ctx); err != nil {
+		c.syncMu.Lock()
+		c.recovery = recoveryNone
+		c.syncMu.Unlock()
+		c.logger.Warn("re-register failed", "source", source, "error", err)
+		return err
+	}
+	return nil
+}
+
+// recoverRegistrations runs the recovery a status report's 404 queued
+// (postStatus), until ctx is cancelled. A wake-up whose recovery is no longer
+// queued -- a report landed since, so manteion knows the instance again, or
+// the poll loop is recovering already -- is dropped.
+func (c *ManteionClient) recoverRegistrations(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.recoverWake:
+		}
+		c.syncMu.Lock()
+		queued := c.recovery == recoveryQueued
+		if queued {
+			c.recovery = recoveryActive
+		}
+		c.syncMu.Unlock()
+		if queued {
+			_ = c.recoverRegistration(ctx, "status report")
 		}
 	}
 }
@@ -378,6 +480,10 @@ func (c *ManteionClient) fetchRulesWait(ctx context.Context, wait time.Duration)
 
 	case http.StatusServiceUnavailable:
 		return fmt.Errorf("manteion not ready (503)")
+
+	case http.StatusNotFound:
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("%w: %s", errUnknownInstance, body)
 
 	default:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
@@ -593,8 +699,12 @@ func (c *ManteionClient) buildStatus() wire.StatusReport {
 // transport error or another status logs a warning, sets it and wakes
 // retryStatus, which re-sends after a short backoff, as the poll loop does
 // before its next poll -- manteion's convergence barrier must not starve on
-// one lost report. Serialized on statusMu: reports go out one at a time, each
-// built when it is sent, so the last one manteion receives is the newest.
+// one lost report. A 404 means manteion no longer knows this instance: the
+// report stays pending, and the recovery of the registration is queued for
+// recoverRegistrations (claimRecovery), whose register sends a fresh report.
+// A 2xx also ends a recovery: manteion knows the instance again. Serialized on
+// statusMu: reports go out one at a time, each built when it is sent, so the
+// last one manteion receives is the newest.
 func (c *ManteionClient) sendStatus(ctx context.Context) {
 	c.statusMu.Lock()
 	defer c.statusMu.Unlock()
@@ -640,12 +750,23 @@ func (c *ManteionClient) postStatus(ctx context.Context) {
 	}
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 	resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		c.statusFailed("status report rejected: manteion does not know this instance", fmt.Errorf("status %d", resp.StatusCode))
+		if c.claimRecovery(recoveryQueued) {
+			select {
+			case c.recoverWake <- struct{}{}:
+			default:
+			}
+		}
+		return
+	}
 	if resp.StatusCode/100 != 2 {
 		c.statusFailed("status report rejected", fmt.Errorf("status %d", resp.StatusCode))
 		return
 	}
 	c.syncMu.Lock()
 	c.statusPending = false
+	c.recovery = recoveryNone // manteion knows this instance
 	c.syncMu.Unlock()
 }
 

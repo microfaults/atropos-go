@@ -162,6 +162,12 @@ sync loop, the status report and the replay-set pull are internal to `Serve`
   and whenever the replay-set state changes. A report that fails to send is
   re-sent before the next poll and by its own retry (2 s, doubling up to the
   poll wait).
+- **Registration lost.** A status report or a poll answered `404` means manteion
+  no longer knows the instance (a database reset, an instance-id collision):
+  the instance drops the generation and ETag it holds and registers again,
+  applying the answer, then resumes polling. Once per loss: until a report
+  lands again, a further `404` does not register again (the report stays
+  pending for its retry; a poll counts as failed).
 - **Replay set.** A `replay_set` whose `id` differs from the committed one is
   pulled by the instance itself (`GET /api/v1/cache/artifacts/{id}` in `Range`
   chunks of at most 4 MiB, staged through the preload path, committed when the

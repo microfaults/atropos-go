@@ -19,6 +19,7 @@ The in-process host (`Serve`) and the atroposd sidecar converge on manteion's ma
 - **Metrics.** `atropos_sync_generation` (the generation held) and `atropos_replay_set_state{state}` (the pull state; all zero when no replay set is desired).
 - **Liveness cadence.** Registration advertises `poll_interval_ms = max(poll interval, hold)` (30 s with the defaults: a 10 s interval, a 30 s hold), and the fault watchdog's grace is `max(3 * max(poll interval, hold), 30s)` (90 s by default).
 - **No-document register.** A register answer with neither an `etag` nor `rules` (manteion could not materialize the desired state) is ignored: the instance keeps its rules, slots, delay source and replay set and keeps polling.
+- **Registration lost.** A status report or a poll answered `404` (manteion no longer knows the instance: a database reset, an instance-id collision) makes the instance drop the generation and ETag it holds and register again at once, applying the answer, instead of re-sending the report forever. Once per loss: until a report lands again, a further `404` does not register again.
 
 ### Added — Route publication for the workflow-builder catalog
 

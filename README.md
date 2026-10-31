@@ -422,9 +422,13 @@ it:
   failed poll keeps the stale state and backs off (60 s at most); the sixth
   consecutive failure re-registers once, and the first poll that succeeds after
   failures drops the held generation and ETag and re-registers, so the instance
-  re-converges on a full document through the register answer. The SSE
-  `rules_changed` nudge (`GET /api/v1/sdk/events`) is kept and ends any wait
-  between polls early.
+  re-converges on a full document through the register answer. A poll or status
+  report answered `404` means manteion no longer knows the instance (its
+  database was reset, or another pod deregistered the same id): the instance
+  drops the held generation and ETag and registers again at once, applying the
+  answer; once per loss, so while the report after that re-register has not
+  landed a further `404` does not register again. The SSE `rules_changed` nudge
+  (`GET /api/v1/sdk/events`) is kept and ends any wait between polls early.
 - **Watchdog.** A fault slot that stays unconfirmed for
   `max(3·max(interval, hold), 30 s)` is dropped: 90 s by default. A `200` that
   names the slot, or a `304` for a document that did, re-confirms it; an

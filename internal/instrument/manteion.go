@@ -18,8 +18,8 @@ import (
 // Blocks until manteion is ready, registers the instance, fetches initial
 // rules without a long-poll hold, configures the evaluator, and starts the
 // background poll loop (long-polling when cfg.pollWait > 0), the status
-// report retry, the SSE listener and, with a DemoEval target, the fault-slot
-// watchdog.
+// report retry, the recovery of a registration manteion loses, the SSE
+// listener and, with a DemoEval target, the fault-slot watchdog.
 //
 // Returns (nil, nil) if cfg.url is empty (offline mode — tracing-only). All
 // methods on *ManteionClient are nil-receiver safe, so callers can
@@ -73,8 +73,10 @@ func connectManteion(ctx context.Context, cfg manteionConfig) (*ManteionClient, 
 		targets:    cfg.targets,
 		logger:     cfg.logger,
 		// Before register: a report that fails before retryStatus starts
-		// leaves its wake-up queued here.
+		// leaves its wake-up queued here, and one answered 404 before
+		// recoverRegistrations starts leaves its recovery queued.
 		statusRetry: make(chan struct{}, 1),
+		recoverWake: make(chan struct{}, 1),
 	}
 	if cfg.pollWait > 0 {
 		// A held poll outlives httpClient's timeout: manteion answers it
@@ -134,6 +136,7 @@ func connectManteion(ctx context.Context, cfg manteionConfig) (*ManteionClient, 
 
 	c.wg.Go(func() { c.pollLoopWithTrigger(pollCtx, triggerPoll) })
 	c.wg.Go(func() { c.retryStatus(pollCtx) })
+	c.wg.Go(func() { c.recoverRegistrations(pollCtx) })
 	c.wg.Go(func() {
 		c.listenSSE(pollCtx, func() {
 			select {
@@ -266,8 +269,8 @@ type ConnectConfig struct {
 
 // ConnectManteion connects a host's core to the control plane: waits for
 // readiness, registers, fetches initial rules, and starts the poll, status
-// retry, SSE and watchdog goroutines. Returns (nil, nil) when URL is empty
-// (offline).
+// retry, registration recovery, SSE and watchdog goroutines. Returns (nil,
+// nil) when URL is empty (offline).
 func ConnectManteion(ctx context.Context, c ConnectConfig) (*ManteionClient, error) {
 	cfg := defaultManteionConfig(c.Core.service)
 	cfg.url = c.URL

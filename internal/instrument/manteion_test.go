@@ -501,7 +501,8 @@ type fakeManteion struct {
 	statusAt   []time.Time                                  // arrival time of each status report
 	statusCode int                                          // response to POST /api/v1/sdk/status; 0 = 204
 	failStatus int                                          // the next failStatus reports are answered 500 whatever statusCode says
-	register   string                                       // 201 body; default `{"status":"registered","version":0,"rules":[],"active_faults":[]}`
+	lost       bool                                         // manteion lost the registration: reports are answered 404 until the instance registers again
+	register   string                                       // 201 body; default `{"status":"registered","version":0,"rules":[],"active_faults":[]}`; read under mu
 	rules      func(w http.ResponseWriter, r *http.Request) // answers GET /api/v1/sdk/rules; read and written under mu (setRules)
 }
 
@@ -523,9 +524,11 @@ func newFakeManteion(t *testing.T) *fakeManteion {
 			_ = json.NewDecoder(r.Body).Decode(&reg)
 			f.mu.Lock()
 			f.registers = append(f.registers, reg)
+			f.lost = false
+			body := f.register
 			f.mu.Unlock()
 			w.WriteHeader(http.StatusCreated)
-			io.WriteString(w, f.register)
+			io.WriteString(w, body)
 		case strings.HasPrefix(r.URL.Path, "/api/v1/sdk/register/") && r.Method == http.MethodDelete:
 			w.WriteHeader(http.StatusOK)
 		case r.URL.Path == "/api/v1/sdk/rules":
@@ -547,6 +550,9 @@ func newFakeManteion(t *testing.T) *fakeManteion {
 			if f.failStatus > 0 {
 				f.failStatus--
 				code = http.StatusInternalServerError
+			}
+			if f.lost {
+				code = http.StatusNotFound // manteion's "instance not found"
 			}
 			f.mu.Unlock()
 			if code == 0 {
@@ -616,6 +622,16 @@ func (f *fakeManteion) registered() []wire.RegisterRequest {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]wire.RegisterRequest(nil), f.registers...)
+}
+
+// registerAnswer is a register body answering with doc.
+func registerAnswer(t *testing.T, doc wire.RuleSync) string {
+	t.Helper()
+	b, err := json.Marshal(wire.RegisterResponse{Status: "registered", RuleSync: doc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }
 
 func respond304(gen, etag string) func(http.ResponseWriter, *http.Request) {
@@ -1700,6 +1716,158 @@ func TestConnectManteion_TheLoopsFirstFailureIsTheLastWord(t *testing.T) {
 			t.Fatalf("status = %v after the loop's first poll failed, want degraded", c.Status())
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// ---------- registration lost ----------
+
+// TestConnectManteion_Status404ReRegistersOnce: a status report answered 404
+// means manteion no longer knows this instance (a database reset, or another
+// pod's deregister under the same id). The client takes the recovery path
+// once -- it forgets the document held and registers again, applying the
+// answer -- and the report that follows lands: exactly one extra register,
+// then a delivered report with the new document's generation.
+func TestConnectManteion_Status404ReRegistersOnce(t *testing.T) {
+	doc1 := wire.RuleSync{Version: 1, Etag: "1-a", Rules: []wire.CompiledRule{}, ActiveFaults: []wire.FaultRequest{}}
+	doc2 := wire.RuleSync{Version: 2, Etag: "2-b", Rules: threeRules()[:1], ActiveFaults: []wire.FaultRequest{}}
+	f := newFakeManteion(t)
+	f.register = registerAnswer(t, doc1)
+	f.setRules(newHoldingRules(doc1).serve)
+	eval := newTestEvaluator()
+	c, err := connectManteion(t.Context(), manteionConfig{
+		url: f.srv.URL, serviceName: "svc", instanceID: "pod-1",
+		initTimeout: 5 * time.Second, pollInterval: 10 * time.Second, pollWait: 30 * time.Second,
+		targets:    applyTargets{Evaluator: eval},
+		httpClient: &http.Client{Timeout: 5 * time.Second},
+		logger:     slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+	f.waitStatuses(t, 1) // the register's report, delivered
+
+	// manteion loses the registration and moves on: reports are answered 404
+	// until the instance registers again, which now answers generation 2.
+	f.mu.Lock()
+	f.lost = true
+	f.register = registerAnswer(t, doc2)
+	f.mu.Unlock()
+	c.sendStatus(t.Context()) // the next report: an apply's, a replay-set transition's
+
+	f.waitStatuses(t, 3)
+	time.Sleep(200 * time.Millisecond) // nothing else may register meanwhile
+	if n := len(f.registered()); n != 2 {
+		t.Fatalf("registers = %d, want 2: the first and exactly one after the 404", n)
+	}
+	_, statuses := f.snapshot()
+	if len(statuses) != 3 || statuses[1].AppliedGeneration != 1 || statuses[2].AppliedGeneration != 2 || statuses[2].Etag != "2-b" {
+		t.Fatalf("status reports = %+v, want generation 1 delivered, generation 1 answered 404, then generation 2 delivered", statuses)
+	}
+	if c.statusIsPending() || c.ruleVersion.Load() != 2 || len(eval.Rules()) != 1 {
+		t.Fatalf("pending=%v gen=%d rules=%d, want the register's document applied and its report delivered",
+			c.statusIsPending(), c.ruleVersion.Load(), len(eval.Rules()))
+	}
+}
+
+// TestConnectManteion_Persistent404ReRegistersOnlyOnce: when reports keep
+// being answered 404 after the re-register too, the client registers again
+// only once. The report stays pending and its retry keeps re-sending it, but
+// no further register goes out until a report lands.
+func TestConnectManteion_Persistent404ReRegistersOnlyOnce(t *testing.T) {
+	statusRetryBase = 20 * time.Millisecond
+	t.Cleanup(func() { statusRetryBase = 2 * time.Second })
+	doc := wire.RuleSync{Version: 1, Etag: "1-a", Rules: []wire.CompiledRule{}, ActiveFaults: []wire.FaultRequest{}}
+	f := newFakeManteion(t)
+	f.statusCode = http.StatusNotFound // every report, before and after any register
+	f.register = registerAnswer(t, doc)
+	f.setRules(newHoldingRules(doc).serve)
+	c, err := connectManteion(t.Context(), manteionConfig{
+		url: f.srv.URL, serviceName: "svc", instanceID: "pod-1",
+		initTimeout: 5 * time.Second, pollInterval: 10 * time.Second, pollWait: 30 * time.Second,
+		targets:    applyTargets{Evaluator: newTestEvaluator()},
+		httpClient: &http.Client{Timeout: 5 * time.Second},
+		logger:     slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+
+	// The register's report is answered 404 and the client registers again;
+	// its report and the retry's re-sends of it (20, 40, 80 ms apart) are
+	// answered 404 too.
+	waitFor(t, 5*time.Second, func() bool { return len(f.registered()) >= 2 })
+	_, statuses := f.snapshot()
+	f.waitStatuses(t, len(statuses)+3)
+	if n := len(f.registered()); n != 2 {
+		t.Fatalf("registers = %d, want 2: one recovery per lost registration, however many 404s follow", n)
+	}
+	if !c.statusIsPending() {
+		t.Fatal("a report answered 404 must stay pending for its retry")
+	}
+}
+
+// TestPollLoop_404ReRegistersOnceAndResumes: a poll answered 404 (manteion no
+// longer knows this instance) takes the recovery path at once -- the
+// document held is forgotten and the instance registers again, applying the
+// answer -- and polling resumes, conditional on that document and without a
+// failure's backoff. While the recovery's report has not landed, another 404
+// is a failed poll and does not register again.
+func TestPollLoop_404ReRegistersOnceAndResumes(t *testing.T) {
+	doc1 := wire.RuleSync{Version: 1, Etag: "1-a", Rules: []wire.CompiledRule{}, ActiveFaults: []wire.FaultRequest{}}
+	doc2 := wire.RuleSync{Version: 2, Etag: "2-b", Rules: []wire.CompiledRule{}, ActiveFaults: []wire.FaultRequest{}}
+	f := newFakeManteion(t)
+	f.register = registerAnswer(t, doc1)
+	c := f.client(applyTargets{Evaluator: newTestEvaluator()}) // pollWait 0, pollInterval 10s: the trigger drives every poll
+	if err := c.register(t.Context()); err != nil {            // the instance holds generation 1
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.register = registerAnswer(t, doc2)
+	f.mu.Unlock()
+	var lost atomic.Bool
+	lost.Store(true)
+	f.setRules(func(w http.ResponseWriter, r *http.Request) {
+		if lost.Load() {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		respond304("2", "2-b")(w, r)
+	})
+	trigger := make(chan struct{}, 1)
+	startLoop(t, c, trigger)
+
+	trigger <- struct{}{}
+	f.waitStatuses(t, 2) // the recovery's report
+	lost.Store(false)
+	trigger <- struct{}{}
+	polls := f.waitPolls(t, 2)
+	if got := polls[1]; got != (pollSeen{Version: "2", IfNoneMatch: `"2-b"`}) {
+		t.Fatalf("poll after the recovery = %+v, want one conditional on the register's 2-b", got)
+	}
+	if n := len(f.registered()); n != 2 || c.Status() != manteionConnected {
+		t.Fatalf("registers=%d status=%v, want one re-register and the loop connected", n, c.Status())
+	}
+
+	// Lost again, and this time the recovery's report is refused too: the
+	// next 404 registers once more, the one after it is a failed poll.
+	f.mu.Lock()
+	f.statusCode = http.StatusNotFound
+	f.mu.Unlock()
+	lost.Store(true)
+	trigger <- struct{}{}
+	f.waitStatuses(t, 3) // the recovery's report, refused
+	trigger <- struct{}{}
+	f.waitPolls(t, 4)
+	for deadline := time.Now().Add(5 * time.Second); c.Status() != manteionDegraded; {
+		if time.Now().After(deadline) {
+			t.Fatalf("status = %v, want degraded: a second 404 before a report lands is a failed poll", c.Status())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := len(f.registered()); n != 3 {
+		t.Fatalf("registers = %d, want 3: the second 404 of one loss must not register again", n)
 	}
 }
 
