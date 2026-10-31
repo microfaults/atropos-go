@@ -29,6 +29,8 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 
+	"go.opentelemetry.io/otel"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 )
 
@@ -252,6 +254,55 @@ func TestRun_RejectsBadConfig(t *testing.T) {
 	err := Run(context.Background(), Config{Service: "", Capture: "explicit"}, slog.New(slog.DiscardHandler))
 	if err == nil || !strings.Contains(err.Error(), "service is required") {
 		t.Fatalf("got %v", err)
+	}
+}
+
+// With no BYO provider Run builds the SDK provider itself; its resource tells
+// a backend the spans come from the sidecar.
+func TestRun_ResourceNamesTheSidecarHost(t *testing.T) {
+	for _, key := range []string{"MANTEION_URL", "MANTEION_ADVERTISE_ADDR", "COLLECTOR_SERVICE_ADDR", "OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_PROTOCOL"} {
+		t.Setenv(key, "") // hermetic: no control plane, nothing for the exporter shim to map
+	}
+	t.Setenv("OTEL_TRACES_EXPORTER", "none")
+	t.Setenv("OTEL_LOGS_EXPORTER", "none")
+	t.Setenv("OTEL_TRACES_SAMPLER", "always_on")
+
+	ready := make(chan Addrs, 1)
+	stopped := make(chan struct{})
+	var runErr error
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		defer close(stopped)
+		runErr = Run(ctx, Config{
+			Service: "svc", ControlListen: "127.0.0.1:0",
+			Egress:  []EgressRoute{{Listen: "127.0.0.1:0", Upstream: "dep:80"}},
+			OnReady: func(a Addrs) { ready <- a },
+		}, slog.New(slog.DiscardHandler))
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-stopped:
+		case <-time.After(15 * time.Second):
+			t.Error("Run did not return after cancel")
+		}
+	})
+	select {
+	case <-ready:
+	case <-stopped:
+		t.Fatalf("Run exited before ready: %v", runErr)
+	case <-time.After(10 * time.Second):
+		t.Fatal("daemon not ready in time")
+	}
+
+	_, span := otel.Tracer("daemon-test").Start(context.Background(), "probe")
+	defer span.End()
+	ro, ok := span.(sdktrace.ReadOnlySpan)
+	if !ok {
+		t.Fatalf("span %T is not an SDK span", span)
+	}
+	if v, ok := ro.Resource().Set().Value("atropos.host"); !ok || v.AsString() != "sidecar" {
+		t.Fatalf("atropos.host = %v (present=%v), want sidecar", v, ok)
 	}
 }
 

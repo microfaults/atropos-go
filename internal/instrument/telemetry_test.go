@@ -7,10 +7,13 @@ import (
 
 	"go.opentelemetry.io/contrib/exporters/autoexport"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
 	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 // pinExporterEnv blanks the variables the exporter-env shim reads, so a test
@@ -25,6 +28,18 @@ func pinExporterEnv(t *testing.T) {
 		"OTEL_EXPORTER_OTLP_PROTOCOL",
 	} {
 		t.Setenv(key, "")
+	}
+}
+
+// unsetEnv removes key for the rest of the test. t.Setenv alone can only give a
+// variable a value, and the SDK reads a set-but-empty OTEL_TRACES_SAMPLER as an
+// unsupported sampler rather than as none; t.Setenv's cleanup restores the
+// original.
+func unsetEnv(t *testing.T, key string) {
+	t.Helper()
+	t.Setenv(key, "")
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -283,5 +298,177 @@ func TestInitTelemetry_NoBYO_UsesEnvExporter(t *testing.T) {
 	defer shutdown(context.Background())
 	if _, ok := otel.GetTracerProvider().(*sdktrace.TracerProvider); !ok {
 		t.Fatalf("global provider = %T, want *sdktrace.TracerProvider", otel.GetTracerProvider())
+	}
+}
+
+func TestInstanceIdentity(t *testing.T) {
+	env := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
+	if id, pod := instanceIdentity(env(map[string]string{"ATROPOS_POD_NAME": "pod-7", "HOSTNAME": "host-1"})); id != "pod-7" || pod != "pod-7" {
+		t.Fatalf("got %q/%q, want pod-7/pod-7", id, pod)
+	}
+	if id, pod := instanceIdentity(env(map[string]string{"HOSTNAME": "host-1"})); id != "host-1" || pod != "host-1" {
+		t.Fatalf("got %q/%q, want host-1/host-1", id, pod)
+	}
+	host, _ := os.Hostname()
+	if id, pod := instanceIdentity(env(map[string]string{})); id != host || pod != "" {
+		t.Fatalf("got %q/%q, want %q/\"\"", id, pod, host)
+	}
+}
+
+// A blank variable is unset, and whitespace around a name is not part of it.
+func TestInstanceIdentity_TrimsAndSkipsBlank(t *testing.T) {
+	env := map[string]string{"ATROPOS_POD_NAME": " \t", "HOSTNAME": " host-1\n"}
+	if id, pod := instanceIdentity(func(k string) string { return env[k] }); id != "host-1" || pod != "host-1" {
+		t.Fatalf("got %q/%q, want host-1/host-1", id, pod)
+	}
+}
+
+// resourceOf starts and ends one sampled span on the global provider and
+// returns its resource; initTelemetry must have installed an SDK provider.
+func resourceOf(t *testing.T) *resource.Resource {
+	t.Helper()
+	_, span := otel.Tracer("resource-test").Start(context.Background(), "probe")
+	defer span.End()
+	ro, ok := span.(sdktrace.ReadOnlySpan)
+	if !ok {
+		t.Fatalf("span %T is not an SDK span (unsampled or no SDK provider)", span)
+	}
+	return ro.Resource()
+}
+
+func TestInitTelemetry_ResourceCarriesInstanceAndHost(t *testing.T) {
+	pinExporterEnv(t)
+	t.Setenv("OTEL_TRACES_EXPORTER", "none")
+	t.Setenv("OTEL_LOGS_EXPORTER", "none")
+	t.Setenv("OTEL_TRACES_SAMPLER", "")
+	t.Setenv("ATROPOS_POD_NAME", "pod-7")
+	shutdown, err := initTelemetry(context.Background(), telemetryConfig{serviceName: "svc", host: HostSidecar})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(context.Background())
+	set := resourceOf(t).Set()
+	for k, want := range map[attribute.Key]string{"service.instance.id": "pod-7", "k8s.pod.name": "pod-7", "atropos.host": "sidecar", "service.name": "svc"} {
+		if v, ok := set.Value(k); !ok || v.AsString() != want {
+			t.Fatalf("%s = %v (present=%v), want %q", k, v, ok, want)
+		}
+	}
+}
+
+// The service name and environment the caller leaves empty get their defaults.
+func TestInitTelemetry_ResourceDefaults(t *testing.T) {
+	pinExporterEnv(t)
+	t.Setenv("OTEL_TRACES_EXPORTER", "none")
+	t.Setenv("OTEL_LOGS_EXPORTER", "none")
+	t.Setenv("OTEL_TRACES_SAMPLER", "")
+	shutdown, err := initTelemetry(context.Background(), telemetryConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(context.Background())
+	set := resourceOf(t).Set()
+	for k, want := range map[attribute.Key]string{"service.name": "unknown", "deployment.environment.name": "development"} {
+		if v, ok := set.Value(k); !ok || v.AsString() != want {
+			t.Fatalf("%s = %v (present=%v), want %q", k, v, ok, want)
+		}
+	}
+}
+
+func TestInitTelemetry_NoPodNameOmitsK8sAttribute(t *testing.T) {
+	pinExporterEnv(t)
+	t.Setenv("OTEL_TRACES_EXPORTER", "none")
+	t.Setenv("OTEL_LOGS_EXPORTER", "none")
+	t.Setenv("OTEL_TRACES_SAMPLER", "")
+	t.Setenv("ATROPOS_POD_NAME", "")
+	t.Setenv("HOSTNAME", "")
+	shutdown, err := initTelemetry(context.Background(), telemetryConfig{serviceName: "svc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(context.Background())
+	set := resourceOf(t).Set()
+	if _, ok := set.Value("k8s.pod.name"); ok {
+		t.Fatal("k8s.pod.name must be omitted without ATROPOS_POD_NAME/HOSTNAME")
+	}
+	if _, ok := set.Value("atropos.host"); ok {
+		t.Fatal("atropos.host must be omitted when the host is unset")
+	}
+}
+
+func TestInitTelemetry_SamplerFromEnv(t *testing.T) {
+	pinExporterEnv(t)
+	t.Setenv("OTEL_TRACES_EXPORTER", "none")
+	t.Setenv("OTEL_LOGS_EXPORTER", "none")
+	t.Setenv("OTEL_TRACES_SAMPLER", "always_off")
+	shutdown, err := initTelemetry(context.Background(), telemetryConfig{serviceName: "svc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(context.Background())
+	_, span := otel.Tracer("sampler-test").Start(context.Background(), "probe")
+	span.End()
+	if span.SpanContext().IsSampled() {
+		t.Fatal("OTEL_TRACES_SAMPLER=always_off must be honoured")
+	}
+}
+
+func TestInitTelemetry_DefaultSamplerSamples(t *testing.T) {
+	pinExporterEnv(t)
+	t.Setenv("OTEL_TRACES_EXPORTER", "none")
+	t.Setenv("OTEL_LOGS_EXPORTER", "none")
+	t.Setenv("OTEL_TRACES_SAMPLER", "")
+	shutdown, err := initTelemetry(context.Background(), telemetryConfig{serviceName: "svc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(context.Background())
+	_, span := otel.Tracer("sampler-test").Start(context.Background(), "probe")
+	span.End()
+	if !span.SpanContext().IsSampled() {
+		t.Fatal("default sampler must be parent-based always-on")
+	}
+}
+
+// A root span is sampled under AlwaysSample and under ParentBased(AlwaysSample)
+// alike; a remote parent that was not sampled tells them apart.
+func TestInitTelemetry_DefaultSamplerFollowsUnsampledParent(t *testing.T) {
+	pinExporterEnv(t)
+	t.Setenv("OTEL_TRACES_EXPORTER", "none")
+	t.Setenv("OTEL_LOGS_EXPORTER", "none")
+	unsetEnv(t, "OTEL_TRACES_SAMPLER")
+	shutdown, err := initTelemetry(context.Background(), telemetryConfig{serviceName: "svc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(context.Background())
+	parent := oteltrace.NewSpanContext(oteltrace.SpanContextConfig{
+		TraceID: oteltrace.TraceID{1},
+		SpanID:  oteltrace.SpanID{1},
+		Remote:  true, // no TraceFlags: the caller did not sample this trace
+	})
+	ctx := oteltrace.ContextWithRemoteSpanContext(context.Background(), parent)
+	_, span := otel.Tracer("sampler-test").Start(ctx, "probe")
+	span.End()
+	if span.SpanContext().IsSampled() {
+		t.Fatal("with no OTEL_TRACES_SAMPLER the default is parent-based: an unsampled remote parent must win")
+	}
+}
+
+// telemetryConfig.sampler is the tests-only seam; production reads the
+// environment. The seam must still win when both are present.
+func TestInitTelemetry_SamplerConfigOverridesEnv(t *testing.T) {
+	pinExporterEnv(t)
+	t.Setenv("OTEL_TRACES_EXPORTER", "none")
+	t.Setenv("OTEL_LOGS_EXPORTER", "none")
+	t.Setenv("OTEL_TRACES_SAMPLER", "always_on")
+	shutdown, err := initTelemetry(context.Background(), telemetryConfig{serviceName: "svc", sampler: sdktrace.NeverSample()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shutdown(context.Background())
+	_, span := otel.Tracer("sampler-test").Start(context.Background(), "probe")
+	span.End()
+	if span.SpanContext().IsSampled() {
+		t.Fatal("telemetryConfig.sampler must win over OTEL_TRACES_SAMPLER")
 	}
 }

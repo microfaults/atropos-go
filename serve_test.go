@@ -28,6 +28,7 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 
+	"go.opentelemetry.io/otel"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	oteltrace "go.opentelemetry.io/otel/trace"
@@ -90,6 +91,33 @@ func TestServe_RequiresService(t *testing.T) {
 	_, _, err := Serve(context.Background(), Config{})
 	if err == nil {
 		t.Fatal("expected error for missing Service")
+	}
+}
+
+// With no BYO provider Serve builds the SDK provider itself; its resource
+// tells a backend the spans come from the in-process host.
+func TestServe_ResourceNamesTheInProcessHost(t *testing.T) {
+	for _, key := range []string{"MANTEION_URL", "ATROPOS_HOST", "COLLECTOR_SERVICE_ADDR", "OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_PROTOCOL"} {
+		t.Setenv(key, "") // hermetic: no control plane, nothing for the exporter shim to map
+	}
+	t.Setenv("OTEL_TRACES_EXPORTER", "none")
+	t.Setenv("OTEL_LOGS_EXPORTER", "none")
+	t.Setenv("OTEL_TRACES_SAMPLER", "always_on")
+
+	_, shutdown, err := Serve(context.Background(), Config{Service: "serve-test", Handler: http.NewServeMux()})
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	t.Cleanup(func() { _ = shutdown(context.Background()) })
+
+	_, span := otel.Tracer("serve-test").Start(context.Background(), "probe")
+	defer span.End()
+	ro, ok := span.(sdktrace.ReadOnlySpan)
+	if !ok {
+		t.Fatalf("span %T is not an SDK span", span)
+	}
+	if v, ok := ro.Resource().Set().Value("atropos.host"); !ok || v.AsString() != "in-process" {
+		t.Fatalf("atropos.host = %v (present=%v), want in-process", v, ok)
 	}
 }
 

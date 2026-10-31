@@ -9,9 +9,11 @@ import (
 
 	"go.opentelemetry.io/contrib/exporters/autoexport"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	// The one semconv version for both hosts; the sidecar shares it through InitTelemetry.
 	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
@@ -21,8 +23,9 @@ import (
 type telemetryConfig struct {
 	serviceName    string
 	serviceVersion string
-	environment    string // "" = "development"
-	sampler        sdktrace.Sampler
+	environment    string                   // "" = "development"
+	host           string                   // HostInProcess or HostSidecar; "" omits atropos.host
+	sampler        sdktrace.Sampler         // tests only; nil leaves it to OTEL_TRACES_SAMPLER(_ARG)
 	tracerProvider oteltrace.TracerProvider // BYO: registered globally, caller owns shutdown
 }
 
@@ -49,6 +52,34 @@ func initTelemetry(ctx context.Context, cfg telemetryConfig) (func(context.Conte
 		return nil, fmt.Errorf("atropos: init span exporter: %w", err)
 	}
 
+	res, err := newResource(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("atropos: build resource: %w", err)
+	}
+
+	// Build TracerProvider. With no explicit sampler the SDK reads
+	// OTEL_TRACES_SAMPLER and OTEL_TRACES_SAMPLER_ARG itself and defaults to
+	// ParentBased(AlwaysSample).
+	opts := []sdktrace.TracerProviderOption{
+		sdktrace.WithBatcher(exporter, sdktrace.WithBatchTimeout(100*time.Millisecond)),
+		sdktrace.WithResource(res),
+	}
+	if cfg.sampler != nil { // tests only; production reads OTEL_TRACES_SAMPLER(_ARG)
+		opts = append(opts, sdktrace.WithSampler(cfg.sampler))
+	}
+	tp := sdktrace.NewTracerProvider(opts...)
+
+	otel.SetTracerProvider(tp)
+
+	return tp.Shutdown, nil
+}
+
+// newResource describes this process on every span: the service identity from
+// cfg (service.name "unknown" and deployment.environment.name "development"
+// when empty), the instance identity and, when the host is set, atropos.host,
+// merged over resource.Default(), which already folds in OTEL_RESOURCE_ATTRIBUTES
+// and OTEL_SERVICE_NAME. The attributes set here win over the environment's.
+func newResource(cfg telemetryConfig) (*resource.Resource, error) {
 	serviceName := cfg.serviceName
 	if serviceName == "" {
 		serviceName = "unknown"
@@ -57,38 +88,43 @@ func initTelemetry(ctx context.Context, cfg telemetryConfig) (func(context.Conte
 	if environment == "" {
 		environment = "development"
 	}
+	instanceID, podName := instanceIdentity(os.Getenv)
 
-	// Build resource with service metadata.
+	attrs := []attribute.KeyValue{
+		semconv.ServiceName(serviceName),
+		semconv.ServiceVersion(cfg.serviceVersion),
+		semconv.DeploymentEnvironmentName(environment),
+		semconv.ServiceInstanceID(instanceID),
+	}
+	if podName != "" {
+		attrs = append(attrs, semconv.K8SPodName(podName))
+	}
+	if cfg.host != "" {
+		attrs = append(attrs, attribute.String("atropos.host", cfg.host))
+	}
+
 	// Use NewSchemaless to avoid schema URL conflicts between
 	// resource.Default() (which tracks the SDK's semconv version)
 	// and the semconv import version used here.
-	res, err := resource.Merge(
-		resource.Default(),
-		resource.NewSchemaless(
-			semconv.ServiceName(serviceName),
-			semconv.ServiceVersion(cfg.serviceVersion),
-			semconv.DeploymentEnvironmentName(environment),
-		),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("atropos: build resource: %w", err)
+	return resource.Merge(resource.Default(), resource.NewSchemaless(attrs...))
+}
+
+// instanceIdentity names this process for the resource. The pod name is
+// ATROPOS_POD_NAME, else HOSTNAME (which Kubernetes sets to the pod name), and
+// is empty outside a pod. The instance id is the pod name when there is one,
+// else the machine's hostname, else "unknown".
+func instanceIdentity(getenv func(string) string) (instanceID, podName string) {
+	podName = strings.TrimSpace(getenv("ATROPOS_POD_NAME"))
+	if podName == "" {
+		podName = strings.TrimSpace(getenv("HOSTNAME"))
 	}
-
-	// Build TracerProvider.
-	sampler := cfg.sampler
-	if sampler == nil {
-		sampler = sdktrace.AlwaysSample()
+	if podName != "" {
+		return podName, podName
 	}
-
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter, sdktrace.WithBatchTimeout(100*time.Millisecond)),
-		sdktrace.WithResource(res),
-		sdktrace.WithSampler(sampler),
-	)
-
-	otel.SetTracerProvider(tp)
-
-	return tp.Shutdown, nil
+	if host, err := os.Hostname(); err == nil && host != "" {
+		return host, ""
+	}
+	return "unknown", ""
 }
 
 // applyExporterEnvFallback maps the bed's COLLECTOR_SERVICE_ADDR onto the
@@ -156,11 +192,19 @@ func newSpanExporter(ctx context.Context) (sdktrace.SpanExporter, error) {
 // http/protobuf) and the other OTEL_EXPORTER_OTLP_* variables the exporters
 // read. The bed's COLLECTOR_SERVICE_ADDR, and a schemeless
 // OTEL_EXPORTER_OTLP_ENDPOINT such as otel-collector:4317, still work and
-// mean a gRPC collector. The sampler is AlwaysSample.
+// mean a gRPC collector. The sampler comes from OTEL_TRACES_SAMPLER and
+// OTEL_TRACES_SAMPLER_ARG; the default is parent-based always-on. Every span's
+// resource carries service.name, service.version, deployment.environment.name
+// and service.instance.id, plus k8s.pod.name (ATROPOS_POD_NAME, else HOSTNAME;
+// omitted when neither is set) and atropos.host (Host; omitted when empty).
+// OTEL_RESOURCE_ATTRIBUTES adds further attributes.
 type TelemetryConfig struct {
 	ServiceName    string
 	ServiceVersion string
 	Environment    string // "" = "development"
+	// Host says which kind of atropos host this is, HostInProcess or
+	// HostSidecar. It becomes the atropos.host resource attribute; empty omits it.
+	Host string
 	// TracerProvider, if set, is registered globally instead of building an
 	// OTLP exporter — the seam for tests and hosts that own their OTel setup.
 	TracerProvider oteltrace.TracerProvider
@@ -173,6 +217,7 @@ func InitTelemetry(ctx context.Context, cfg TelemetryConfig) (func(context.Conte
 		serviceName:    cfg.ServiceName,
 		serviceVersion: cfg.ServiceVersion,
 		environment:    cfg.Environment,
+		host:           cfg.Host,
 		tracerProvider: cfg.TracerProvider,
 	})
 }

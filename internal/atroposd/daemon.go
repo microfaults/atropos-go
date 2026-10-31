@@ -71,6 +71,7 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 		ServiceName:    cfg.Service,
 		ServiceVersion: cfg.Version,
 		Environment:    cfg.Environment,
+		Host:           instrument.HostSidecar,
 		TracerProvider: cfg.TracerProvider,
 	})
 	if err != nil {

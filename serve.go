@@ -139,6 +139,7 @@ func Serve(ctx context.Context, cfg Config) (http.Handler, ShutdownFunc, error) 
 		ServiceName:    cfg.Service,
 		ServiceVersion: version,
 		Environment:    cfg.Environment,
+		Host:           instrument.HostInProcess,
 		TracerProvider: cfg.TracerProvider,
 	})
 	if err != nil {
