@@ -22,11 +22,11 @@ func TestIntegration_IngressMiddleware_WithFault(t *testing.T) {
 		sdktrace.WithSampler(sdktrace.AlwaysSample()),
 	)
 
-	shutdown, err := instrument.InitTelemetry(context.Background(), instrument.TelemetryConfig{TracerProvider: tp})
+	tel, err := instrument.InitTelemetry(context.Background(), instrument.TelemetryConfig{TracerProvider: tp})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer shutdown(context.Background())
+	defer tel.Shutdown(context.Background())
 
 	configure(&integrationEval{
 		decision: &evaluator.Decision{

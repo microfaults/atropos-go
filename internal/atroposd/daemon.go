@@ -46,7 +46,7 @@ func checkCapture(cfg Config) error {
 // Run hosts the instrument out of process until ctx is cancelled, then
 // tears it down in dependency order: proxied traffic drains, the control
 // server stops, the control-plane client deregisters, the core flushes its
-// recorder and push client, spans flush.
+// recorder and push client, spans and logs flush.
 //
 // Order at startup is deliberate: the control port is bound before anything
 // else (a port conflict must fail before the instance registers, and the
@@ -54,10 +54,10 @@ func checkCapture(cfg Config) error {
 // (same reason), and the control plane last, so a configured-but-
 // unreachable manteion is a startup error with nothing half-running — an
 // instrument that pretends to be connected corrupts experiments.
+//
+// A nil logger means the SDK default from InitTelemetry: JSON on stdout teed
+// into the OTel logs bridge.
 func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
-	if logger == nil {
-		logger = slog.Default()
-	}
 	cfg.applyDefaults()
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("atroposd: config: %w", err)
@@ -67,16 +67,20 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	}
 	instanceID := instrument.ResolveInstanceID(cfg.InstanceID, cfg.Service)
 
-	otelShutdown, err := instrument.InitTelemetry(ctx, instrument.TelemetryConfig{
+	tel, err := instrument.InitTelemetry(ctx, instrument.TelemetryConfig{
 		ServiceName:    cfg.Service,
 		ServiceVersion: cfg.Version,
 		Environment:    cfg.Environment,
+		InstanceID:     instanceID,
 		Host:           instrument.HostSidecar,
 		TracerProvider: cfg.TracerProvider,
+		Logger:         logger, // nil: the SDK default
 	})
 	if err != nil {
 		return fmt.Errorf("atroposd: init telemetry: %w", err)
 	}
+	logger = tel.Logger
+	otelShutdown := tel.Shutdown
 
 	// The core, with the two sidecar-only behaviours: network toxics with
 	// host=inline become armed proxy policies, and background faults arm
@@ -197,6 +201,6 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	errs = append(errs, controlSrv.Shutdown(sctx)) // then stop answering the control plane
 	errs = append(errs, mc.Close(sctx))            // deregister, stop polling (nil-safe offline)
 	core.Stop()                                    // drain recorder into push, final flush
-	errs = append(errs, otelShutdown(sctx))        // flush spans
+	errs = append(errs, otelShutdown(sctx))        // flush spans and logs
 	return errors.Join(errs...)
 }

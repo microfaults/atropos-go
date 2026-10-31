@@ -7,6 +7,8 @@ All notable changes to atropos-go are documented in this file.
 ### Changed — Telemetry (ADR-3)
 
 - Exporters are selected by `OTEL_TRACES_EXPORTER` / `OTEL_LOGS_EXPORTER` / `OTEL_EXPORTER_OTLP_*` through contrib `autoexport`; `COLLECTOR_SERVICE_ADDR` and a schemeless `OTEL_EXPORTER_OTLP_ENDPOINT` still work and imply gRPC.
+- Logs are an OTel signal: both hosts build an SDK `LoggerProvider` with the span resource, exported as `OTEL_LOGS_EXPORTER` selects (`otlp` default, `console`, `none`; the same `OTEL_EXPORTER_OTLP_*` and `COLLECTOR_SERVICE_ADDR` handling as spans), and register it as the global logger provider. `Config.Logger` now defaults to JSON on stdout (Info and above) teed into the `otelslog` bridge (scope `git.ucsc.edu/microfaults/atropos-go`), so `*Context` log calls carry `trace_id` and `span_id`; it was `slog.Default()` (pass `Config.Logger: slog.Default()` to keep that). New `Config.LoggerProvider`, honoured only together with `Config.TracerProvider`; a BYO `TracerProvider` builds no exporter, for traces or logs. `atroposd` logs through the same default.
+- Resource: `service.instance.id` is the registration identity (`Config.InstanceID` > `MANTEION_INSTANCE_ID` > hostname > service), and `k8s.pod.name` stays the pod name. `service.version` and `deployment.environment.name` are stamped only when set, so `OTEL_RESOURCE_ATTRIBUTES` can supply them; `Config.Environment` no longer defaults to `"development"`. A padded `OTEL_EXPORTER_OTLP_PROTOCOL` is trimmed before autoexport reads it.
 
 ### Changed — Desired-state protocol v1 (ADR-2)
 

@@ -11,6 +11,7 @@ import (
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/instrument"
 
+	otellog "go.opentelemetry.io/otel/log"
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
@@ -26,11 +27,12 @@ type Config struct {
 
 	// Version is the service version reported both to OTel
 	// (service.version) and to manteion for experiment attribution.
-	// Default: MANTEION_SERVICE_VERSION.
+	// Default: MANTEION_SERVICE_VERSION. With neither set, service.version is
+	// left to OTEL_RESOURCE_ATTRIBUTES.
 	Version string
 
-	// Environment is the OTel deployment.environment resource attribute.
-	// Default: "development".
+	// Environment is the OTel deployment.environment.name resource
+	// attribute. Default: none; OTEL_RESOURCE_ATTRIBUTES may supply it.
 	Environment string
 
 	// Routes is the HTTP route inventory published to manteion at
@@ -57,7 +59,8 @@ type Config struct {
 	// InstanceID overrides the SDK instance identity. Default precedence:
 	// MANTEION_INSTANCE_ID > hostname > Service. The resolved identity is
 	// used verbatim for manteion registration, cache pushes, and the
-	// fidelity endpoint — the three places manteion correlates an instance.
+	// fidelity endpoint — the three places manteion correlates an instance —
+	// and as the OTel service.instance.id, so spans and logs join it.
 	InstanceID string
 
 	// NetworkResolver maps a logical network-fault target (e.g. "redis") to
@@ -66,20 +69,28 @@ type Config struct {
 	// per rule, logged and counted in atropos_rules_unsupported_total.
 	NetworkResolver NetworkResolver
 
-	// TracerProvider, if set, is registered globally instead of building an
-	// OTLP exporter — the seam for tests and for hosts that own their OTel
-	// setup. Default: an OTLP exporter per OTEL_EXPORTER_OTLP_ENDPOINT /
-	// COLLECTOR_SERVICE_ADDR (falling back to localhost).
+	// TracerProvider, if set, is registered globally and the SDK builds no
+	// exporter, for traces or logs — the seam for tests and for hosts that
+	// own their OTel setup. Default: the exporters the OTEL_* environment
+	// selects (OTEL_TRACES_EXPORTER, OTEL_LOGS_EXPORTER, OTEL_EXPORTER_OTLP_*;
+	// COLLECTOR_SERVICE_ADDR or a schemeless endpoint mean a gRPC collector).
 	TracerProvider oteltrace.TracerProvider
 
-	// Logger receives SDK logs. Default: slog.Default().
+	// LoggerProvider, if set, receives the SDK's log records (and the decision
+	// events) instead of the OTLP log exporter autoexport would build. Ignored
+	// unless TracerProvider is also set: a host that owns one signal owns both.
+	LoggerProvider otellog.LoggerProvider
+
+	// Logger receives SDK logs. Default: a JSON handler on stdout teed into
+	// the OTel logs bridge, so every *Context call carries trace_id and
+	// span_id.
 	Logger *slog.Logger
 }
 
 // ShutdownFunc tears the embed down: control-plane deregistration, recorder
-// drain, final cache-push flush, and OTel span flush, in that order. Safe to
-// call more than once; calls after the first are no-ops returning the first
-// call's error.
+// drain, final cache-push flush, and OTel span and log flush, in that order.
+// Safe to call more than once; calls after the first are no-ops returning the
+// first call's error.
 type ShutdownFunc func(context.Context) error
 
 // Serve wires the complete instrument around the service's handler and
@@ -95,8 +106,9 @@ type ShutdownFunc func(context.Context) error
 //	defer shutdown(ctx)
 //	http.ListenAndServe(":"+port, h)
 //
-// Inside, in order: OTel init; one instance identity resolved once and used
-// for registration, cache pushes, and the fidelity endpoint; the
+// Inside, in order: one instance identity resolved once and used for
+// registration, cache pushes, the fidelity endpoint and the OTel resource;
+// OTel init (traces, logs and the default logger); the
 // record/replay cache-box and its push client bound to one fidelity
 // registry; the host rule evaluator composed with the admin fault slot (host
 // rules always win); the manteion connection (poll + SSE + drain tracking),
@@ -119,10 +131,6 @@ func Serve(ctx context.Context, cfg Config) (http.Handler, ShutdownFunc, error) 
 	if cfg.Service == "" {
 		return nil, nil, errors.New("atropos: Config.Service is required")
 	}
-	logger := cfg.Logger
-	if logger == nil {
-		logger = slog.Default()
-	}
 	version := cfg.Version
 	if version == "" {
 		version = os.Getenv("MANTEION_SERVICE_VERSION")
@@ -134,17 +142,22 @@ func Serve(ctx context.Context, cfg Config) (http.Handler, ShutdownFunc, error) 
 	instanceID := instrument.ResolveInstanceID(cfg.InstanceID, cfg.Service)
 
 	// Telemetry first: everything below emits spans through the global
-	// tracer provider this installs.
-	otelShutdown, err := instrument.InitTelemetry(ctx, instrument.TelemetryConfig{
+	// tracer provider this installs, and logs through the logger it returns.
+	tel, err := instrument.InitTelemetry(ctx, instrument.TelemetryConfig{
 		ServiceName:    cfg.Service,
 		ServiceVersion: version,
 		Environment:    cfg.Environment,
+		InstanceID:     instanceID,
 		Host:           instrument.HostInProcess,
 		TracerProvider: cfg.TracerProvider,
+		LoggerProvider: cfg.LoggerProvider,
+		Logger:         cfg.Logger,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("atropos: init telemetry: %w", err)
 	}
+	logger := tel.Logger
+	otelShutdown := tel.Shutdown
 
 	// Mixed-fleet guard (design §5.12): a pod is instrumented by exactly one
 	// host. When the pod's atroposd sidecar owns the instrument, the embed

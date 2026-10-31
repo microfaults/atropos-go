@@ -29,6 +29,8 @@ func main() {
 	printCfg := flag.Bool("print-config", false, "print the effective configuration and exit")
 	flag.Parse()
 
+	// main's own errors only (a config that does not load, the exit error):
+	// Run logs through the SDK default logger, stdout JSON teed into OTel.
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	cfg, err := atroposd.Load(*configPath)
 	if err != nil {
@@ -45,7 +47,7 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if err := atroposd.Run(ctx, cfg, logger); err != nil {
+	if err := atroposd.Run(ctx, cfg, nil); err != nil {
 		logger.Error("atroposd: exit", "error", err)
 		os.Exit(1)
 	}

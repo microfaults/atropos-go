@@ -87,8 +87,8 @@ type Config struct {
 	AppContainer string `yaml:"app_container"` // default "server"
 	PodUID       string `yaml:"pod_uid"`       // downward API metadata.uid (ATROPOS_POD_UID)
 
-	// TracerProvider, if set, replaces the OTLP exporter (tests, or hosts
-	// that own their OTel setup).
+	// TracerProvider, if set, replaces the exporters, for traces and logs
+	// (tests, or hosts that own their OTel setup).
 	TracerProvider oteltrace.TracerProvider `yaml:"-"`
 	// OriginalDst overrides the original-destination lookup (tests). When
 	// set, the capture marker is not required.

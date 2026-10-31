@@ -258,7 +258,8 @@ func TestRun_RejectsBadConfig(t *testing.T) {
 }
 
 // With no BYO provider Run builds the SDK provider itself; its resource tells
-// a backend the spans come from the sidecar.
+// a backend the spans come from the sidecar, under the instance id it
+// registers with.
 func TestRun_ResourceNamesTheSidecarHost(t *testing.T) {
 	for _, key := range []string{"MANTEION_URL", "MANTEION_ADVERTISE_ADDR", "COLLECTOR_SERVICE_ADDR", "OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_PROTOCOL"} {
 		t.Setenv(key, "") // hermetic: no control plane, nothing for the exporter shim to map
@@ -274,7 +275,7 @@ func TestRun_ResourceNamesTheSidecarHost(t *testing.T) {
 	go func() {
 		defer close(stopped)
 		runErr = Run(ctx, Config{
-			Service: "svc", ControlListen: "127.0.0.1:0",
+			Service: "svc", InstanceID: "inst-sidecar", ControlListen: "127.0.0.1:0",
 			Egress:  []EgressRoute{{Listen: "127.0.0.1:0", Upstream: "dep:80"}},
 			OnReady: func(a Addrs) { ready <- a },
 		}, slog.New(slog.DiscardHandler))
@@ -306,6 +307,9 @@ func TestRun_ResourceNamesTheSidecarHost(t *testing.T) {
 	}
 	if v, ok := ro.Resource().Set().Value("atropos.host"); !ok || v.AsString() != "sidecar" {
 		t.Fatalf("atropos.host = %v (present=%v), want sidecar", v, ok)
+	}
+	if v, ok := ro.Resource().Set().Value("service.instance.id"); !ok || v.AsString() != "inst-sidecar" {
+		t.Fatalf("service.instance.id = %v (present=%v), want the registration identity inst-sidecar", v, ok)
 	}
 }
 
