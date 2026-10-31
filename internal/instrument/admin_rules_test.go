@@ -18,7 +18,7 @@ import (
 func TestRulesAdminHandler(t *testing.T) {
 	t.Run("GET on empty evaluator returns 200 with empty array", func(t *testing.T) {
 		eval := evaluator.NewStaticEvaluator()
-		handler := rulesAdminHandler(applyTargets{Evaluator: eval})
+		handler := rulesAdminHandler(applyTargets{Evaluator: eval}, nil)
 
 		req := httptest.NewRequest(http.MethodGet, "/admin/rules", nil)
 		rec := httptest.NewRecorder()
@@ -39,7 +39,7 @@ func TestRulesAdminHandler(t *testing.T) {
 
 	t.Run("POST with valid compiled rules replaces evaluator rules", func(t *testing.T) {
 		eval := evaluator.NewStaticEvaluator()
-		handler := rulesAdminHandler(applyTargets{Evaluator: eval})
+		handler := rulesAdminHandler(applyTargets{Evaluator: eval}, nil)
 
 		compiled := wire.CompiledRule{
 			Name:           "freeze-productcatalog",
@@ -77,7 +77,7 @@ func TestRulesAdminHandler(t *testing.T) {
 
 	t.Run("POST with malformed JSON returns 400", func(t *testing.T) {
 		eval := evaluator.NewStaticEvaluator()
-		handler := rulesAdminHandler(applyTargets{Evaluator: eval})
+		handler := rulesAdminHandler(applyTargets{Evaluator: eval}, nil)
 
 		req := httptest.NewRequest(http.MethodPost, "/admin/rules", bytes.NewReader([]byte(`"not json"`)))
 		rec := httptest.NewRecorder()
@@ -89,7 +89,7 @@ func TestRulesAdminHandler(t *testing.T) {
 	})
 
 	t.Run("POST without an Evaluator target is a 500", func(t *testing.T) {
-		handler := rulesAdminHandler(applyTargets{}) // a host that cannot hold rules
+		handler := rulesAdminHandler(applyTargets{}, nil) // a host that cannot hold rules
 		body := `[{"name":"r","injection_point":"egress","mode":"inline"}]`
 
 		rec := httptest.NewRecorder()
@@ -102,7 +102,7 @@ func TestRulesAdminHandler(t *testing.T) {
 
 	t.Run("POST skips a network rule this host cannot run and applies the rest", func(t *testing.T) {
 		eval := evaluator.NewStaticEvaluator()
-		handler := rulesAdminHandler(applyTargets{Evaluator: eval}) // no NetworkResolver, no inline toxic host
+		handler := rulesAdminHandler(applyTargets{Evaluator: eval}, nil) // no NetworkResolver, no inline toxic host
 
 		body, err := json.Marshal([]wire.CompiledRule{
 			{Name: "net-proxy", Mode: "background", Fault: &wire.CompiledFault{
@@ -135,7 +135,7 @@ func TestRulesAdminHandler(t *testing.T) {
 
 	t.Run("DELETE returns 405", func(t *testing.T) {
 		eval := evaluator.NewStaticEvaluator()
-		handler := rulesAdminHandler(applyTargets{Evaluator: eval})
+		handler := rulesAdminHandler(applyTargets{Evaluator: eval}, nil)
 
 		req := httptest.NewRequest(http.MethodDelete, "/admin/rules", nil)
 		rec := httptest.NewRecorder()
@@ -152,7 +152,7 @@ func TestRulesAdminHandler(t *testing.T) {
 // that decode replace the set, and the 422 names the ones that did not.
 func TestRulesAdmin_PostPartialDecodeIs422ButAppliesTheRest(t *testing.T) {
 	eval := evaluator.NewStaticEvaluator(wire.StaticRule{Name: "old", Point: evaluator.Ingress})
-	handler := rulesAdminHandler(applyTargets{Evaluator: eval})
+	handler := rulesAdminHandler(applyTargets{Evaluator: eval}, nil)
 	body, err := json.Marshal([]wire.CompiledRule{
 		{Name: "good", Mode: "inline", Fault: &wire.CompiledFault{
 			Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"10ms"}`)}},
@@ -194,7 +194,7 @@ func TestRulesAdmin_PostTouchesOnlyRules(t *testing.T) {
 	// A puller too: under any wider scope its Reconcile(nil) would clear the set.
 	p := newReplaySetPuller(replaySetPullerConfig{BaseURL: "http://manteion.invalid", CacheBox: cb, Logger: slog.New(slog.DiscardHandler)})
 	t.Cleanup(p.Close)
-	handler := rulesAdminHandler(applyTargets{Evaluator: evaluator.NewStaticEvaluator(), DemoEval: demo, CacheBox: cb, ReplaySet: p})
+	handler := rulesAdminHandler(applyTargets{Evaluator: evaluator.NewStaticEvaluator(), DemoEval: demo, CacheBox: cb, ReplaySet: p}, nil)
 
 	body, _ := json.Marshal([]wire.CompiledRule{{Name: "r", InjectionPoint: "egress", Mode: "inline", CacheBox: &wire.CompiledCacheBox{Mode: "replay", KeyStrategy: "exact"}}})
 	rec := httptest.NewRecorder()
@@ -232,7 +232,7 @@ func TestRulesAdminHandler_PostObservesDrainTracker(t *testing.T) {
 	pusher.BindFidelity(cb.Fidelity())
 
 	eval := evaluator.NewStaticEvaluator()
-	handler := rulesAdminHandler(applyTargets{Evaluator: eval, CacheDrain: newCacheDrainTracker(cb, pusher, nil)})
+	handler := rulesAdminHandler(applyTargets{Evaluator: eval, CacheDrain: newCacheDrainTracker(cb, pusher, nil)}, nil)
 	post := func(body string) int {
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/rules", strings.NewReader(body)))
@@ -278,7 +278,7 @@ func TestRulesAdminHandler_PostArmsEagerly(t *testing.T) {
 		armed = append(armed, point.String()+":"+d.Name)
 	}
 	eval := evaluator.NewStaticEvaluator()
-	handler := rulesAdminHandler(applyTargets{Evaluator: eval, Arm: arm})
+	handler := rulesAdminHandler(applyTargets{Evaluator: eval, Arm: arm}, nil)
 	body, _ := json.Marshal([]wire.CompiledRule{{
 		Name: "burn", InjectionPoint: "ingress", Mode: "background",
 		Fault: &wire.CompiledFault{Category: "resource", FaultType: "cpu", DurationMs: 1000, Params: json.RawMessage(`{"target_load":0.1}`)},
@@ -290,5 +290,96 @@ func TestRulesAdminHandler_PostArmsEagerly(t *testing.T) {
 	}
 	if len(armed) != 1 || armed[0] != "ingress:burn" {
 		t.Fatalf("armed = %v, want exactly [ingress:burn]", armed)
+	}
+}
+
+// TestRulesAdmin_PushLastsUntilTheNextPoll: while connected, a push is a
+// short-lived override. Applied (204) or partly applied (422), it clears the
+// ETag the client holds, as reaping a confirmed slot does, so the next poll
+// is unconditional and its 200 re-applies manteion's desired state; a poll
+// out during the push comes back late and adopts nothing. The push itself
+// sends no status report.
+func TestRulesAdmin_PushLastsUntilTheNextPoll(t *testing.T) {
+	doc := wire.RuleSync{Version: 1, Etag: "1-a", Rules: threeRules()[:1], ActiveFaults: []wire.FaultRequest{}} // rule "lat"
+	f := newFakeManteion(t)
+	f.setRules(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("If-None-Match") == `"1-a"` {
+			respond304("1", "1-a")(w, r)
+			return
+		}
+		respond200(doc)(w, r)
+	})
+	eval := evaluator.NewStaticEvaluator()
+	targets := applyTargets{Evaluator: eval}
+	c := f.client(targets)
+	if err := c.fetchRules(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	handler := rulesAdminHandler(targets, c)
+	push := func(body string) int {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/rules", strings.NewReader(body)))
+		return rec.Code
+	}
+	holds := func(name string) bool {
+		rules := eval.Rules()
+		return len(rules) == 1 && rules[0].Name == name
+	}
+	const pushed = `{"name":"pushed","injection_point":"ingress","mode":"inline","fault":{"category":"inline","fault_type":"latency","params":{"delay":"2ms"}}}`
+	const bad = `{"name":"bad","injection_point":"ingress","mode":"inline","fault":{"category":"inline","fault_type":"latency","params":{"delay":"notaduration"}}}`
+
+	for _, tc := range []struct {
+		name, body string
+		code       int
+	}{
+		{"applied", "[" + pushed + "]", http.StatusNoContent},
+		{"partly applied", "[" + pushed + "," + bad + "]", http.StatusUnprocessableEntity},
+	} {
+		_, before := f.snapshot()
+		if code := push(tc.body); code != tc.code || !holds("pushed") {
+			t.Fatalf("%s: push answered %d holding %+v, want %d holding the pushed rule", tc.name, code, eval.Rules(), tc.code)
+		}
+		if c.currentEtag() != "" || c.ruleVersion.Load() != 1 {
+			t.Fatalf("%s: etag=%q gen=%d, want the ETag held cleared and the generation kept", tc.name, c.currentEtag(), c.ruleVersion.Load())
+		}
+		if _, after := f.snapshot(); len(after) != len(before) {
+			t.Fatalf("%s: the push sent %d status reports, want none", tc.name, len(after)-len(before))
+		}
+		if err := c.fetchRules(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		polls, statuses := f.snapshot()
+		if got := polls[len(polls)-1]; got != (pollSeen{Version: "1"}) {
+			t.Fatalf("%s: poll after the push = %+v, want an unconditional poll at version 1", tc.name, got)
+		}
+		if !holds("lat") || c.currentEtag() != "1-a" || len(statuses) != len(before)+1 {
+			t.Fatalf("%s: rules=%+v etag=%q reports +%d, want the 200 to restore the desired rule, its ETag and one report",
+				tc.name, eval.Rules(), c.currentEtag(), len(statuses)-len(before))
+		}
+	}
+
+	// A push while a poll is out: that poll's 304 is late and re-adopts
+	// nothing, so the push still lasts only until the next poll.
+	f.setRules(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("If-None-Match") == "" {
+			respond200(doc)(w, r)
+			return
+		}
+		if code := push("[" + pushed + "]"); code != http.StatusNoContent {
+			t.Errorf("push while the poll is out: %d", code)
+		}
+		respond304("1", "1-a")(w, r)
+	})
+	if err := c.fetchRules(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if c.currentEtag() != "" || !holds("pushed") {
+		t.Fatalf("etag=%q rules=%+v, want the pushed rule held and no ETag: the late 304 must not re-adopt one", c.currentEtag(), eval.Rules())
+	}
+	if err := c.fetchRules(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if !holds("lat") || c.currentEtag() != "1-a" {
+		t.Fatalf("etag=%q rules=%+v, want the desired rule restored by the next poll", c.currentEtag(), eval.Rules())
 	}
 }

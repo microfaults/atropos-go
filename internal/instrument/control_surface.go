@@ -51,7 +51,7 @@ func ControlSurface(cfg ControlConfig) *http.ServeMux {
 	mux.Handle("/admin/fault", faultAdmin)
 	mux.Handle("/admin/fault/", faultAdmin)
 
-	mux.Handle("/admin/rules", rulesAdminHandler(c.targets(cfg.NetworkResolver)))
+	mux.Handle("/admin/rules", rulesAdminHandler(c.targets(cfg.NetworkResolver), cfg.Client))
 
 	cbAdmin := cacheBoxAdminHandler(c.cacheBox)
 	mux.Handle("/admin/cachebox", cbAdmin)

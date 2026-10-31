@@ -65,16 +65,26 @@ func armDecision(arm armFunc, point evaluator.InjectionPoint, d *evaluator.Decis
 // body carries no version, so the poll's ruleVersion (manteion_client.go,
 // fetchRules) is left untouched.
 //
+// Connected (client non-nil), a push is a short-lived override, like an
+// /admin/fault slot: once it applied (204 or 422) the client forgets the
+// ETag it holds (pushOverride), so the next poll is unconditional and its 200
+// re-applies manteion's desired state over the pushed set -- which lasts
+// until that poll completes, at most one long-poll hold plus the apply. The
+// push sends no status report. Offline (nil client), a pushed set holds until
+// the next push.
+//
 // Supported methods:
 //   - GET:  200 + JSON-encoded current rule list (empty array if nil)
 //   - POST: body is []wire.CompiledRule; null clears the set (teardown).
 //     204 when every rule applied or was skipped as unsupported; 400 on bad
-//     JSON; 422 when some rules did not decode -- the rest were applied, and
-//     the body names the skipped ones; 500 when this host cannot hold rules
+//     JSON; 422 when some rules did not decode -- the pushed set, less the
+//     skipped rules, replaced the installed one (an empty set when none
+//     decoded), and the body names the skipped ones; 500 when this host
+//     cannot hold rules (nothing applied)
 //   - Other: 405
 //
 // targets.Evaluator is required.
-func rulesAdminHandler(targets applyTargets) http.Handler {
+func rulesAdminHandler(targets applyTargets, client *ManteionClient) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -100,6 +110,7 @@ func rulesAdminHandler(targets applyTargets) http.Handler {
 				jsonError(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
+			client.pushOverride()
 			if len(report.Errors) > 0 {
 				jsonError(w, strings.Join(report.Errors, "; "), http.StatusUnprocessableEntity)
 				return

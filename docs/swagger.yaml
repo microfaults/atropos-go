@@ -868,8 +868,13 @@ paths:
         outside the sidecar or host=proxy without a resolver, compositions) are skipped
         per rule, logged and counted in atropos_rules_unsupported_total{category};
         the rest apply and the answer is 204. A rule that does not decode is skipped
-        and logged, not counted, and the answer is 422. The pushed set holds until
-        the next desired-state 200 answer replaces it.'
+        and logged, not counted, and the answer is 422; the pushed set less the skipped
+        rules replaces the installed one (an empty set when no rule decodes). Connected
+        to manteion, a push is a short-lived override: it clears the ETag the instance
+        holds, so the next poll is unconditional and its 200 re-applies the desired
+        state over the pushed set, at most one long-poll hold plus the apply later;
+        the push sends no status report. Offline, the pushed set holds until the next
+        push.'
       requestBody:
         content:
           application/json:
@@ -902,8 +907,9 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/atropos.ErrorResponse'
-          description: some rules did not decode and were skipped, the rest were applied;
-            error joins the per-rule messages with '; '
+          description: some rules did not decode and were skipped; the rest replaced
+            the installed set (an empty set when none decoded); error joins the per-rule
+            messages with '; '
         '500':
           content:
             application/json:

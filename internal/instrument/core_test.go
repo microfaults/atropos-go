@@ -104,7 +104,7 @@ func TestApply_PollAndPushSerializeOnTheCoreMutex(t *testing.T) {
 		inside.Add(-1)
 	}
 	poll.Arm, push.Arm = arm, arm
-	handler := rulesAdminHandler(push)
+	handler := rulesAdminHandler(push, nil)
 	rules := []wire.CompiledRule{{Name: "burn", InjectionPoint: "ingress", Mode: "background",
 		Fault: &wire.CompiledFault{Category: "resource", FaultType: "cpu", DurationMs: 1000, Params: json.RawMessage(`{"target_load":0.1}`)}}}
 	body, err := json.Marshal(rules)
@@ -204,7 +204,7 @@ func TestApply_NetworkIOGoesOutWithNoApplyLockHeld(t *testing.T) {
 
 	// The push records, then tears down: its drain report goes out with the
 	// core's mutex released too.
-	push := rulesAdminHandler(core.targets(nil))
+	push := rulesAdminHandler(core.targets(nil), c)
 	body, err := json.Marshal(recording)
 	if err != nil {
 		t.Fatal(err)

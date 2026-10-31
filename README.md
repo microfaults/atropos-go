@@ -255,6 +255,16 @@ name a slot drops (and stops) it, and the fault watchdog drops one that stays
 unconfirmed for the grace period (90 s with the default poll settings; see
 "Manteion integration" below). Offline, slots persist until deleted.
 
+POST `/admin/rules` replaces the installed rule set through the same apply
+path the manteion sync uses, scoped to rules. A rule this host cannot execute
+is skipped (`204` still); a rule that does not decode is skipped too and the
+answer is `422` naming it, the pushed set less the skipped rules having
+replaced the installed one (an empty set when no rule decoded). When connected,
+a pushed set is a short-lived override like an admin slot: the push clears the
+ETag the instance holds, so the next poll — at most one 30 s hold later — is
+unconditional and its `200` re-applies manteion's desired state. The push sends
+no status report. Offline, a pushed set holds until the next push.
+
 ### 5. Cache-Box (Egress)
 
 Cache-box is the measurement primitive that "freezes" a downstream dependency by replaying recorded responses instead of forwarding to the real service. Three modes, selected by the cache-box rule manteion synthesizes for the active experiment phase:

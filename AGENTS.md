@@ -111,7 +111,7 @@ Runtime rule-set management against the host evaluator.
 | Method | Path           | Body                                            | Response |
 |--------|----------------|-------------------------------------------------|----------|
 | GET    | `/admin/rules` | —                                               | 200 `[]StaticRule` JSON (the installed, decoded rules) |
-| POST   | `/admin/rules` | `[]CompiledRule` JSON; `null` clears the set    | 204 (atomic replace); 400 `{"error": ...}` (malformed JSON); 422 `{"error": "rule a: decode: ...; rule b: decode: ..."}` (some rules did not decode and were skipped, the rest were applied); 500 `{"error": ...}` (this host cannot hold rules; nothing was applied) |
+| POST   | `/admin/rules` | `[]CompiledRule` JSON; `null` clears the set    | 204 (atomic replace); 400 `{"error": ...}` (malformed JSON); 422 `{"error": "rule a: decode: ...; rule b: decode: ..."}` (some rules did not decode and were skipped: the pushed set less those rules replaced the installed one, an empty set when none decoded); 500 `{"error": ...}` (this host cannot hold rules; nothing was applied) |
 
 POST is the push side of the single apply path the manteion sync uses (`apply`
 in `internal/instrument/register.go`, here scoped to rules): decode against this
@@ -130,12 +130,20 @@ under `unsupported` in its status report; the push sends no report.) A rule
 that does not decode — malformed params of a known category, an unknown fault
 type — is skipped and logged, not counted; the push then answers 422, with its
 `rule <name>: decode: ...` message joined to the others with `; ` (the sync
-reports it under `errors` instead), and the rules that did decode are already
-applied. The push touches only rules: admin fault slots, the delay source and
-the installed replay set stay as they are, and the push carries no version or
-ETag, so the poll's generation is left untouched. A pushed set holds until the
-next desired-state document applied (a `200` poll answer or a registration
-answer) replaces it; a `304` leaves it.
+reports it under `errors` instead), and the rules that did decode already
+replaced the installed set, the skipped ones removed with it: a push in which
+no rule decodes replaces the installed set with an empty one. The push touches
+only rules: admin fault slots, the delay source and the installed replay set
+stay as they are, and the push carries no version, so the poll's generation is
+left untouched.
+
+Connected to manteion, a pushed set is a short-lived override, like an admin
+fault slot: a push that applied (204 or 422) clears the ETag the instance
+holds, so the next poll is unconditional and its `200` re-applies manteion's
+desired state over the pushed set (a poll already held during the push comes
+back as a late `304` and adopts nothing). A pushed set therefore lasts until
+the next poll completes: at most one long-poll hold (30 s) plus the apply. The
+push sends no status report. Offline, a pushed set holds until the next push.
 
 ## SDK Bootstrap
 
@@ -223,6 +231,7 @@ and the fidelity endpoint alike.
 - Resource faults with `mechanism: quota` need the node agent's cgroup authority. The in-process host has none, so it skips such rules per rule (logged at WARN, counted under `atropos_rules_unsupported_total{category="resource"}`) and rejects a single `/admin/fault` slot with 400; the sidecar delegates resource faults to the node agent when its socket answers at start.
 - Composition rules are skipped per rule on decode (logged at WARN, counted under `atropos_rules_unsupported_total{category="composition"}` and listed under `unsupported` in the status report) — the SDK has no composition evaluator yet (parallel/sequential fault dispatch with direction inheritance is future work).
 - The unexported `decodeRuleSet` (`internal/instrument/decode.go`) sorts decoded rules by `Priority` descending (higher = evaluated first). Equal-priority rules preserve input order. Each rule gets its own outcome: decoded into `Rules`, `Unsupported` (this host cannot execute it, compositions included) or `Errors` (malformed).
+- `/admin/rules` pushes are short-lived while connected: the next poll, at most one long-poll hold later, re-applies manteion's desired state over a pushed set, and a push sends no status report. A push in which no rule decodes replaces the installed set with an empty one (skipped rules removed) and answers 422.
 - A desired-state body with neither an `etag` nor `rules` is manteion's degraded no-document register answer (it could not materialize the desired state: `version: 0`, `rules: null`, `active_faults: null`, no `freeze_cfg`, no `replay_set`). The instance applies nothing for it — it keeps its rules, active-fault slots, delay source and replay set — re-confirms the slots it holds, repeats its status report and keeps polling.
 - Transient (taxonomy 1.3) is implemented for HTTP ingress. Once the response is complete — the handler returned, or an inline error fault short-circuited it — the Transient point is evaluated with the ingress labels plus `atropos.http.status_code`, and a matching fault is started asynchronously on its own goroutine, so the response is never delayed by it (a failed start is only logged). A matching fault always runs in background mode through the fault registry (inline mode is meaningless after the response and is not honoured), detached from the request's cancellation but with its span parented on the request's server span. Armed `/admin/fault` slots and eager arming do not apply at Transient. The gRPC interceptors and `Hook` do not evaluate it.
 

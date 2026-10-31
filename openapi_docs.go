@@ -152,7 +152,7 @@ func swaggerRulesAdminGet() {}
 // swaggerRulesAdminPost documents POST /admin/rules.
 //
 // @Summary  Replace runtime rules
-// @Description  Applies the rule set through the single apply path the manteion sync also uses, scoped to rules: admin fault slots, the delay source and the installed replay set stay as they are. Rules this host cannot execute (a category outside its capabilities, quota resource faults in-process, network host=inline outside the sidecar or host=proxy without a resolver, compositions) are skipped per rule, logged and counted in atropos_rules_unsupported_total{category}; the rest apply and the answer is 204. A rule that does not decode is skipped and logged, not counted, and the answer is 422. The pushed set holds until the next desired-state 200 answer replaces it.
+// @Description  Applies the rule set through the single apply path the manteion sync also uses, scoped to rules: admin fault slots, the delay source and the installed replay set stay as they are. Rules this host cannot execute (a category outside its capabilities, quota resource faults in-process, network host=inline outside the sidecar or host=proxy without a resolver, compositions) are skipped per rule, logged and counted in atropos_rules_unsupported_total{category}; the rest apply and the answer is 204. A rule that does not decode is skipped and logged, not counted, and the answer is 422; the pushed set less the skipped rules replaces the installed one (an empty set when no rule decodes). Connected to manteion, a push is a short-lived override: it clears the ETag the instance holds, so the next poll is unconditional and its 200 re-applies the desired state over the pushed set, at most one long-poll hold plus the apply later; the push sends no status report. Offline, the pushed set holds until the next push.
 // @Tags     admin
 // @Accept   json
 // @Produce  json
@@ -160,7 +160,7 @@ func swaggerRulesAdminGet() {}
 // @Success  204    "rules replaced (rules this host cannot execute are skipped)"
 // @Failure  400    {object}  ErrorResponse  "malformed JSON"
 // @Failure  405    {object}  ErrorResponse  "method not allowed"
-// @Failure  422    {object}  ErrorResponse  "some rules did not decode and were skipped, the rest were applied; error joins the per-rule messages with '; '"
+// @Failure  422    {object}  ErrorResponse  "some rules did not decode and were skipped; the rest replaced the installed set (an empty set when none decoded); error joins the per-rule messages with '; '"
 // @Failure  500    {object}  ErrorResponse  "hard error: this host cannot hold rules, nothing was applied"
 // @Router   /admin/rules [post]
 func swaggerRulesAdminPost() {}

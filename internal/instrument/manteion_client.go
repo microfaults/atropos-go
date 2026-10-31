@@ -54,10 +54,11 @@ var errUnknownInstance = errors.New("manteion does not know this instance (404)"
 // (targets.ApplyMu), the replay-set puller's reconcileMu, the puller's p.mu.
 // syncMu is a leaf, and statusMu is taken with no other lock held.
 //   - applyMu is taken with no lock held: by applyDesired's locked half
-//     (applyAndRecord), the 304 adoption and the watchdog's reap (reapSlots).
-//     Under it, reconcile, confirmSlots and reapStaleSlots take the core's
-//     apply mutex and release it before they return. The /admin/rules push
-//     takes the core's apply mutex alone.
+//     (applyAndRecord), the 304 adoption, the watchdog's reap (reapSlots) and
+//     an /admin/rules push's ETag clear (pushOverride). Under it, reconcile,
+//     confirmSlots and reapStaleSlots take the core's apply mutex and release
+//     it before they return. The push's apply takes the core's apply mutex
+//     alone, and pushOverride runs after it.
 //   - Under the core's apply mutex, reconcile hands the replay set to the
 //     puller: Reconcile takes reconcileMu, then p.mu, and waits for a fetch
 //     it supersedes to stop with p.mu released (that fetch's goroutine takes
@@ -90,19 +91,20 @@ type ManteionClient struct {
 	// syncMu: applyDesired sets them after a successful apply,
 	// adoptGeneration after a 304 that is not late, and forgetDocument zeroes
 	// them when the poll loop recovers from failed polls and when manteion
-	// has lost the registration (recoverRegistration). The one write of
-	// etag alone is reapSlots clearing it when the watchdog drops a slot the
-	// last apply confirmed: the next poll is then unconditional, while the
-	// generation stays the one held. Every writer but adoptGeneration also
-	// bumps applySeq.
+	// has lost the registration (recoverRegistration). The writes of etag
+	// alone clear it: reapSlots when the watchdog drops a slot the last apply
+	// confirmed, pushOverride after an /admin/rules push. The next poll is
+	// then unconditional, while the generation stays the one held. Every
+	// writer but adoptGeneration also bumps applySeq.
 	ruleVersion atomic.Uint64
 	lastPollAt  atomic.Int64 // unix nanos; 0 = never polled
 	status      atomic.Int32
 
 	// applyMu serializes applyDesired's apply with its bookkeeping
-	// (applyAndRecord), the 304 adoption and the watchdog's reap: an apply and
-	// the generation/ETag/report bookkeeping that follows it are one unit, so
-	// a register goroutine, the poll loop and the watchdog never interleave.
+	// (applyAndRecord), the 304 adoption, the watchdog's reap and a push's ETag
+	// clear: an apply and the generation/ETag/report bookkeeping that follows
+	// it are one unit, so a register goroutine, the poll loop, the watchdog
+	// and an /admin/rules push never interleave.
 	applyMu sync.Mutex
 	// confirmed lists the active-fault slots the last successful apply that
 	// reconciled slots confirmed, less any the watchdog has dropped since.
@@ -118,9 +120,9 @@ type ManteionClient struct {
 	lastReport    applyReport // what the last apply could not hold
 	statusPending bool        // the last status report failed; retryStatus re-sends it, and so does the poll loop before its next poll
 	// applySeq counts the changes to the record of the document held: every
-	// applyDesired, forgetDocument and reapSlots' ETag clear bumps it. A poll
-	// snapshots it with the generation and ETag it sends, and its 304 is
-	// adopted only while applySeq is unchanged (adoptGeneration).
+	// applyDesired, forgetDocument, and ETag clear (reapSlots, pushOverride)
+	// bumps it. A poll snapshots it with the generation and ETag it sends, and
+	// its 304 is adopted only while applySeq is unchanged (adoptGeneration).
 	applySeq uint64
 	// recovery is the recovery of a lost registration (claimRecovery). It
 	// stays active from the re-register until a status report lands, so a
@@ -715,6 +717,28 @@ func (c *ManteionClient) reapSlots(grace time.Duration) {
 	c.etag = ""
 	c.syncMu.Unlock()
 	c.logger.Warn("watchdog: dropped a slot of the desired state; the next poll fetches the desired state in full")
+}
+
+// pushOverride records an /admin/rules push: the rules the instance holds are
+// no longer the document its ETag names, so the ETag is cleared (bumping
+// applySeq), as reapSlots does. The next poll is unconditional -- manteion
+// answers it at once -- and its 200 re-applies the desired state over the
+// pushed set; a poll already out comes back as a late 304 and adopts
+// nothing. The generation held stays, and no status report goes out. It takes
+// applyMu, so it comes after any apply in progress and its bookkeeping, which
+// cannot then record an ETag over the pushed set. Nil-safe: offline there is
+// no ETag to clear.
+func (c *ManteionClient) pushOverride() {
+	if c == nil {
+		return
+	}
+	c.applyMu.Lock()
+	defer c.applyMu.Unlock()
+	c.syncMu.Lock()
+	c.applySeq++
+	c.etag = ""
+	c.syncMu.Unlock()
+	c.logger.Info("rules pushed through /admin/rules; the next poll re-applies the desired state")
 }
 
 // statusTimeout bounds one status report POST.
