@@ -64,6 +64,14 @@ type cacheDrainTracker struct {
 
 	mu     sync.Mutex
 	active map[recordingPhaseKey]bool
+
+	// drainMu runs the drains one at a time. A drain's flush takes over
+	// whatever batch the push client holds, of any pair, and posts it before
+	// the report is built; a second drain built meanwhile would snapshot its
+	// pair's counts with that batch still in flight and report them short.
+	// Not an apply lock: drains run after those are released, so the I/O stays
+	// outside them.
+	drainMu sync.Mutex
 }
 
 // newCacheDrainTracker builds a tracker that flushes cb and reports through
@@ -98,12 +106,15 @@ func (t *cacheDrainTracker) Observe(rules []wire.CompiledRule) []recordingPhaseK
 // Drain synchronously flushes cb and sends a drain report via pusher for
 // each phase in ended (what Observe returned). It is network I/O -- the push
 // client's flush, then the drain POST, each retried -- so callers run it with
-// no lock held. Best-effort: a drain failure is logged, never returned, so it
-// never blocks rule application. Nil-safe.
+// no apply lock held; concurrent drains wait for each other (drainMu).
+// Best-effort: a drain failure is logged, never returned, so it never blocks
+// rule application. Nil-safe.
 func (t *cacheDrainTracker) Drain(ended []recordingPhaseKey) {
-	if t == nil {
+	if t == nil || len(ended) == 0 {
 		return
 	}
+	t.drainMu.Lock()
+	defer t.drainMu.Unlock()
 	for _, key := range ended {
 		resp := t.pusher.SendDrainReport(key.ExperimentID, key.PhaseID, t.cb)
 		if !resp.Accepted {

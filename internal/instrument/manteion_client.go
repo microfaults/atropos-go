@@ -36,9 +36,10 @@ const (
 type recoveryState int
 
 const (
-	recoveryNone   recoveryState = iota // no recovery: manteion knows the instance, as far as the client can tell
-	recoveryQueued                      // a status report's 404 claimed it; recoverRegistrations has not started it yet
-	recoveryActive                      // a re-register is under way or done, and no status report has landed since
+	recoveryNone        recoveryState = iota // no recovery: manteion knows the instance, as far as the client can tell
+	recoveryQueued                           // a status report's 404 claimed it; recoverRegistrations has not started it yet
+	recoveryRegistering                      // the re-register is under way
+	recoveryRegistered                       // the re-register went through, and no status report has landed since
 )
 
 // errUnknownInstance is a poll answered 404: manteion no longer knows this
@@ -72,10 +73,11 @@ var errUnknownInstance = errors.New("manteion does not know this instance (404)"
 //   - syncMu is taken under applyMu (the bookkeeping, adoptGeneration,
 //     reapSlots) and under statusMu, and nothing is taken under it.
 //
-// No lock is held across network I/O but statusMu, which exists to send the
-// reports one at a time: polls and registrations go out with no lock held,
-// and applyDesired releases applyMu -- apply, the core's mutex -- before the
-// drain reports and the status report go out.
+// No apply lock is held across network I/O: polls and registrations go out
+// with no lock held, and applyDesired releases applyMu -- apply, the core's
+// mutex -- before the drain reports and the status report go out. The two
+// locks held across I/O exist to send reports one at a time: statusMu, and
+// the drain tracker's drainMu, taken with no other lock held.
 type ManteionClient struct {
 	cfg        manteionConfig
 	httpClient *http.Client // short-lived calls: init, register, status, deregister, a poll without a hold
@@ -119,15 +121,17 @@ type ManteionClient struct {
 	etag          string      // ETag of the document held, sent as If-None-Match; "" = none (writers: see ruleVersion)
 	lastReport    applyReport // what the last apply could not hold
 	statusPending bool        // the last status report failed; retryStatus re-sends it, and so does the poll loop before its next poll
-	// applySeq counts the changes to the record of the document held: every
-	// applyDesired, forgetDocument, and ETag clear (reapSlots, pushOverride)
-	// bumps it. A poll snapshots it with the generation and ETag it sends, and
-	// its 304 is adopted only while applySeq is unchanged (adoptGeneration).
+	// applySeq counts the changes to the record of the document held:
+	// applyDesired bumps it as it starts and again in the same syncMu section
+	// that records what it applied, and forgetDocument and the ETag clears
+	// (reapSlots, pushOverride) bump it with their writes. A poll snapshots it
+	// with the generation and ETag it sends, and its 304 is adopted only while
+	// applySeq is unchanged (adoptGeneration).
 	applySeq uint64
 	// recovery is the recovery of a lost registration (claimRecovery). It
-	// stays active from the re-register until a status report lands, so a
-	// manteion that goes on answering 404 is registered with once per loss,
-	// not in a loop.
+	// holds from the 404 that claims it until a status report lands -- through
+	// the re-register and after it -- so a manteion that goes on answering 404
+	// is registered with once per loss, not in a loop.
 	recovery recoveryState
 
 	statusMu sync.Mutex // serializes sending: reports go out one at a time, in order
@@ -310,8 +314,11 @@ var pollFloor = time.Second
 // A poll answered 404 means manteion no longer knows this instance: the loop
 // takes the recovery path at once (recoverRegistration: forget the document
 // held, register again, apply the answer) and resumes polling without a
-// failure's backoff. Once per loss: a 404 while an earlier recovery's report
-// has not landed is an ordinary failed poll (claimRecovery).
+// failure's backoff. Once per loss (claimRecovery): a 404 while the status
+// path's recovery is queued or under way is no failure either -- the loop
+// polls again once pollFloor has passed, and the restored path after it
+// stays untaken -- but a 404 after a re-register that went through, while
+// no report has landed since, is an ordinary failed poll.
 func (c *ManteionClient) pollLoopWithTrigger(ctx context.Context, trigger <-chan struct{}) {
 	var delay time.Duration // with a hold, straight into the held poll
 	if c.cfg.pollWait == 0 {
@@ -330,13 +337,23 @@ func (c *ManteionClient) pollLoopWithTrigger(ctx context.Context, trigger <-chan
 		c.resendStatus(ctx)
 		start := time.Now()
 		err := c.fetchRules(ctx)
-		if errors.Is(err, errUnknownInstance) && c.claimRecovery(recoveryActive) {
-			if err = c.recoverRegistration(ctx, "poll"); err == nil {
+		if errors.Is(err, errUnknownInstance) {
+			switch c.claimRecovery(recoveryRegistering) {
+			case recoveryNone: // claimed: recover now
+				if err = c.recoverRegistration(ctx, "poll"); err == nil {
+					consecutiveFailures = 0
+					c.status.Store(int32(manteionConnected))
+					delay = c.nextPollDelay(start)
+					continue
+				}
+			case recoveryQueued, recoveryRegistering:
+				// The status path is registering again: wait for it. Not a
+				// failed poll, and nothing for the restored path to redo.
 				consecutiveFailures = 0
-				c.status.Store(int32(manteionConnected))
-				delay = c.nextPollDelay(start)
+				delay = max(0, pollFloor-time.Since(start))
 				continue
 			}
+			// recoveryRegistered, or a re-register that failed: a failed poll.
 		}
 		if err != nil {
 			if ctx.Err() != nil {
@@ -380,34 +397,42 @@ func (c *ManteionClient) nextPollDelay(start time.Time) time.Duration {
 
 // claimRecovery claims the recovery of a registration manteion has lost, as
 // next (recoveryQueued for a status report's 404, which recoverRegistrations
-// takes up; recoveryActive for the poll loop, which recovers at once). It
-// reports false while another recovery is queued or active: one recovery per
-// loss, until a status report lands (postStatus) or the re-register fails.
-func (c *ManteionClient) claimRecovery(next recoveryState) bool {
+// takes up; recoveryRegistering for the poll loop, which recovers at once),
+// when none is claimed. It returns the state it found: recoveryNone means the
+// claim is the caller's; any other is a recovery of the same loss, queued,
+// under way or done -- one per loss, until a status report lands (postStatus)
+// or the re-register fails.
+func (c *ManteionClient) claimRecovery(next recoveryState) (found recoveryState) {
 	c.syncMu.Lock()
 	defer c.syncMu.Unlock()
-	if c.recovery != recoveryNone {
-		return false
+	found = c.recovery
+	if found == recoveryNone {
+		c.recovery = next
 	}
-	c.recovery = next
-	return true
+	return found
 }
 
 // recoverRegistration is the recovery path for a registration manteion has
 // lost: forget the document held (forgetDocument), then register again,
 // applying the answer in full and reporting it (register, applyDesired). A
-// register that fails releases the claim, so a later 404 tries again.
+// re-register that went through leaves the claim recoveryRegistered until a
+// report lands; one that fails releases it, so a later 404 tries again.
 func (c *ManteionClient) recoverRegistration(ctx context.Context, source string) error {
 	c.logger.Warn("manteion does not know this instance; registering again", "source", source)
 	c.forgetDocument()
-	if err := c.register(ctx); err != nil {
-		c.syncMu.Lock()
+	err := c.register(ctx)
+	c.syncMu.Lock()
+	switch {
+	case err != nil:
 		c.recovery = recoveryNone
-		c.syncMu.Unlock()
-		c.logger.Warn("re-register failed", "source", source, "error", err)
-		return err
+	case c.recovery == recoveryRegistering: // the register's own report did not land
+		c.recovery = recoveryRegistered
 	}
-	return nil
+	c.syncMu.Unlock()
+	if err != nil {
+		c.logger.Warn("re-register failed", "source", source, "error", err)
+	}
+	return err
 }
 
 // recoverRegistrations runs the recovery a status report's 404 queued
@@ -425,7 +450,7 @@ func (c *ManteionClient) recoverRegistrations(ctx context.Context) {
 		c.syncMu.Lock()
 		queued := c.recovery == recoveryQueued
 		if queued {
-			c.recovery = recoveryActive
+			c.recovery = recoveryRegistering
 		}
 		c.syncMu.Unlock()
 		if queued {
@@ -587,9 +612,11 @@ func (c *ManteionClient) forgetDocument() {
 // re-confirm the held slots (confirmSlots), as a 304 does; a hard error does
 // not: a document the instance cannot hold vouches for nothing, so the held
 // slots age out under the watchdog unless a later answer confirms them.
-// Every outcome bumps applySeq, so a poll out meanwhile comes back late, and
-// sends the status report; a failed report is marked pending by sendStatus,
-// never returned: applyDesired returns nil.
+// Every outcome bumps applySeq as the apply starts, and a successful apply
+// bumps it again where it records the generation and ETag, so a poll out
+// meanwhile -- or snapshotted while reconcile ran -- comes back late; every
+// outcome sends the status report. A failed report is marked pending by
+// sendStatus, never returned: applyDesired returns nil.
 func (c *ManteionClient) applyDesired(ctx context.Context, doc wire.RuleSync, etag, source string) error {
 	ended := c.applyAndRecord(doc, etag, source)
 	c.targets.CacheDrain.Drain(ended)
@@ -631,6 +658,10 @@ func (c *ManteionClient) applyAndRecord(doc wire.RuleSync, etag, source string) 
 		c.confirmed = report.Confirmed
 	}
 	c.syncMu.Lock()
+	// Bumped again with the record: a poll that snapshotted the record while
+	// reconcile ran paired the early bump with the document held before, and
+	// its 304 must come back late.
+	c.applySeq++
 	c.ruleVersion.Store(doc.Version)
 	c.etag = etag
 	c.lastReport = report
@@ -833,7 +864,7 @@ func (c *ManteionClient) postStatus(ctx context.Context) {
 	resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
 		c.statusFailed("status report rejected: manteion does not know this instance", fmt.Errorf("status %d", resp.StatusCode))
-		if c.claimRecovery(recoveryQueued) {
+		if c.claimRecovery(recoveryQueued) == recoveryNone {
 			select {
 			case c.recoverWake <- struct{}{}:
 			default:

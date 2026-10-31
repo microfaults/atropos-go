@@ -502,6 +502,7 @@ type fakeManteion struct {
 	statusCode int                                          // response to POST /api/v1/sdk/status; 0 = 204
 	failStatus int                                          // the next failStatus reports are answered 500 whatever statusCode says
 	lost       bool                                         // manteion lost the registration: reports are answered 404 until the instance registers again
+	holdReg    chan struct{}                                // when non-nil, a register is recorded, then answered once it is closed
 	register   string                                       // 201 body; default `{"status":"registered","version":0,"rules":[],"active_faults":[]}`; read under mu
 	rules      func(w http.ResponseWriter, r *http.Request) // answers GET /api/v1/sdk/rules; read and written under mu (setRules)
 }
@@ -524,6 +525,16 @@ func newFakeManteion(t *testing.T) *fakeManteion {
 			_ = json.NewDecoder(r.Body).Decode(&reg)
 			f.mu.Lock()
 			f.registers = append(f.registers, reg)
+			hold := f.holdReg
+			f.mu.Unlock()
+			if hold != nil {
+				select {
+				case <-hold:
+				case <-r.Context().Done():
+					return
+				}
+			}
+			f.mu.Lock()
 			f.lost = false
 			body := f.register
 			f.mu.Unlock()
@@ -1593,6 +1604,71 @@ func TestFetchRules_Late304WithTheSameEtagKeepsTheNewerGeneration(t *testing.T) 
 	}
 }
 
+// waitClosed waits up to 5 s for ch to be closed (or to deliver).
+func waitClosed(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+// TestFetchRules_PollSnapshottedMidApplyAdoptsNothing: applyDesired records
+// the generation and ETag it applied only after reconcile, so a poll that
+// snapshots the record while reconcile runs still sees the document held
+// before. Its 304 vouches for that older document and must come back late:
+// recording the apply moves the sequence again. The register's generation 1
+// and ETag 1-b stay -- the poll's 2 / 2-c would never heal, since the next
+// poll would be conditional on an ETag the instance does not hold.
+func TestFetchRules_PollSnapshottedMidApplyAdoptsNothing(t *testing.T) {
+	f := newFakeManteion(t)
+	// The register answer carries a background rule, so eager arming runs inside reconcile.
+	f.register = registerAnswer(t, wire.RuleSync{Version: 1, Etag: "1-b", Rules: threeRules()[1:2], ActiveFaults: []wire.FaultRequest{}})
+	f.setRules(respond200(wire.RuleSync{Version: 2, Etag: "2-c", Rules: []wire.CompiledRule{}, ActiveFaults: []wire.FaultRequest{}}))
+	var block atomic.Bool
+	armed, proceed := make(chan struct{}), make(chan struct{})
+	var release sync.Once
+	t.Cleanup(func() { release.Do(func() { close(proceed) }) })
+	c := f.client(applyTargets{Evaluator: newTestEvaluator(), Arm: func(evaluator.InjectionPoint, *evaluator.Decision) {
+		if block.Load() {
+			close(armed)
+			<-proceed
+		}
+	}})
+	if err := c.fetchRules(t.Context()); err != nil { // the instance holds 2 / 2-c
+		t.Fatal(err)
+	}
+	polled := make(chan struct{})
+	f.setRules(func(w http.ResponseWriter, r *http.Request) {
+		close(polled) // sent, so its snapshot is taken
+		respond304("2", "2-c")(w, r)
+	})
+
+	block.Store(true)
+	registered := make(chan error, 1)
+	go func() { registered <- c.register(context.Background()) }() // applies 1 / 1-b; held in eager arming
+	waitClosed(t, armed, "the register's reconcile to reach eager arming")
+	answered := make(chan error, 1)
+	go func() { answered <- c.fetchRules(context.Background()) }() // snapshots 2 / 2-c mid-apply
+	waitClosed(t, polled, "the poll to be sent")
+	release.Do(func() { close(proceed) })
+	for _, done := range []chan error{registered, answered} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("the register or the poll did not return")
+		}
+	}
+	if c.ruleVersion.Load() != 1 || c.currentEtag() != "1-b" || syncGeneration(t) != 1 {
+		t.Fatalf("gen=%d etag=%q gauge=%v, want the register's 1 / 1-b: a poll snapshotted mid-apply must come back late",
+			c.ruleVersion.Load(), c.currentEtag(), syncGeneration(t))
+	}
+}
+
 // TestFetchRules_Late304AfterAForgetAdoptsNothing: forgetting the document
 // held (a recovery) while a poll is out makes that poll's 304 late, so it
 // cannot restore the generation and ETag just dropped: the next poll stays
@@ -2000,6 +2076,71 @@ func TestConnectManteion_Persistent404ReRegistersOnlyOnce(t *testing.T) {
 	}
 	if !c.statusIsPending() {
 		t.Fatal("a report answered 404 must stay pending for its retry")
+	}
+}
+
+// TestConnectManteion_Poll404DuringTheStatusRecoveryWaitsForIt: manteion lost
+// the registration and answers both the status report and the poll 404 until
+// the instance registers again. The status report's 404 claims the recovery
+// first; a poll answered 404 while that re-register is under way is not a
+// failed poll -- the loop polls again after the floor and stays connected --
+// and once the re-register lands the loop resumes without taking the restored
+// path: exactly one register for the one loss.
+func TestConnectManteion_Poll404DuringTheStatusRecoveryWaitsForIt(t *testing.T) {
+	pollFloor = 20 * time.Millisecond
+	t.Cleanup(func() { pollFloor = time.Second })
+	f := newFakeManteion(t)
+	f.register = registerAnswer(t, wire.RuleSync{Version: 1, Etag: "1-a", Rules: []wire.CompiledRule{}, ActiveFaults: []wire.FaultRequest{}})
+	// Polls answer 404 only once pollLost is set and until the instance
+	// registers again (f.lost), so the status path claims the recovery first.
+	var pollLost atomic.Bool
+	f.setRules(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		lost := f.lost
+		f.mu.Unlock()
+		if lost && pollLost.Load() {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		respond304("1", "1-a")(w, r) // answered at once: the loop polls every pollFloor
+	})
+	c, err := connectManteion(t.Context(), manteionConfig{
+		url: f.srv.URL, serviceName: "svc", instanceID: "pod-1",
+		initTimeout: 5 * time.Second, pollInterval: 100 * time.Millisecond, pollWait: 30 * time.Second,
+		targets:    applyTargets{Evaluator: newTestEvaluator()},
+		httpClient: &http.Client{Timeout: 5 * time.Second},
+		logger:     slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+	f.waitStatuses(t, 1) // the register's report, delivered
+
+	gate := make(chan struct{})
+	f.mu.Lock()
+	f.lost = true
+	f.holdReg = gate // the re-register stays under way until the gate opens
+	f.mu.Unlock()
+	c.sendStatus(t.Context()) // 404: the status path claims the recovery
+	waitFor(t, 5*time.Second, func() bool { return len(f.registered()) == 2 })
+	pollLost.Store(true) // the re-register is under way: polls are answered 404 too
+	polls, _ := f.snapshot()
+	f.waitPolls(t, len(polls)+1) // a poll answered 404 while the re-register is under way
+	if c.Status() != manteionConnected {
+		t.Fatalf("status = %v, want connected: a poll answered 404 while the recovery is under way is not a failure", c.Status())
+	}
+	f.waitPolls(t, len(polls)+3) // re-polled after the floor, not after a failure's backoff
+
+	f.mu.Lock()
+	f.holdReg = nil
+	f.mu.Unlock()
+	close(gate) // the re-register lands: manteion knows the instance again
+	waitFor(t, 5*time.Second, func() bool { return !c.statusIsPending() })
+	polls, _ = f.snapshot()
+	f.waitPolls(t, len(polls)+3) // polling resumed, answered 304
+	if n := len(f.registered()); n != 2 || c.Status() != manteionConnected {
+		t.Fatalf("registers=%d status=%v, want 2 and connected: one register for the one loss, no restored path after it", n, c.Status())
 	}
 }
 

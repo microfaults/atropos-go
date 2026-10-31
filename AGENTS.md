@@ -176,8 +176,10 @@ sync loop, the status report and the replay-set pull are internal to `Serve`
   no longer knows the instance (a database reset, an instance-id collision):
   the instance drops the generation and ETag it holds and registers again,
   applying the answer, then resumes polling. Once per loss: until a report
-  lands again, a further `404` does not register again (the report stays
-  pending for its retry; a poll counts as failed).
+  lands again, a further `404` does not register again. The report stays
+  pending for its retry; a poll answered `404` while the re-register is under
+  way waits for it (re-polled after the 1 s floor, not counted as a failure),
+  and one after a re-register that went through counts as a failed poll.
 - **Replay set.** A `replay_set` whose `id` differs from the committed one is
   pulled by the instance itself (`GET /api/v1/cache/artifacts/{id}` in `Range`
   chunks of at most 4 MiB, staged through the preload path, committed when the

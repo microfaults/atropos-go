@@ -443,7 +443,9 @@ it:
   database was reset, or another pod deregistered the same id): the instance
   drops the held generation and ETag and registers again at once, applying the
   answer; once per loss, so while the report after that re-register has not
-  landed a further `404` does not register again. The SSE `rules_changed` nudge
+  landed a further `404` does not register again (a poll answered `404` while
+  the re-register is under way is re-polled after the 1 s floor, not counted as
+  a failure). The SSE `rules_changed` nudge
   (`GET /api/v1/sdk/events`) is kept and ends any wait between polls early.
 - **Watchdog.** A fault slot that stays unconfirmed for
   `max(3·max(interval, hold), 30 s)` is dropped: 90 s by default. A `200` that
