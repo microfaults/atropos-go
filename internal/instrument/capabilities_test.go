@@ -98,6 +98,10 @@ func TestApply_UnsupportedActiveFaultDoesNotWedgeSync(t *testing.T) {
 func TestRegister_CarriesHostAndCapabilities(t *testing.T) {
 	var body []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/sdk/register" { // e.g. the status report register sends after applying
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		body, _ = io.ReadAll(r.Body)
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(wire.RegisterResponse{Status: "registered"})

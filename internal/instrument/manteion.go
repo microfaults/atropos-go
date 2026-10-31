@@ -76,7 +76,27 @@ func connectManteion(ctx context.Context, cfg manteionConfig) (*ManteionClient, 
 		return nil, err
 	}
 
+	// The replay-set puller, when there is a cache box to install into. It is
+	// wired before register, whose answer may already name a set: apply hands
+	// it every document's replay set, its artifact requests carry the
+	// client's auth, and each state it reaches on its own (committed, failed)
+	// is reported.
+	if cfg.targets.CacheBox != nil {
+		c.puller = newReplaySetPuller(replaySetPullerConfig{
+			BaseURL: cfg.url,
+			Client:  &http.Client{Transport: cfg.httpClient.Transport},
+			NewRequest: func(ctx context.Context, method, target string) (*http.Request, error) {
+				return c.newReq(ctx, method, target, nil)
+			},
+			CacheBox: cfg.targets.CacheBox,
+			Logger:   cfg.logger,
+			OnChange: func() { c.sendStatus(context.Background()) },
+		})
+		c.targets.ReplaySet = c.puller
+	}
+
 	if err := c.register(ctx); err != nil {
+		c.puller.Close()
 		return nil, fmt.Errorf("connectManteion: register: %w", err)
 	}
 
@@ -105,7 +125,7 @@ func connectManteion(ctx context.Context, cfg manteionConfig) (*ManteionClient, 
 	})
 	if c.targets.DemoEval != nil {
 		c.wg.Go(func() {
-			startFaultWatchdog(pollCtx, c.targets.DemoEval, c.targets.Registry, cfg.pollInterval, c.logger)
+			startFaultWatchdog(pollCtx, c.targets.DemoEval, c.targets.Registry, c.targets.ApplyMu, cfg.pollInterval, c.logger)
 		})
 	}
 	c.status.Store(int32(manteionConnected))
@@ -126,6 +146,7 @@ type manteionConfig struct {
 	capabilities   []string     // advertised fault categories (register payload)
 	initTimeout    time.Duration
 	pollInterval   time.Duration
+	pollWait       time.Duration // long-poll hold each rules poll asks manteion for (wait=<seconds>); 0 = answer at once
 	offline        bool
 	targets        applyTargets
 	httpClient     *http.Client

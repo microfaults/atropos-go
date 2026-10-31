@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -135,6 +136,13 @@ const (
 type applyReport struct {
 	Unsupported []wire.UnsupportedRule
 	Errors      []string
+	// Confirmed lists, in document order, the document's active-fault slots
+	// this apply holds and confirmed: afterwards they are exactly the slots
+	// held, save an /admin/fault slot armed meanwhile. Nil when apply left
+	// the slots alone (no active_faults, or a scope without scopeFaults). Not
+	// part of the status report: the manteion client keeps it to re-confirm
+	// the slots on every later answer (confirmSlots).
+	Confirmed []string
 }
 
 // apply reconciles targets with one desired-state document. It is the only
@@ -176,9 +184,10 @@ type applyReport struct {
 // that does not decode ("rule <name>: decode: ..."), a slot that does not
 // build ("active_fault <id>: ..."), a freeze config that does not validate
 // ("freeze_cfg: ...") and a replay set with no puller to fetch it
-// ("replay_set <id>: ...") go to Errors. A rejected slot or freeze config
-// installs nothing: an earlier slot under the same id stays armed but
-// unconfirmed, so the watchdog reaps it; an earlier delay source stays.
+// ("replay_set <id>: ...") go to Errors. A slot that cannot be held installs
+// nothing and clears an earlier slot under the same id, stopping its running
+// fault, so the slots held are exactly the ones report.Confirmed names. A
+// rejected freeze config installs nothing; an earlier delay source stays.
 //
 // Hard errors -- a category present with no target to apply it to: rules
 // without an Evaluator, active faults without a DemoEval, a freeze config
@@ -245,7 +254,11 @@ func apply(sync wire.RuleSync, targets applyTargets, scope applyScope) (applyRep
 
 		// Apply / refresh slots that ARE in the document. Confirm refreshes the
 		// watchdog heartbeat so the slot survives until its server-side lifetime
-		// ends; a slot that cannot be held is reported and never confirmed.
+		// ends. A slot that cannot be held is reported, and an earlier slot
+		// under its id is cleared and its running fault stopped: the held
+		// slots must be exactly the confirmed ones, or the client would keep
+		// an unbuildable redefinition's predecessor alive on every 304.
+		report.Confirmed = make([]string, 0, len(sync.ActiveFaults))
 		for _, req := range sync.ActiveFaults {
 			id := req.ID
 			if id == "" {
@@ -258,9 +271,15 @@ func apply(sync wire.RuleSync, targets applyTargets, scope applyScope) (applyRep
 				} else {
 					report.Errors = append(report.Errors, fmt.Sprintf("active_fault %s: %v", id, err))
 				}
+				targets.DemoEval.ClearSlot(id)
+				stopFaults(targets.Registry, id)
+				report.Confirmed = slices.DeleteFunc(report.Confirmed, func(c string) bool { return c == id })
 				continue
 			}
 			targets.DemoEval.Confirm(id)
+			if !slices.Contains(report.Confirmed, id) { // an id repeated in the document is held once
+				report.Confirmed = append(report.Confirmed, id)
+			}
 		}
 	}
 
@@ -383,12 +402,13 @@ func applyFreezeCfg(req wire.DelayRequest, cb *cachebox.CacheBox) error {
 }
 
 // startFaultWatchdog runs until ctx is cancelled. Every tick, drops any
-// fault slot whose lastConfirmedAt is older than the grace period.
+// fault slot whose lastConfirmedAt is older than the grace period
+// (reapStaleSlots, under applyMu, the core's apply mutex).
 //
 // Grace = max(3 * pollInterval, 30s). This is the only mechanism that
 // protects against zombie faults when duration_ms = 0 (infinite) AND
 // Manteion crashes.
-func startFaultWatchdog(ctx context.Context, eval *demoEvaluator, reg *interceptor.FaultRegistry, pollInterval time.Duration, logger interface{ Warn(string, ...any) }) {
+func startFaultWatchdog(ctx context.Context, eval *demoEvaluator, reg *interceptor.FaultRegistry, applyMu *sync.Mutex, pollInterval time.Duration, logger interface{ Warn(string, ...any) }) {
 	grace := 3 * pollInterval
 	if grace < 30*time.Second {
 		grace = 30 * time.Second
@@ -400,15 +420,28 @@ func startFaultWatchdog(ctx context.Context, eval *demoEvaluator, reg *intercept
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			for _, cat := range eval.StaleSlots(grace) {
-				eval.ClearSlot(cat)
-				// Clearing the slot only stops NEW starts; the zombie guard
-				// is only real if the running instance dies too.
-				stopFaults(reg, cat)
-				if logger != nil {
-					logger.Warn("watchdog: dropped stale fault slot", "category", cat, "grace", grace)
-				}
-			}
+			reapStaleSlots(eval, reg, applyMu, grace, logger)
+		}
+	}
+}
+
+// reapStaleSlots is one watchdog pass: every slot not confirmed within grace
+// is cleared and its running faults stopped. The pass holds applyMu, the
+// core's apply mutex (nil = no locking), from the staleness check to the last
+// clear, so a slot that an apply or the client's confirmSlots refreshes in
+// between is never dropped.
+func reapStaleSlots(eval *demoEvaluator, reg *interceptor.FaultRegistry, applyMu *sync.Mutex, grace time.Duration, logger interface{ Warn(string, ...any) }) {
+	if applyMu != nil {
+		applyMu.Lock()
+		defer applyMu.Unlock()
+	}
+	for _, cat := range eval.StaleSlots(grace) {
+		eval.ClearSlot(cat)
+		// Clearing the slot only stops NEW starts; the zombie guard
+		// is only real if the running instance dies too.
+		stopFaults(reg, cat)
+		if logger != nil {
+			logger.Warn("watchdog: dropped stale fault slot", "category", cat, "grace", grace)
 		}
 	}
 }

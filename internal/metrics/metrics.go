@@ -98,6 +98,15 @@ var (
 		Name: "atropos_replay_set_state",
 		Help: "Replay-set pull state of this instance (1 for the current state).",
 	}, []string{"state"})
+
+	// SyncGeneration is the generation of the desired state this instance
+	// holds: the one its last successful apply installed, or the one a 304
+	// confirmed unchanged. manteion's convergence barrier waits on the same
+	// number (observed_generation), so the two can be compared directly.
+	SyncGeneration = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "atropos_sync_generation",
+		Help: "Generation of the desired state this instance holds.",
+	})
 )
 
 func init() {
@@ -114,6 +123,7 @@ func init() {
 		ProxyInflight,
 		RulesUnsupportedTotal,
 		ReplaySetState,
+		SyncGeneration,
 	)
 }
 

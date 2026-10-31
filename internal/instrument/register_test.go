@@ -9,12 +9,15 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
+	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
 	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
@@ -679,5 +682,103 @@ func TestApply_NoDocumentAppliesNothing(t *testing.T) {
 	}
 	if cb.ReplaySetLen() != 1 {
 		t.Fatalf("replay set has %d entries, want the installed one kept", cb.ReplaySetLen())
+	}
+}
+
+// TestApply_SlotThatCannotBeHeldIsCleared: a slot whose new definition does
+// not build, or that this host cannot run, is cleared and its running fault
+// stopped, so the slots held are exactly the ones the document applied --
+// the ones Confirmed names.
+func TestApply_SlotThatCannotBeHeldIsCleared(t *testing.T) {
+	demo := &demoEvaluator{}
+	reg := interceptor.NewFaultRegistry()
+	t.Cleanup(reg.Close)
+	targets := applyTargets{DemoEval: demo, Registry: reg, DecodeOpts: []decodeOption{WithCapabilities(CapInline)}}
+	lat := func(id, delay string) wire.FaultRequest {
+		return wire.FaultRequest{ID: id, Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"` + delay + `"}`)}
+	}
+	report, err := apply(wire.RuleSync{Etag: "1-a", ActiveFaults: []wire.FaultRequest{
+		lat("slot-bad", "1ms"), lat("slot-unsup", "1ms"), lat("slot-ok", "1ms"),
+	}}, targets, scopeAll)
+	if err != nil || !reflect.DeepEqual(report.Confirmed, []string{"slot-bad", "slot-unsup", "slot-ok"}) {
+		t.Fatalf("seed: err=%v confirmed=%v", err, report.Confirmed)
+	}
+	hBad, _, err := reg.StartOrJoin("slot-bad", evaluator.DeduplicateByRule, seedLongFault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hUnsup, _, err := reg.StartOrJoin("slot-unsup", evaluator.DeduplicateByRule, seedLongFault)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hOK, _, err := reg.StartOrJoin("slot-ok", evaluator.DeduplicateByRule, seedLongFault)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	report, err = apply(wire.RuleSync{Etag: "2-b", ActiveFaults: []wire.FaultRequest{
+		lat("slot-bad", "bogus"), // no longer builds
+		{ID: "slot-unsup", Category: "resource", FaultType: "cpu", DurationMs: 1000, Params: json.RawMessage(`{"target_load":0.1}`)}, // not runnable here
+		lat("slot-ok", "2ms"),
+	}}, targets, scopeAll)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids := demo.ActiveIDs(); !reflect.DeepEqual(ids, []string{"slot-ok"}) {
+		t.Fatalf("slots = %v, want only slot-ok: a slot that cannot be held is cleared", ids)
+	}
+	if !reflect.DeepEqual(report.Confirmed, []string{"slot-ok"}) {
+		t.Fatalf("confirmed = %v, want [slot-ok]", report.Confirmed)
+	}
+	if len(report.Errors) != 1 || len(report.Unsupported) != 1 {
+		t.Fatalf("report = %+v, want slot-bad among the errors and slot-unsup unsupported", report)
+	}
+	for id, h := range map[string]*fault.Handle{"slot-bad": hBad, "slot-unsup": hUnsup} {
+		select {
+		case <-h.Done():
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s was cleared; its running fault must stop", id)
+		}
+	}
+	select {
+	case <-hOK.Done():
+		t.Fatal("slot-ok still applies; its fault must keep running")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// ageSlots backdates every slot's last confirmation by d.
+func ageSlots(demo *demoEvaluator, d time.Duration) {
+	demo.mu.Lock()
+	defer demo.mu.Unlock()
+	for _, s := range demo.slots {
+		s.lastConfirmedAt = s.lastConfirmedAt.Add(-d)
+	}
+}
+
+// TestReapStaleSlots_WaitsForAnApplyInProgress: the watchdog's reap holds the
+// core's apply mutex, so it cannot clear a slot that an apply (or a poll
+// answer re-confirming the held slots) refreshes while the reap waits.
+func TestReapStaleSlots_WaitsForAnApplyInProgress(t *testing.T) {
+	demo := &demoEvaluator{}
+	demo.Set(&evaluator.Decision{Name: "slot-a"}, &wire.FaultRequest{ID: "slot-a"})
+	ageSlots(demo, time.Hour)
+	var applyMu sync.Mutex
+	applyMu.Lock() // an apply in progress
+	reaped := make(chan struct{})
+	go func() {
+		defer close(reaped)
+		reapStaleSlots(demo, nil, &applyMu, 30*time.Second, nil)
+	}()
+	select {
+	case <-reaped:
+		t.Fatal("the reap ran while an apply held the mutex")
+	case <-time.After(50 * time.Millisecond):
+	}
+	demo.Confirm("slot-a") // the apply refreshes the slot
+	applyMu.Unlock()
+	<-reaped
+	if ids := demo.ActiveIDs(); !reflect.DeepEqual(ids, []string{"slot-a"}) {
+		t.Fatalf("slots = %v, want slot-a kept: it was refreshed before the reap looked", ids)
 	}
 }
