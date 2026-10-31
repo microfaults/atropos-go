@@ -41,11 +41,14 @@ const (
 // replaySetRetryBase and replaySetRetryMax pace the retry of a failed pull
 // while its set stays desired: the first retry comes replaySetRetryBase after
 // the failure, each further one twice as long after the one before, at most
-// replaySetRetryMax, every wait spread by ±20 % (jitterRetry). Vars so tests
-// can shrink them; newReplaySetPuller copies them.
+// replaySetRetryMax, every wait spread by ±20 % (jitterRetry).
+// replaySetRetryWait waits one out: it reports false when the retry is
+// dropped first. Vars so tests can shrink the waits or fire a retry when they
+// choose; newReplaySetPuller copies them.
 var (
 	replaySetRetryBase = 5 * time.Second
 	replaySetRetryMax  = time.Minute
+	replaySetRetryWait = sleepCtx
 )
 
 // replaySetPullerConfig configures a replaySetPuller.
@@ -95,10 +98,12 @@ type replaySetPuller struct {
 	logger     *slog.Logger
 	onChange   func()
 
-	// The retry of a failed pull waits retryDelay: retryBase, doubling up to
-	// retryMax, spread by jitter. Set at construction.
+	// The retry of a failed pull waits retryDelay -- retryBase, doubling up to
+	// retryMax, spread by jitter -- through retryWait, which reports false
+	// when the retry is dropped first. Set at construction.
 	retryBase, retryMax time.Duration
 	jitter              func(time.Duration) time.Duration
+	retryWait           func(context.Context, time.Duration) bool
 
 	ctx  context.Context // parent of every fetch and retry; Close cancels it
 	stop context.CancelFunc
@@ -168,6 +173,7 @@ func newReplaySetPuller(cfg replaySetPullerConfig) *replaySetPuller {
 		retryBase:  replaySetRetryBase,
 		retryMax:   replaySetRetryMax,
 		jitter:     jitterRetry,
+		retryWait:  replaySetRetryWait,
 		ctx:        ctx,
 		stop:       stop,
 	}
@@ -355,10 +361,10 @@ func (p *replaySetPuller) run(ctx context.Context, f *replayFetch, ref wire.Repl
 }
 
 // armRetryLocked arms the retry of the current set's failed pull, ref under
-// scope: once retryDelay(p.failures) has passed, its goroutine pulls the set
-// again (retryFetch) unless the retry is dropped first -- by a Reconcile
-// naming another set, none, or this set again (which fetches it at once), or
-// by Close. It returns the wait. p.mu must be held.
+// scope: once retryWait has waited out retryDelay(p.failures), its goroutine
+// pulls the set again (retryFetch) unless the retry is dropped first -- by a
+// Reconcile naming another set, none, or this set again (which fetches it at
+// once), or by Close. It returns the wait. p.mu must be held.
 func (p *replaySetPuller) armRetryLocked(ref wire.ReplaySetRef, scope cachebox.PhasePair) time.Duration {
 	ctx, cancel := context.WithCancel(p.ctx)
 	r := &replayRetry{id: ref.ID, scope: scope, cancel: cancel}
@@ -368,7 +374,7 @@ func (p *replaySetPuller) armRetryLocked(ref wire.ReplaySetRef, scope cachebox.P
 	go func() {
 		defer p.wg.Done()
 		defer cancel()
-		if sleepCtx(ctx, wait) {
+		if p.retryWait(ctx, wait) {
 			p.retryFetch(r, ref, scope)
 		}
 	}()

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,7 +34,6 @@ type fakeArtifact struct {
 	body        []byte
 	mu          sync.Mutex
 	ranges      []string      // Range headers seen, in order of arrival
-	at          []time.Time   // arrival time of each request
 	failAt      map[int64]int // offset → remaining failures to serve there, at once (ahead of the gate)
 	codeAt      map[int64]int // offset → the status failAt's failures carry; absent = 500
 	ignoreRange bool          // answer 200 with the whole body
@@ -57,7 +57,6 @@ func newFakeArtifact(t *testing.T, entries []*cachebox.Entry) *fakeArtifact {
 		// Recorded on arrival, before the gate, so a test can tell a request is in flight.
 		f.mu.Lock()
 		f.ranges = append(f.ranges, r.Header.Get("Range"))
-		f.at = append(f.at, time.Now())
 		gate, ignoreRange, hideTotal := f.gate, f.ignoreRange, f.hideTotal
 		var off int64
 		fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-", &off)
@@ -108,13 +107,6 @@ func (f *fakeArtifact) requests() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.ranges...)
-}
-
-// arrivals copies the arrival time of every request seen so far.
-func (f *fakeArtifact) arrivals() []time.Time {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]time.Time(nil), f.at...)
 }
 
 // starTotalWriter rewrites "Content-Range: bytes a-b/N" to "bytes a-b/*".
@@ -172,13 +164,20 @@ func withReplayChunkBytes(t *testing.T, n int64) {
 	t.Cleanup(func() { replaySetChunkBytes = 4 << 20 })
 }
 
-// withReplayRetry sets the backoff of a failed pull's retry for one test:
-// base, doubling up to max. Set it before the puller is built, which copies
-// it; the restore runs after the puller's Close (cleanups are LIFO).
-func withReplayRetry(t *testing.T, base, max time.Duration) {
+// withReplayRetryWait sets, for one test, what a failed pull's retry waits
+// on before it pulls again (true) or ends because it was dropped (false). Set
+// it before the puller is built, which copies it; the restore runs after the
+// puller's Close (cleanups are LIFO).
+func withReplayRetryWait(t *testing.T, wait func(context.Context, time.Duration) bool) {
 	t.Helper()
-	replaySetRetryBase, replaySetRetryMax = base, max
-	t.Cleanup(func() { replaySetRetryBase, replaySetRetryMax = 5*time.Second, time.Minute })
+	replaySetRetryWait = wait
+	t.Cleanup(func() { replaySetRetryWait = sleepCtx })
+}
+
+// neverFires is a retry wait only a drop ends: the retry never pulls.
+func neverFires(ctx context.Context, _ time.Duration) bool {
+	<-ctx.Done()
+	return false
 }
 
 func waitState(t *testing.T, p *replaySetPuller, want string) (*wire.ReplaySetStatus, string) {
@@ -417,20 +416,21 @@ func TestReplaySetPuller_UnscopedFails(t *testing.T) {
 	cb := newTestCacheBox(t)
 	var changes atomic.Int32
 	p := newTestPuller(t, f, cb, func() { changes.Add(1) })
-	p.retryBase, p.retryMax = 10*time.Millisecond, 10*time.Millisecond
 
 	p.Reconcile(ptr(refFor(f, entries)), cachebox.PhasePair{})
 	_, msg := waitState(t, p, wire.ReplaySetFailed)
 	if !strings.Contains(msg, "no (experiment_id, phase_id)") {
 		t.Fatalf("msg = %q, want the missing-scope reason", msg)
 	}
-	waitChanges(t, &changes, 1)
-	time.Sleep(60 * time.Millisecond) // past several retry waits
+	waitChanges(t, &changes, 1) // the failure is recorded, a retry armed or not, before OnChange runs
+	p.mu.Lock()
+	retry := p.retry
+	p.mu.Unlock()
+	if retry != nil {
+		t.Fatal("a retry is armed for an unscoped set, which no pull can fetch")
+	}
 	if got := f.requests(); len(got) != 0 {
 		t.Fatalf("requests = %q, want none for an unscoped set", got)
-	}
-	if n := changes.Load(); n != 1 {
-		t.Fatalf("OnChange calls = %d, want 1: an unscoped set is never retried", n)
 	}
 	if st, _ := p.Status(); st == nil || st.State != wire.ReplaySetFailed {
 		t.Fatalf("state = %+v, want failed kept", st)
@@ -471,6 +471,8 @@ func TestReplaySetPuller_RetryDelayDoublesUpToTheCap(t *testing.T) {
 // failing (404) is pulled again on its own while it stays desired, after
 // waits that double up to the cap, until a pull commits; each retry turns the
 // state back to fetching and reports it, and the commit resets the backoff.
+// The waits are recorded and fired at once: the test checks what the puller
+// asks for, not the clock.
 func TestReplaySetPuller_RetriesAFailedPullWithBackoff(t *testing.T) {
 	entries := replayEntries(3)
 	f := newFakeArtifact(t, entries)
@@ -480,6 +482,14 @@ func TestReplaySetPuller_RetriesAFailedPullWithBackoff(t *testing.T) {
 	p := newTestPuller(t, f, cb, func() { changes.Add(1) })
 	p.retryBase, p.retryMax = 10*time.Millisecond, 40*time.Millisecond
 	noJitter(p)
+	var waitsMu sync.Mutex
+	var waits []time.Duration
+	p.retryWait = func(ctx context.Context, d time.Duration) bool {
+		waitsMu.Lock()
+		waits = append(waits, d)
+		waitsMu.Unlock()
+		return ctx.Err() == nil
+	}
 
 	p.Reconcile(ptr(refFor(f, entries)), scope1)
 	waitState(t, p, wire.ReplaySetCommitted)
@@ -487,18 +497,15 @@ func TestReplaySetPuller_RetriesAFailedPullWithBackoff(t *testing.T) {
 	if cb.ReplaySetLen() != 3 {
 		t.Fatalf("installed %d entries, want 3", cb.ReplaySetLen())
 	}
-	at := f.arrivals()
-	if len(at) != 9 {
-		t.Fatalf("got %d artifact requests, want 9: one per pull", len(at))
+	if got := f.requests(); len(got) != 9 {
+		t.Fatalf("got %d artifact requests, want 9: one per pull", len(got))
 	}
-	for i, w := range []time.Duration{10, 20, 40, 40, 40, 40, 40, 40} {
-		if gap := at[i+1].Sub(at[i]); gap < w*time.Millisecond {
-			t.Errorf("retry %d came %v after the failed pull, want at least %v", i+1, gap, w*time.Millisecond)
-		}
-	}
-	// Capped: 10+20+6·40 ms = 270 ms. Uncapped doubling: 10+20+...+1280 ms = 2.55 s.
-	if total := at[8].Sub(at[0]); total > 1500*time.Millisecond {
-		t.Errorf("eight retries took %v, want the backoff capped at 40ms", total)
+	waitsMu.Lock()
+	got := append([]time.Duration(nil), waits...)
+	waitsMu.Unlock()
+	ms := time.Millisecond
+	if want := []time.Duration{10 * ms, 20 * ms, 40 * ms, 40 * ms, 40 * ms, 40 * ms, 40 * ms, 40 * ms}; !slices.Equal(got, want) {
+		t.Fatalf("retry waits = %v, want %v: base, doubling, capped", got, want)
 	}
 	p.mu.Lock()
 	failures, retry := p.failures, p.retry
@@ -520,8 +527,7 @@ func TestReplaySetPuller_ReconcileOfAFailedSetRefetchesAtOnce(t *testing.T) {
 	cb := newTestCacheBox(t)
 	var changes atomic.Int32
 	p := newTestPuller(t, f, cb, func() { changes.Add(1) })
-	p.retryBase, p.retryMax = 10*time.Second, time.Minute // the timer cannot fire during the test
-	noJitter(p)
+	p.retryWait = neverFires // only the re-naming can pull the set again
 	failures := func() int {
 		p.mu.Lock()
 		defer p.mu.Unlock()
@@ -563,42 +569,55 @@ func TestReplaySetPuller_ReconcileOfAFailedSetRefetchesAtOnce(t *testing.T) {
 
 // TestReplaySetPuller_ReconcileElsewhereOrCloseDropsTheRetry: the retry of a
 // failed pull lasts only while its set is desired. A document naming no set,
-// or another one, drops it, and so does Close.
+// or another one, drops it, and so does Close: its wait ends without a pull
+// and no retry stays armed. The wait only a drop ends, so no timer races the
+// test.
 func TestReplaySetPuller_ReconcileElsewhereOrCloseDropsTheRetry(t *testing.T) {
 	entries, entries2 := replayEntries(3), replayEntries(2)
 	f, g := newFakeArtifact(t, entries), newFakeArtifact(t, entries2)
 	f.failAt[0], f.codeAt[0] = 1000, http.StatusNotFound // every pull of ref fails
 	cb := newTestCacheBox(t)
 	p := newTestPuller(t, f, cb, nil)
-	p.retryBase, p.retryMax = 50*time.Millisecond, 50*time.Millisecond
-	noJitter(p)
+	armed, dropped := make(chan struct{}, 1), make(chan struct{}, 1)
+	p.retryWait = func(ctx context.Context, d time.Duration) bool {
+		armed <- struct{}{}
+		neverFires(ctx, d)
+		dropped <- struct{}{}
+		return false
+	}
 	ref, ref2 := refFor(f, entries), refFor(g, entries2)
 	ref2.URL = g.srv.URL + "/api/v1/cache/artifacts/y"
-	pullsAfter := func(what string, want int) {
+	retryDropped := func(what string, pulls int) {
 		t.Helper()
-		time.Sleep(150 * time.Millisecond) // three retry waits
-		if got := f.requests(); len(got) != want {
-			t.Fatalf("%s: %d pulls of the failed set, want %d: its retry must be dropped", what, len(got), want)
+		waitClosed(t, dropped, what+": the retry's wait to end")
+		p.mu.Lock()
+		retry := p.retry
+		p.mu.Unlock()
+		if retry != nil {
+			t.Fatalf("%s: a retry is still armed", what)
+		}
+		if got := f.requests(); len(got) != pulls {
+			t.Fatalf("%s: %d pulls of the failed set, want %d: its retry must not pull", what, len(got), pulls)
 		}
 	}
 
 	p.Reconcile(&ref, scope1)
-	waitState(t, p, wire.ReplaySetFailed)
+	waitClosed(t, armed, "the retry of the first failed pull")
 	p.Reconcile(nil, scope1)
-	pullsAfter("no set desired", 1)
+	retryDropped("no set desired", 1)
 
 	p.Reconcile(&ref, scope1)
-	waitState(t, p, wire.ReplaySetFailed)
+	waitClosed(t, armed, "the retry of the second failed pull")
 	p.Reconcile(&ref2, scope1)
+	retryDropped("another set desired", 2)
 	if st, _ := waitState(t, p, wire.ReplaySetCommitted); st.ID != ref2.ID {
 		t.Fatalf("committed %s, want ref2", st.ID)
 	}
-	pullsAfter("another set desired", 2)
 
 	p.Reconcile(&ref, scope1)
-	waitState(t, p, wire.ReplaySetFailed)
+	waitClosed(t, armed, "the retry of the third failed pull")
 	p.Close()
-	pullsAfter("closed", 3)
+	retryDropped("closed", 3)
 }
 
 // TestReplaySetPuller_RetriesThrottledAndUnbuiltChunkRequests: like a 5xx, a

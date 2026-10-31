@@ -1063,8 +1063,17 @@ func replaySetStates(statuses []wire.StatusReport) []string {
 // ever re-applies it. The puller pulls the set again on its own retry while
 // it stays desired: the status reports walk failed → fetching → committed.
 func TestConnectManteion_RetriesAFailedReplaySetPullWhileDesired(t *testing.T) {
-	// The retry waits long enough for the failed report to go out before it.
-	withReplayRetry(t, 200*time.Millisecond, time.Second)
+	// The retry fires only once the failed report is in, however long the
+	// reports before it take.
+	fire := make(chan struct{})
+	withReplayRetryWait(t, func(ctx context.Context, _ time.Duration) bool {
+		select {
+		case <-fire:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	})
 	entries := replayEntries(3)
 	art := newFakeArtifact(t, entries)
 	art.failAt[0], art.codeAt[0] = 1, http.StatusNotFound // the first request only, answered at once
@@ -1099,6 +1108,8 @@ func TestConnectManteion_RetriesAFailedReplaySetPullWhileDesired(t *testing.T) {
 		states := replaySetStates(statuses)
 		return len(states) >= len(want) && slices.Equal(states[len(states)-len(want):], want)
 	}
+	waitFor(t, 5*time.Second, func() bool { return endsWith(wire.ReplaySetFailed) })
+	close(fire)
 	waitFor(t, 5*time.Second, func() bool { return endsWith(wire.ReplaySetFailed, wire.ReplaySetFetching) })
 	release()
 	waitFor(t, 5*time.Second, func() bool {
@@ -1131,7 +1142,7 @@ func TestConnectManteion_RetriesAFailedReplaySetPullWhileDesired(t *testing.T) {
 // fetched again at once, without waiting for the timer, and the status
 // reports walk failed → fetching → committed.
 func TestConnectManteion_A200RenamingAFailedReplaySetRefetchesAtOnce(t *testing.T) {
-	withReplayRetry(t, 10*time.Second, time.Minute) // the timer cannot fire during the test
+	withReplayRetryWait(t, neverFires) // only the 200 can pull the set again
 	entries := replayEntries(3)
 	art := newFakeArtifact(t, entries)
 	art.failAt[0], art.codeAt[0] = 1, http.StatusNotFound // the first request only, answered at once
@@ -1167,7 +1178,6 @@ func TestConnectManteion_A200RenamingAFailedReplaySetRefetchesAtOnce(t *testing.
 	f.waitPolls(t, 2) // the startup fetch, then the loop's poll, held on 3-a
 
 	// The document changes elsewhere (a rule attached) and still names the set.
-	bumped := time.Now()
 	h.bump(wire.RuleSync{Version: 4, Etag: "4-b", Rules: threeRules()[:1], ActiveFaults: []wire.FaultRequest{}, ReplaySet: &ref})
 	waitFor(t, 5*time.Second, func() bool { return endsWith(wire.ReplaySetFailed, wire.ReplaySetFetching) })
 	release()
@@ -1175,12 +1185,8 @@ func TestConnectManteion_A200RenamingAFailedReplaySetRefetchesAtOnce(t *testing.
 		return endsWith(wire.ReplaySetFailed, wire.ReplaySetFetching, wire.ReplaySetCommitted)
 	})
 
-	at := art.arrivals()
-	if len(at) != 2 {
-		t.Fatalf("artifact requests = %q, want the 404 and the refetch", art.requests())
-	}
-	if lag := at[1].Sub(bumped); lag > 2*time.Second {
-		t.Fatalf("refetched %v after the 200, want at once: the retry timer waits at least 8s", lag)
+	if got := art.requests(); len(got) != 2 {
+		t.Fatalf("artifact requests = %q, want the 404 and the refetch the 200 started", got)
 	}
 	if cb.ReplaySetLen() != 3 || cb.ReplaySetPhaseKey() != cachebox.PhaseKey("exp-1", "phase-1") {
 		t.Fatalf("installed %d entries under %q, want the set committed under (exp-1, phase-1)", cb.ReplaySetLen(), cb.ReplaySetPhaseKey())
