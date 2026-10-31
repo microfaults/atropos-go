@@ -104,7 +104,9 @@ func initTelemetry(ctx context.Context, cfg telemetryConfig) (func(context.Conte
 // defaults apply). Otherwise the endpoint gets an http:// scheme if it lacks
 // one and the protocol becomes grpc unless the environment already names one.
 // The result holds the variables set and their values, empty when nothing
-// changed; a second call changes nothing.
+// changed; a second call changes nothing. Values are read with surrounding
+// whitespace trimmed, as the OTLP exporters read theirs, and a blank value
+// counts as unset.
 func applyExporterEnvFallback() map[string]string {
 	const (
 		endpointKey = "OTEL_EXPORTER_OTLP_ENDPOINT"
@@ -113,15 +115,16 @@ func applyExporterEnvFallback() map[string]string {
 	)
 	applied := map[string]string{}
 	set := func(key, value string) {
+		// Ignoring the error is safe: the keys are constants, so only a NUL byte can fail.
 		if err := os.Setenv(key, value); err == nil {
 			applied[key] = value
 		}
 	}
 
-	explicit := os.Getenv(endpointKey)
+	explicit := strings.TrimSpace(os.Getenv(endpointKey))
 	endpoint := explicit
 	if endpoint == "" {
-		endpoint = os.Getenv(addrKey)
+		endpoint = strings.TrimSpace(os.Getenv(addrKey))
 	}
 	if endpoint == "" || strings.Contains(explicit, "://") {
 		// No endpoint named, or the standard variable already holds a URL.
@@ -131,7 +134,7 @@ func applyExporterEnvFallback() map[string]string {
 		endpoint = "http://" + endpoint
 	}
 	set(endpointKey, endpoint)
-	if os.Getenv(protocolKey) == "" {
+	if strings.TrimSpace(os.Getenv(protocolKey)) == "" {
 		set(protocolKey, "grpc")
 	}
 	return applied

@@ -13,6 +13,21 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
+// pinExporterEnv blanks the variables the exporter-env shim reads, so a test
+// does not depend on the ambient OTLP environment. The shim writes the process
+// environment with os.Setenv; t.Setenv restores each variable when the test
+// ends, so nothing the shim maps leaks into later tests.
+func pinExporterEnv(t *testing.T) {
+	t.Helper()
+	for _, key := range []string{
+		"COLLECTOR_SERVICE_ADDR",
+		"OTEL_EXPORTER_OTLP_ENDPOINT",
+		"OTEL_EXPORTER_OTLP_PROTOCOL",
+	} {
+		t.Setenv(key, "")
+	}
+}
+
 func TestInitTelemetry_SetsGlobalTracerProvider(t *testing.T) {
 	exporter := tracetest.NewInMemoryExporter()
 	tp := sdktrace.NewTracerProvider(
@@ -128,7 +143,8 @@ func TestExporterEnvFallback_CollectorServiceAddr(t *testing.T) {
 	}
 }
 
-// Review Focus 1: the bare host:port form the old exporter accepted.
+// A bare host:port endpoint, the form the old exporter accepted, still means a
+// gRPC collector.
 func TestExporterEnvFallback_SchemelessEndpointKeepsGRPC(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "otel-collector:4317")
 	t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "")
@@ -154,7 +170,89 @@ func TestExporterEnvFallback_ExplicitEndpointUntouched(t *testing.T) {
 	}
 }
 
+// Once mapped, the endpoint is a URL, so the shim has nothing left to do.
+func TestExporterEnvFallback_SecondCallChangesNothing(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "")
+	t.Setenv("COLLECTOR_SERVICE_ADDR", "otel-collector:4317")
+	if first := applyExporterEnvFallback(); len(first) != 2 {
+		t.Fatalf("first call applied = %v, want endpoint+protocol", first)
+	}
+	if second := applyExporterEnvFallback(); len(second) != 0 {
+		t.Fatalf("second call applied = %v, want an empty map", second)
+	}
+	if got := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"); got != "http://otel-collector:4317" {
+		t.Fatalf("endpoint = %q", got)
+	}
+	if got := os.Getenv("OTEL_EXPORTER_OTLP_PROTOCOL"); got != "grpc" {
+		t.Fatalf("protocol = %q", got)
+	}
+}
+
+// A URL endpoint is the exporters' own business: a protocol the environment
+// leaves empty stays empty, so autoexport's http/protobuf default applies.
+func TestExporterEnvFallback_URLEndpointLeavesEmptyProtocolEmpty(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318")
+	t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "")
+	t.Setenv("COLLECTOR_SERVICE_ADDR", "")
+	if applied := applyExporterEnvFallback(); len(applied) != 0 {
+		t.Fatalf("applied = %v, want nothing", applied)
+	}
+	if got := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"); got != "http://collector:4318" {
+		t.Fatalf("endpoint = %q", got)
+	}
+	if got := os.Getenv("OTEL_EXPORTER_OTLP_PROTOCOL"); got != "" {
+		t.Fatalf("protocol = %q, want it left empty", got)
+	}
+}
+
+// A protocol the environment already names wins over the grpc default, even
+// while the endpoint still needs its scheme.
+func TestExporterEnvFallback_SchemelessEndpointKeepsNamedProtocol(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "otel-collector:4318")
+	t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
+	t.Setenv("COLLECTOR_SERVICE_ADDR", "")
+	applied := applyExporterEnvFallback()
+	if got := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"); got != "http://otel-collector:4318" {
+		t.Fatalf("endpoint = %q", got)
+	}
+	if got := os.Getenv("OTEL_EXPORTER_OTLP_PROTOCOL"); got != "http/protobuf" {
+		t.Fatalf("protocol = %q, want the named protocol kept", got)
+	}
+	if len(applied) != 1 {
+		t.Fatalf("applied = %v, want only the endpoint", applied)
+	}
+}
+
+// Whitespace around a value does not change what the shim decides: a blank
+// variable counts as unset and a padded schemeless endpoint becomes a clean URL.
+func TestExporterEnvFallback_TrimsWhitespace(t *testing.T) {
+	for _, tc := range []struct {
+		name                     string
+		endpoint, protocol, addr string
+		wantEndpoint             string
+	}{
+		{"padded schemeless endpoint", "  otel-collector:4317 ", "", "", "http://otel-collector:4317"},
+		{"blank endpoint falls back to the bed address", "  ", "", " otel-collector:4317\n", "http://otel-collector:4317"},
+		{"blank protocol counts as unset", "otel-collector:4317", " \t", "", "http://otel-collector:4317"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", tc.endpoint)
+			t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", tc.protocol)
+			t.Setenv("COLLECTOR_SERVICE_ADDR", tc.addr)
+			applyExporterEnvFallback()
+			if got := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"); got != tc.wantEndpoint {
+				t.Fatalf("endpoint = %q, want %q", got, tc.wantEndpoint)
+			}
+			if got := os.Getenv("OTEL_EXPORTER_OTLP_PROTOCOL"); got != "grpc" {
+				t.Fatalf("protocol = %q, want grpc", got)
+			}
+		})
+	}
+}
+
 func TestNewSpanExporter_None(t *testing.T) {
+	pinExporterEnv(t)
 	t.Setenv("OTEL_TRACES_EXPORTER", "none")
 	exp, err := newSpanExporter(context.Background())
 	if err != nil || !autoexport.IsNoneSpanExporter(exp) {
@@ -163,6 +261,7 @@ func TestNewSpanExporter_None(t *testing.T) {
 }
 
 func TestNewSpanExporter_Console(t *testing.T) {
+	pinExporterEnv(t)
 	t.Setenv("OTEL_TRACES_EXPORTER", "console")
 	exp, err := newSpanExporter(context.Background())
 	if err != nil {
@@ -174,6 +273,7 @@ func TestNewSpanExporter_Console(t *testing.T) {
 }
 
 func TestInitTelemetry_NoBYO_UsesEnvExporter(t *testing.T) {
+	pinExporterEnv(t)
 	t.Setenv("OTEL_TRACES_EXPORTER", "none")
 	t.Setenv("OTEL_LOGS_EXPORTER", "none")
 	shutdown, err := initTelemetry(context.Background(), telemetryConfig{serviceName: "svc"})
