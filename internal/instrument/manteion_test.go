@@ -2138,6 +2138,14 @@ func TestConnectManteion_Poll404DuringTheStatusRecoveryWaitsForIt(t *testing.T) 
 	}
 	f.waitPolls(t, len(polls)+3) // re-polled after the floor, not after a failure's backoff
 
+	// No poll is answered 404 from here on, and the loop is sequential: two
+	// more polls mean every 404 was handled while the recovery was still
+	// registering, so none can be handled after the recovery's report has
+	// landed (and the claim is released) and register again.
+	pollLost.Store(false)
+	polls, _ = f.snapshot()
+	f.waitPolls(t, len(polls)+2)
+
 	f.mu.Lock()
 	f.holdReg = nil
 	f.mu.Unlock()
