@@ -283,6 +283,9 @@ func TestRun_ResourceNamesTheSidecarHost(t *testing.T) {
 		cancel()
 		select {
 		case <-stopped:
+			if runErr != nil {
+				t.Errorf("Run returned %v after cancel, want nil", runErr)
+			}
 		case <-time.After(15 * time.Second):
 			t.Error("Run did not return after cancel")
 		}

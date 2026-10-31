@@ -45,16 +45,16 @@ func initTelemetry(ctx context.Context, cfg telemetryConfig) (func(context.Conte
 		return func(context.Context) error { return nil }, nil
 	}
 
+	res, err := newResource(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("atropos: build resource: %w", err)
+	}
+
 	// The span exporter is chosen by the standard OTEL_* environment (see
 	// newSpanExporter).
 	exporter, err := newSpanExporter(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("atropos: init span exporter: %w", err)
-	}
-
-	res, err := newResource(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("atropos: build resource: %w", err)
 	}
 
 	// Build TracerProvider. With no explicit sampler the SDK reads
@@ -111,8 +111,8 @@ func newResource(cfg telemetryConfig) (*resource.Resource, error) {
 
 // instanceIdentity names this process for the resource. The pod name is
 // ATROPOS_POD_NAME, else HOSTNAME (which Kubernetes sets to the pod name), and
-// is empty outside a pod. The instance id is the pod name when there is one,
-// else the machine's hostname, else "unknown".
+// is empty when neither is set. The instance id is the pod name when there is
+// one, else the machine's hostname, else "unknown".
 func instanceIdentity(getenv func(string) string) (instanceID, podName string) {
 	podName = strings.TrimSpace(getenv("ATROPOS_POD_NAME"))
 	if podName == "" {
@@ -197,7 +197,9 @@ func newSpanExporter(ctx context.Context) (sdktrace.SpanExporter, error) {
 // resource carries service.name, service.version, deployment.environment.name
 // and service.instance.id, plus k8s.pod.name (ATROPOS_POD_NAME, else HOSTNAME;
 // omitted when neither is set) and atropos.host (Host; omitted when empty).
-// OTEL_RESOURCE_ATTRIBUTES adds further attributes.
+// OTEL_RESOURCE_ATTRIBUTES adds further attributes. Host, the sampler and the
+// resource apply only when no TracerProvider is given: a BYO provider keeps
+// its own.
 type TelemetryConfig struct {
 	ServiceName    string
 	ServiceVersion string

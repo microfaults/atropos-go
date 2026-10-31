@@ -43,6 +43,19 @@ func unsetEnv(t *testing.T, key string) {
 	}
 }
 
+// restoreOTelGlobals puts back, when the test ends, the global tracer provider
+// the test found, so the SDK provider a non-BYO initTelemetry installs does not
+// outlive the test that built it.
+func restoreOTelGlobals(t *testing.T) {
+	t.Helper()
+	prevTP := otel.GetTracerProvider()
+	t.Cleanup(func() {
+		if otel.GetTracerProvider() != prevTP {
+			otel.SetTracerProvider(prevTP)
+		}
+	})
+}
+
 func TestInitTelemetry_SetsGlobalTracerProvider(t *testing.T) {
 	exporter := tracetest.NewInMemoryExporter()
 	tp := sdktrace.NewTracerProvider(
@@ -289,6 +302,7 @@ func TestNewSpanExporter_Console(t *testing.T) {
 
 func TestInitTelemetry_NoBYO_UsesEnvExporter(t *testing.T) {
 	pinExporterEnv(t)
+	restoreOTelGlobals(t)
 	t.Setenv("OTEL_TRACES_EXPORTER", "none")
 	t.Setenv("OTEL_LOGS_EXPORTER", "none")
 	shutdown, err := initTelemetry(context.Background(), telemetryConfig{serviceName: "svc"})
@@ -338,6 +352,7 @@ func resourceOf(t *testing.T) *resource.Resource {
 
 func TestInitTelemetry_ResourceCarriesInstanceAndHost(t *testing.T) {
 	pinExporterEnv(t)
+	restoreOTelGlobals(t)
 	t.Setenv("OTEL_TRACES_EXPORTER", "none")
 	t.Setenv("OTEL_LOGS_EXPORTER", "none")
 	t.Setenv("OTEL_TRACES_SAMPLER", "")
@@ -358,9 +373,10 @@ func TestInitTelemetry_ResourceCarriesInstanceAndHost(t *testing.T) {
 // The service name and environment the caller leaves empty get their defaults.
 func TestInitTelemetry_ResourceDefaults(t *testing.T) {
 	pinExporterEnv(t)
+	restoreOTelGlobals(t)
 	t.Setenv("OTEL_TRACES_EXPORTER", "none")
 	t.Setenv("OTEL_LOGS_EXPORTER", "none")
-	t.Setenv("OTEL_TRACES_SAMPLER", "")
+	unsetEnv(t, "OTEL_TRACES_SAMPLER")
 	shutdown, err := initTelemetry(context.Background(), telemetryConfig{})
 	if err != nil {
 		t.Fatal(err)
@@ -376,11 +392,19 @@ func TestInitTelemetry_ResourceDefaults(t *testing.T) {
 
 func TestInitTelemetry_NoPodNameOmitsK8sAttribute(t *testing.T) {
 	pinExporterEnv(t)
+	restoreOTelGlobals(t)
 	t.Setenv("OTEL_TRACES_EXPORTER", "none")
 	t.Setenv("OTEL_LOGS_EXPORTER", "none")
 	t.Setenv("OTEL_TRACES_SAMPLER", "")
 	t.Setenv("ATROPOS_POD_NAME", "")
 	t.Setenv("HOSTNAME", "")
+	// resource.Default() reads OTEL_RESOURCE_ATTRIBUTES once per process: pin it
+	// blank in case this is the first read, and skip when an earlier read
+	// already took a pod name from the ambient environment.
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "")
+	if _, ok := resource.Default().Set().Value("k8s.pod.name"); ok {
+		t.Skip("the process's default resource already carries k8s.pod.name (ambient OTEL_RESOURCE_ATTRIBUTES)")
+	}
 	shutdown, err := initTelemetry(context.Background(), telemetryConfig{serviceName: "svc"})
 	if err != nil {
 		t.Fatal(err)
@@ -397,6 +421,7 @@ func TestInitTelemetry_NoPodNameOmitsK8sAttribute(t *testing.T) {
 
 func TestInitTelemetry_SamplerFromEnv(t *testing.T) {
 	pinExporterEnv(t)
+	restoreOTelGlobals(t)
 	t.Setenv("OTEL_TRACES_EXPORTER", "none")
 	t.Setenv("OTEL_LOGS_EXPORTER", "none")
 	t.Setenv("OTEL_TRACES_SAMPLER", "always_off")
@@ -414,6 +439,7 @@ func TestInitTelemetry_SamplerFromEnv(t *testing.T) {
 
 func TestInitTelemetry_DefaultSamplerSamples(t *testing.T) {
 	pinExporterEnv(t)
+	restoreOTelGlobals(t)
 	t.Setenv("OTEL_TRACES_EXPORTER", "none")
 	t.Setenv("OTEL_LOGS_EXPORTER", "none")
 	t.Setenv("OTEL_TRACES_SAMPLER", "")
@@ -433,6 +459,7 @@ func TestInitTelemetry_DefaultSamplerSamples(t *testing.T) {
 // alike; a remote parent that was not sampled tells them apart.
 func TestInitTelemetry_DefaultSamplerFollowsUnsampledParent(t *testing.T) {
 	pinExporterEnv(t)
+	restoreOTelGlobals(t)
 	t.Setenv("OTEL_TRACES_EXPORTER", "none")
 	t.Setenv("OTEL_LOGS_EXPORTER", "none")
 	unsetEnv(t, "OTEL_TRACES_SAMPLER")
@@ -458,6 +485,7 @@ func TestInitTelemetry_DefaultSamplerFollowsUnsampledParent(t *testing.T) {
 // environment. The seam must still win when both are present.
 func TestInitTelemetry_SamplerConfigOverridesEnv(t *testing.T) {
 	pinExporterEnv(t)
+	restoreOTelGlobals(t)
 	t.Setenv("OTEL_TRACES_EXPORTER", "none")
 	t.Setenv("OTEL_LOGS_EXPORTER", "none")
 	t.Setenv("OTEL_TRACES_SAMPLER", "always_on")

@@ -21,6 +21,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -528,6 +529,9 @@ func TestServe_PreloadCommitThenReplayHit(t *testing.T) {
 // envelope, and the fidelity endpoint is one and the same string.
 func TestServe_OneIdentityEverywhere(t *testing.T) {
 	type captured struct {
+		// mu guards the register fields: the stub answers the status report
+		// 404, so the SDK registers again while the test reads them.
+		mu          sync.Mutex
 		registerID  string
 		routes      int
 		version     string
@@ -543,9 +547,11 @@ func TestServe_OneIdentityEverywhere(t *testing.T) {
 		case r.URL.Path == "/api/v1/sdk/register" && r.Method == http.MethodPost:
 			var reg RegisterRequest
 			_ = json.NewDecoder(r.Body).Decode(&reg)
+			got.mu.Lock()
 			got.registerID = reg.ID
 			got.routes = len(reg.Routes)
 			got.version = reg.Version
+			got.mu.Unlock()
 			w.WriteHeader(http.StatusCreated)
 			_, _ = io.WriteString(w, `{"status":"registered","version":0,"rules":[],"active_faults":[]}`)
 		case strings.HasPrefix(r.URL.Path, "/api/v1/sdk/register/") && r.Method == http.MethodDelete:
@@ -584,14 +590,17 @@ func TestServe_OneIdentityEverywhere(t *testing.T) {
 	ts := httptest.NewServer(h)
 	defer ts.Close()
 
-	if got.registerID != "pod-42" {
-		t.Errorf("register id = %q, want pod-42", got.registerID)
+	got.mu.Lock()
+	registerID, routes, version := got.registerID, got.routes, got.version
+	got.mu.Unlock()
+	if registerID != "pod-42" {
+		t.Errorf("register id = %q, want pod-42", registerID)
 	}
-	if got.routes != 1 {
-		t.Errorf("register routes = %d, want 1", got.routes)
+	if routes != 1 {
+		t.Errorf("register routes = %d, want 1", routes)
 	}
-	if got.version != "0.3.7" {
-		t.Errorf("register version = %q, want 0.3.7", got.version)
+	if version != "0.3.7" {
+		t.Errorf("register version = %q, want 0.3.7", version)
 	}
 
 	code, body := mustGet(t, ts.URL+"/atropos/health")
