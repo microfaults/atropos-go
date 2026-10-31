@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -438,5 +439,49 @@ func TestPush_EnvelopeCarriesEpoch(t *testing.T) {
 	defer mu.Unlock()
 	if len(epochs) != 2 || epochs[0] != 1700000000000000001 || epochs[1] != 1700000000000000001 {
 		t.Fatalf("epochs = %v, want the configured epoch on every batch", epochs)
+	}
+}
+
+// TestPush_BatchSeqNeverRestartsWithinAnEpoch: batch_seq numbers every batch
+// of the instance's epoch, whatever its pair, so entries for pair A, then B,
+// then A again go out as three distinct numbers. Restarting the count when
+// the pair changes would give A's second batch the number its first one took,
+// and manteion's dedupe on (experiment, phase, instance, epoch, batch_seq)
+// would drop it as a retry while the client counts it pushed.
+func TestPush_BatchSeqNeverRestartsWithinAnEpoch(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string // "phase:batch_seq" per envelope
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var env struct {
+			PhaseID  string `json:"phase_id"`
+			BatchSeq int    `json:"batch_seq"`
+		}
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &env)
+		mu.Lock()
+		seen = append(seen, fmt.Sprintf("%s:%d", env.PhaseID, env.BatchSeq))
+		mu.Unlock()
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	client := newCachePushClient(cachePushConfig{
+		BaseURL: server.URL, Service: "cart", Instance: "pod-1", Epoch: 1700000000000000001,
+		MaxBatch: 100, MaxWait: 10 * time.Second,
+	})
+	defer client.Stop()
+	for _, phase := range []string{"phase-a", "phase-b", "phase-a"} { // each pair change flushes the batch before it
+		client.PushFunc()("k", &cachebox.Entry{Key: "k", StatusCode: 200, Body: []byte("x"), ExperimentID: "exp-1", PhaseID: phase})
+	}
+	client.Flush() // the second phase-a batch, then every batch in flight
+
+	mu.Lock()
+	defer mu.Unlock()
+	slices.Sort(seen)
+	if want := []string{"phase-a:1", "phase-a:3", "phase-b:2"}; !slices.Equal(seen, want) {
+		t.Fatalf("batches = %v, want %v: batch_seq must run on across pair changes", seen, want)
+	}
+	if got := client.currentBatchSeq(); got != 3 {
+		t.Fatalf("last batch_seq = %d, want 3", got)
 	}
 }

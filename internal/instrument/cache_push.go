@@ -65,8 +65,12 @@ type cachePushStats struct {
 // current batch's -- an envelope must never mix entries from two phases
 // (wire spec §W2), so a phase transition forces an early flush.
 //
-// batch_seq is monotonic per (experiment, phase) pair (design doc Q2) and
-// restarts whenever the tracked pair changes.
+// batch_seq is monotonic per instance epoch: every batch, whatever its
+// (experiment, phase) pair, takes the next number, and a pair change never
+// restarts the count. Manteion dedupes retried batches on (experiment, phase,
+// instance, epoch, batch_seq); a count restarted per pair would let a pair's
+// later batch (entries for A, then B, then A) reuse a number one of its
+// earlier batches took, and the dedupe would drop a real batch.
 //
 // Failure policy (design doc Q2): up to 3 attempts with exponential
 // backoff (base 250ms + jitter) on transport errors and 5xx. A
@@ -193,11 +197,9 @@ func (c *cachePushClient) add(entry *cachebox.Entry) {
 	// A phase transition means we flush whatever's pending under the OLD
 	// tag before starting a new batch under the new one -- an envelope
 	// must never mix entries from two phases (wire spec §W2).
+	// batch_seq runs on: the new pair's batches take the next numbers.
 	if len(c.batch) > 0 && (entry.ExperimentID != c.batchExpID || entry.PhaseID != c.batchPhaseID) {
 		c.flushLocked()
-	}
-	if len(c.batch) == 0 && (entry.ExperimentID != c.batchExpID || entry.PhaseID != c.batchPhaseID) {
-		c.batchSeq = 0 // new pair -- batch_seq restarts (design doc Q2)
 	}
 	c.batchExpID = entry.ExperimentID
 	c.batchPhaseID = entry.PhaseID
@@ -279,9 +281,11 @@ func (c *cachePushClient) Flush() {
 }
 
 // ingestEnvelope is the POST body for /api/v1/cache/ingest (wire spec §W2).
-// BatchSeq is 1-based and monotonic per (experiment_id, phase_id, instance)
-// so manteion can dedupe retried batches. Epoch (the instance start time, unix
-// nanoseconds) extends that key so it stays unique across restarts, when batch_seq starts over.
+// BatchSeq is 1-based and monotonic per instance epoch -- it never restarts
+// when the pair changes -- so (experiment_id, phase_id, instance, epoch,
+// batch_seq) names one batch and manteion can dedupe retried ones. Epoch (the
+// instance start time, unix nanoseconds) keeps that key unique across
+// restarts, when batch_seq starts over.
 type ingestEnvelope struct {
 	Service      string               `json:"service"`
 	Instance     string               `json:"instance"`
@@ -482,8 +486,9 @@ func (c *cachePushClient) SendDrainReport(experimentID, phaseID string, cb *cach
 	return wire.DrainReportResponse{Accepted: false}
 }
 
-// currentBatchSeq returns the last batch_seq assigned, for the drain
-// report's LastBatchSeq field.
+// currentBatchSeq returns the last batch_seq assigned in this epoch, whatever
+// its pair, for the drain report's LastBatchSeq field (a client-lifetime
+// diagnostic).
 func (c *cachePushClient) currentBatchSeq() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()

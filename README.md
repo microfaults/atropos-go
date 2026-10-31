@@ -458,8 +458,10 @@ strategy and ships it as wire provenance.
 The fidelity pipeline around a recording phase:
 
 1. **Record** — passthrough rule active; entries land in the RecordBuffer and stream to manteion
-   (`POST /api/v1/cache/ingest`) in batches with per-pair monotonic `batch_seq` and the instance's
-   `epoch` (its start time in unix nanoseconds), so manteion's dedupe key stays unique across restarts.
+   (`POST /api/v1/cache/ingest`) in batches with a `batch_seq` monotonic over the instance's lifetime
+   (it never restarts when the pair changes) and the instance's `epoch` (its start time in unix
+   nanoseconds), so manteion's dedupe key `(experiment, phase, instance, epoch, batch_seq)` names one
+   batch, across restarts too.
 2. **Drain** — the rule leaves the rule set at phase end; the drain tracker flushes the recorder,
    settles all in-flight batches, then POSTs a per-pair drain report (recorded / pushed / dropped).
    Manteion's drain barrier compares those against what it actually received.

@@ -192,7 +192,9 @@ sync loop, the status report and the replay-set pull are internal to `Serve`
   unsupported key strategy, no artifact `url`) is not retried.
 - **Ingest `epoch`.** Cache-push batches (`POST /api/v1/cache/ingest`) carry the
   instance's start time in unix nanoseconds as `epoch`, extending manteion's
-  dedupe key across restarts.
+  dedupe key across restarts. `batch_seq` is monotonic per epoch and never
+  restarts when the batch's `(experiment, phase)` pair changes, so
+  `(experiment, phase, instance, epoch, batch_seq)` names one batch.
 
 ### Types
 
