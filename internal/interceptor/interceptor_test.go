@@ -972,3 +972,28 @@ func TestStartFault_RearmsAreNotCountedAsJoins(t *testing.T) {
 		t.Fatalf("fault span attrs = %v, want %s=1: an unsampled request is still a request", us.Attributes, trace.AttrFaultJoined)
 	}
 }
+
+// The first request an interceptor sees is the ring's only entry; when it
+// triggers a background fault, the fault span links it once, as the trigger,
+// and has no recent link to it.
+func TestStartFault_FirstRequestLinksOnlyItsTrigger(t *testing.T) {
+	exp := installRecordingProvider(t)
+	reg := NewFaultRegistry()
+	defer reg.Close()
+	i := New(&mockEvaluator{decision: backgroundDecision("bg")}, trace.NewOTelTracer(), WithRegistry(reg))
+	ctx, reqSpan := otel.Tracer("test").Start(context.Background(), "first")
+	cr, err := i.Check(ctx, evaluator.Request{Point: evaluator.Ingress})
+	if err != nil || cr.Handle == nil {
+		t.Fatalf("cr=%+v err=%v", cr, err)
+	}
+	if ids := i.recent.TraceIDs(); len(ids) != 1 {
+		t.Fatalf("ring holds %v, want only the trigger", ids)
+	}
+	<-cr.Handle.Done()
+	reqSpan.End()
+
+	fs := findSpan(t, exp.GetSpans(), trace.SpanFaultInject)
+	if len(fs.Links) != 1 || len(linksOfKind(fs.Links, trace.LinkKindTrigger)) != 1 || fs.Links[0].SpanContext.SpanID() != reqSpan.SpanContext().SpanID() {
+		t.Fatalf("fault span links = %+v, want exactly the trigger link to the request span", fs.Links)
+	}
+}

@@ -57,8 +57,31 @@ func TestRequestRing_LinksCapAndExclude(t *testing.T) {
 	}
 }
 
+// Writers and readers run together, so under -race an unlocked read in Links
+// or TraceIDs (or an unlocked write in Record) fails.
 func TestRequestRing_ConcurrentRecord(t *testing.T) {
 	r := newRequestRing(ringSize)
+	done := make(chan struct{})
+	var readers sync.WaitGroup
+	for range 4 {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				if l := r.Links(ringLinks, oteltrace.SpanID{}); len(l) > ringLinks {
+					t.Errorf("Links returned %d links, want at most %d", len(l), ringLinks)
+				}
+				if ids := r.TraceIDs(); len(ids) > ringSize {
+					t.Errorf("TraceIDs returned %d ids, want at most %d", len(ids), ringSize)
+				}
+			}
+		}()
+	}
 	var wg sync.WaitGroup
 	for g := 0; g < 8; g++ {
 		wg.Add(1)
@@ -70,6 +93,8 @@ func TestRequestRing_ConcurrentRecord(t *testing.T) {
 		}(byte(g))
 	}
 	wg.Wait()
+	close(done)
+	readers.Wait()
 	if len(r.TraceIDs()) != ringSize {
 		t.Fatalf("len = %d", len(r.TraceIDs()))
 	}
@@ -107,6 +132,16 @@ func TestRequestRing_EmptyRingAndZeroLimit(t *testing.T) {
 	r.Record(sampledSC(1), nil)
 	if got := r.Links(0, oteltrace.SpanID{}); len(got) != 0 {
 		t.Fatalf("Links(0) = %v, want none", got)
+	}
+}
+
+// When the trigger is the only request the ring holds, excluding it leaves
+// no recent link: a fault span never links its trigger as "recent".
+func TestRequestRing_ExcludedOnlyEntryLeavesNoLinks(t *testing.T) {
+	r := newRequestRing(4)
+	r.Record(sampledSC(1), nil)
+	if got := r.Links(ringLinks, sampledSC(1).SpanID()); len(got) != 0 {
+		t.Fatalf("links = %+v, want none: the only entry is the excluded trigger", got)
 	}
 }
 
