@@ -2,6 +2,8 @@ package atroposgrpc
 
 import (
 	"context"
+	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -10,6 +12,7 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
 	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 
+	oteltrace "go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 )
 
@@ -172,4 +175,54 @@ func (f *fakeServerStream) Context() context.Context { return f.ctx }
 
 type fakeClientStream struct {
 	grpc.ClientStream
+}
+
+// ctxCapturingHandler records the context and message of every record.
+type ctxCapturingHandler struct {
+	mu   sync.Mutex
+	ctxs []context.Context
+	msgs []string
+}
+
+func (h *ctxCapturingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *ctxCapturingHandler) Handle(ctx context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.ctxs = append(h.ctxs, ctx)
+	h.msgs = append(h.msgs, r.Message)
+	return nil
+}
+func (h *ctxCapturingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *ctxCapturingHandler) WithGroup(string) slog.Handler      { return h }
+
+func sampledContext(t *testing.T) (context.Context, oteltrace.SpanContext) {
+	t.Helper()
+	sc := oteltrace.NewSpanContext(oteltrace.SpanContextConfig{
+		TraceID:    oteltrace.TraceID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		SpanID:     oteltrace.SpanID{1, 2, 3, 4, 5, 6, 7, 8},
+		TraceFlags: oteltrace.FlagsSampled,
+	})
+	return oteltrace.ContextWithSpanContext(context.Background(), sc), sc
+}
+
+func TestUnaryServerInterceptor_CheckErrorLogsWithContext(t *testing.T) {
+	h := &ctxCapturingHandler{}
+	eval := &testEvaluator{decision: &evaluator.Decision{
+		Fault: &inline.Latency{Delay: 0}, // invalid: Validate fails, Check returns an error
+		Mode:  evaluator.Inline,
+	}}
+	i := interceptor.New(eval, nil, interceptor.WithLogger(slog.New(h)))
+	ctx, sc := sampledContext(t)
+	handler := func(ctx context.Context, req any) (any, error) { return "ok", nil }
+
+	resp, err := UnaryServerInterceptor(i)(ctx, nil, &grpc.UnaryServerInfo{FullMethod: "/svc/M"}, handler)
+	if err != nil || resp != "ok" {
+		t.Fatalf("resp=%v err=%v, want the handler to run: a failed check costs the fault, not the RPC", resp, err)
+	}
+	if len(h.msgs) != 1 || h.msgs[0] != "atropos: grpc check error" {
+		t.Fatalf("messages = %q", h.msgs)
+	}
+	if got := oteltrace.SpanContextFromContext(h.ctxs[0]); got.TraceID() != sc.TraceID() {
+		t.Fatalf("log context trace id = %s, want %s", got.TraceID(), sc.TraceID())
+	}
 }

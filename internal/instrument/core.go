@@ -122,6 +122,7 @@ func NewCore(cfg CoreConfig) *Core {
 		interceptor.WithInjectionHook(hook),
 		interceptor.WithRegistry(reg),
 		interceptor.WithCacheBox(cb),
+		interceptor.WithLogger(logger),
 	)
 
 	c := &Core{

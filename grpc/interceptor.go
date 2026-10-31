@@ -4,7 +4,6 @@ package atroposgrpc
 
 import (
 	"context"
-	"log"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
@@ -18,7 +17,7 @@ import (
 func checkAndWait(i *interceptor.Interceptor, ctx context.Context, point evaluator.InjectionPoint, labels map[string]string) {
 	cr, err := i.Check(ctx, evaluator.Request{Point: point, Labels: labels})
 	if err != nil {
-		log.Printf("atropos: grpc check error: %v", err)
+		i.Logger().ErrorContext(ctx, "atropos: grpc check error", "error", err)
 	}
 	if cr.Handle != nil && cr.Decision.Mode == evaluator.Inline {
 		<-cr.Handle.Done()

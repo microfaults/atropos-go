@@ -1,16 +1,13 @@
 package interceptor
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strconv"
-	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,6 +16,8 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault/inline"
 	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
+
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 func inlineLatencyDecision(name string, d time.Duration) *evaluator.Decision {
@@ -341,36 +340,16 @@ func (f *panicStartFault) Start(context.Context) (*fault.Handle, error) {
 	panic("boom")
 }
 
-// syncBuffer is a goroutine-safe sink for the standard logger.
-type syncBuffer struct {
-	mu sync.Mutex
-	b  bytes.Buffer
-}
-
-func (s *syncBuffer) Write(p []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.b.Write(p)
-}
-
-func (s *syncBuffer) String() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.b.String()
-}
-
 // TestIngressMiddleware_TransientStartPanicIsContained: the start runs on its
 // own goroutine, beyond net/http's per-connection recover, so a panic in
 // Fault.Start (or the tracer, or the injection hook) would take the host
 // process down. It must be recovered and logged, the response must complete
 // normally, and a later request must still work: its start reaches
 // Fault.Start too, so neither the registry lock nor the middleware was left
-// wedged by the first panic.
+// wedged by the first panic. The recovered panic is logged through the
+// interceptor's logger, with the panic value, under the request's context.
 func TestIngressMiddleware_TransientStartPanicIsContained(t *testing.T) {
-	var logs syncBuffer
-	prev := log.Writer()
-	log.SetOutput(&logs)
-	t.Cleanup(func() { log.SetOutput(prev) })
+	logs := &logRecorder{}
 
 	reg := NewFaultRegistry()
 	t.Cleanup(func() {
@@ -385,29 +364,33 @@ func TestIngressMiddleware_TransientStartPanicIsContained(t *testing.T) {
 		}
 	})
 	boom := &panicStartFault{}
-	i := New(evaluator.NewStaticEvaluator(transientRule("boom", nil, boom)), trace.Noop(), WithRegistry(reg))
+	i := New(evaluator.NewStaticEvaluator(transientRule("boom", nil, boom)), trace.Noop(), WithRegistry(reg), WithLogger(slog.New(logs)))
 	h := i.IngressMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
 		_, _ = w.Write([]byte("ok"))
 	}))
 
+	ctx, sc := sampledContext(t)
 	for n := 1; n <= 2; n++ {
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest("GET", "/x", nil))
+		h.ServeHTTP(rec, httptest.NewRequest("GET", "/x", nil).WithContext(ctx))
 		if rec.Code != http.StatusAccepted || rec.Body.String() != "ok" {
 			t.Fatalf("request %d: response = %d %q, want 202 ok", n, rec.Code, rec.Body.String())
 		}
 	}
 
 	// Each start panics on its own goroutine; both must be recovered and logged.
-	const want = "atropos: transient start panic: boom"
-	deadline := time.Now().Add(2 * time.Second)
-	for strings.Count(logs.String(), want) < 2 {
-		if time.Now().After(deadline) {
-			t.Fatalf("recovered panics logged = %d (Fault.Start reached %d times), want 2 of each; log:\n%s",
-				strings.Count(logs.String(), want), boom.attempts.Load(), logs.String())
+	recs := logs.wait(2, 2*time.Second)
+	if len(recs) != 2 {
+		t.Fatalf("recovered panics logged = %d (Fault.Start reached %d times), want 2 of each", len(recs), boom.attempts.Load())
+	}
+	for n, r := range recs {
+		if r.msg != "atropos: transient start panic" || r.level != slog.LevelError || r.attrs["panic"] != "boom" {
+			t.Fatalf("record %d = %v %q %v, want an Error \"atropos: transient start panic\" carrying panic=boom", n+1, r.level, r.msg, r.attrs)
 		}
-		time.Sleep(5 * time.Millisecond)
+		if got := oteltrace.SpanContextFromContext(r.ctx); got.TraceID() != sc.TraceID() {
+			t.Fatalf("record %d: log context trace id = %s, want the request's %s", n+1, got.TraceID(), sc.TraceID())
+		}
 	}
 	if got := boom.attempts.Load(); got != 2 {
 		t.Fatalf("Fault.Start reached %d times, want 2", got)

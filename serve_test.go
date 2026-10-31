@@ -32,6 +32,8 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/log/global"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	oteltrace "go.opentelemetry.io/otel/trace"
@@ -234,6 +236,87 @@ func TestServe_LogsThroughConfigLogger(t *testing.T) {
 			t.Fatalf("passive-mode notice = %v %v, want an Info record for service log-test-passive", e.level, e.attrs)
 		}
 	})
+}
+
+// recordedLogs is the in-memory sdklog.Exporter the end-to-end log test reads.
+type recordedLogs struct {
+	mu   sync.Mutex
+	recs []sdklog.Record
+}
+
+func (e *recordedLogs) Export(_ context.Context, rs []sdklog.Record) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, r := range rs {
+		e.recs = append(e.recs, r.Clone())
+	}
+	return nil
+}
+
+func (e *recordedLogs) Shutdown(context.Context) error   { return nil }
+func (e *recordedLogs) ForceFlush(context.Context) error { return nil }
+
+// find returns the first record exported with the given body.
+func (e *recordedLogs) find(body string) (sdklog.Record, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, r := range e.recs {
+		if r.Body().AsString() == body {
+			return r, true
+		}
+	}
+	return sdklog.Record{}, false
+}
+
+// The whole chain behind request-scoped logging, end to end: a request through
+// Serve's middleware gets a server span; the armed fault is invalid, so the
+// interceptor's ingress check fails and logs through the host's logger, under
+// the request's context. With the SDK's default logger on a BYO logger provider
+// the bridge stamps the exported record with that server span's trace and span.
+func TestServe_CheckErrorLogCarriesTheRequestTrace(t *testing.T) {
+	t.Setenv("ATROPOS_HOST", "")
+	prev := global.GetLoggerProvider()
+	t.Cleanup(func() {
+		if global.GetLoggerProvider() != prev {
+			global.SetLoggerProvider(prev)
+		}
+	})
+	logs := &recordedLogs{}
+	lp := sdklog.NewLoggerProvider(sdklog.WithProcessor(sdklog.NewSimpleProcessor(logs)))
+	t.Cleanup(func() { _ = lp.Shutdown(context.Background()) })
+
+	biz := http.NewServeMux()
+	biz.HandleFunc("GET /work", func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "done") })
+	ts, spans := serveOffline(t, Config{Service: "log-trace-test", Handler: biz, LoggerProvider: lp})
+
+	// A latency with neither delay nor jitter decodes, but fails Validate when
+	// the interceptor starts it.
+	if code, body := postJSON(t, ts.URL+"/admin/fault", `{"category":"inline","fault_type":"latency","params":{"delay":"0s"}}`); code != http.StatusCreated {
+		t.Fatalf("arm fault: code=%d body=%s", code, body)
+	}
+	spans.Reset()
+	if code, body := mustGet(t, ts.URL+"/work"); code != 200 || body != "done" {
+		t.Fatalf("/work: code=%d body=%q, want the handler to run despite the failed check", code, body)
+	}
+
+	var server *tracetest.SpanStub
+	got := spans.GetSpans()
+	for i := range got {
+		if got[i].SpanKind == oteltrace.SpanKindServer {
+			server = &got[i]
+		}
+	}
+	if server == nil {
+		t.Fatalf("no server span exported: %d spans", len(got))
+	}
+	rec, ok := logs.find("atropos: ingress check error")
+	if !ok {
+		t.Fatal("the failed ingress check was not logged through the host's logger and the OTel bridge")
+	}
+	if rec.TraceID() != server.SpanContext.TraceID() || rec.SpanID() != server.SpanContext.SpanID() {
+		t.Fatalf("log record trace/span = %s/%s, want the request's server span %s/%s",
+			rec.TraceID(), rec.SpanID(), server.SpanContext.TraceID(), server.SpanContext.SpanID())
+	}
 }
 
 func TestServe_OfflineServesBusinessAndControlSurface(t *testing.T) {

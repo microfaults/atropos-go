@@ -3,7 +3,6 @@ package interceptor
 import (
 	"context"
 	"io"
-	"log"
 	"maps"
 	"net/http"
 	"strconv"
@@ -39,7 +38,7 @@ func (i *Interceptor) IngressMiddleware(next http.Handler) http.Handler {
 		labels := extractHTTPLabels(r)
 		cr, err := i.Check(r.Context(), evaluator.Request{Point: evaluator.Ingress, Labels: labels})
 		if err != nil {
-			log.Printf("atropos: ingress check error: %v", err)
+			i.logger.ErrorContext(r.Context(), "atropos: ingress check error", "error", err)
 		}
 
 		rec := NewStatusRecorder(w)
@@ -86,11 +85,11 @@ func (i *Interceptor) transient(r *http.Request, labels map[string]string, statu
 	go func() {
 		defer func() {
 			if p := recover(); p != nil {
-				log.Printf("atropos: transient start panic: %v", p)
+				i.logger.ErrorContext(ctx, "atropos: transient start panic", "panic", p)
 			}
 		}()
 		if _, err := i.StartTransient(ctx, req, d); err != nil {
-			log.Printf("atropos: transient check error: %v", err)
+			i.logger.ErrorContext(ctx, "atropos: transient check error", "error", err)
 		}
 	}()
 }
@@ -124,7 +123,7 @@ func (i *Interceptor) EgressTransport(base http.RoundTripper) http.RoundTripper 
 		if decision != nil && decision.Fault != nil {
 			cr, err := i.StartFault(r.Context(), req, decision)
 			if err != nil {
-				log.Printf("atropos: egress check error: %v", err)
+				i.logger.ErrorContext(r.Context(), "atropos: egress check error", "error", err)
 			}
 			if cr.Handle != nil && cr.Decision.Mode == evaluator.Inline {
 				res := <-cr.Handle.Done()

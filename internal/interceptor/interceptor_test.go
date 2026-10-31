@@ -2,8 +2,10 @@ package interceptor
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 
 	"go.opentelemetry.io/otel/attribute"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 // mockEvaluator returns a fixed decision for all requests.
@@ -436,5 +439,77 @@ func TestCheck_EventAwareFault_EmitsSpanEvents(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected event 'test.event', got events: %v", recorder.span.events)
+	}
+}
+
+// ctxCapturingHandler records the context and message of every record.
+type ctxCapturingHandler struct {
+	mu   sync.Mutex
+	ctxs []context.Context
+	msgs []string
+}
+
+func (h *ctxCapturingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *ctxCapturingHandler) Handle(ctx context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.ctxs = append(h.ctxs, ctx)
+	h.msgs = append(h.msgs, r.Message)
+	return nil
+}
+func (h *ctxCapturingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *ctxCapturingHandler) WithGroup(string) slog.Handler      { return h }
+
+func sampledContext(t *testing.T) (context.Context, oteltrace.SpanContext) {
+	t.Helper()
+	sc := oteltrace.NewSpanContext(oteltrace.SpanContextConfig{
+		TraceID:    oteltrace.TraceID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		SpanID:     oteltrace.SpanID{1, 2, 3, 4, 5, 6, 7, 8},
+		TraceFlags: oteltrace.FlagsSampled,
+	})
+	return oteltrace.ContextWithSpanContext(context.Background(), sc), sc
+}
+
+// invalidFaultRule decides, at point only, on a fault that fails Validate (a
+// latency with neither delay nor jitter), so a check at that point returns an
+// error. Other points find no rule: the Transient evaluation that follows an
+// ingress response must not add a second, asynchronous record.
+func invalidFaultRule(point evaluator.InjectionPoint) evaluator.StaticRule {
+	return evaluator.StaticRule{Name: "invalid", Point: point, Decision: evaluator.Decision{
+		Fault: &inline.Latency{Delay: 0}, // invalid: Validate fails, Check returns an error
+		Mode:  evaluator.Inline, Reason: "test",
+	}}
+}
+
+func TestIngressMiddleware_CheckErrorLogsWithRequestContext(t *testing.T) {
+	h := &ctxCapturingHandler{}
+	eval := evaluator.NewStaticEvaluator(invalidFaultRule(evaluator.Ingress))
+	i := New(eval, trace.Noop(), WithLogger(slog.New(h)))
+	ctx, sc := sampledContext(t)
+	req := httptest.NewRequest("GET", "/x", nil).WithContext(ctx)
+	i.IngressMiddleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(httptest.NewRecorder(), req)
+
+	if len(h.msgs) != 1 || h.msgs[0] != "atropos: ingress check error" {
+		t.Fatalf("messages = %q", h.msgs)
+	}
+	if got := oteltrace.SpanContextFromContext(h.ctxs[0]); got.TraceID() != sc.TraceID() {
+		t.Fatalf("log context trace id = %s, want %s", got.TraceID(), sc.TraceID())
+	}
+}
+
+func TestNew_LoggerDefaultsToSlogDefault(t *testing.T) {
+	if New(nil, nil).Logger() != slog.Default() {
+		t.Fatal("Logger() must fall back to slog.Default()")
+	}
+}
+
+// WithLogger's logger is the one Logger() returns; a nil one leaves the default.
+func TestWithLogger_IsReturnedByLogger(t *testing.T) {
+	l := slog.New(&ctxCapturingHandler{})
+	if got := New(nil, nil, WithLogger(l)).Logger(); got != l {
+		t.Fatalf("Logger() = %p, want the logger passed to WithLogger (%p)", got, l)
+	}
+	if got := New(nil, nil, WithLogger(nil)).Logger(); got != slog.Default() {
+		t.Fatal("WithLogger(nil) must leave the slog.Default() fallback")
 	}
 }

@@ -3,6 +3,7 @@ package interceptor
 import (
 	"context"
 	"fmt"
+	"log/slog"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
@@ -39,6 +40,19 @@ func WithInjectionHook(h InjectionHook) Option {
 	return func(i *Interceptor) { i.onInject = h }
 }
 
+// WithLogger sets the logger the interceptor reports its own errors to: a
+// failed fault check, a recovered panic. A log call that has a request passes
+// the request's context, so a logger with an OpenTelemetry bridge stamps the
+// record with the request's trace and span. A nil logger is ignored; the
+// default is slog.Default().
+func WithLogger(l *slog.Logger) Option {
+	return func(i *Interceptor) {
+		if l != nil {
+			i.logger = l
+		}
+	}
+}
+
 // Interceptor ties the evaluator, fault execution, OTel, and cache-box
 // together. It is the per-service policy dispatcher -- middleware layers
 // call into it at each injection point.
@@ -48,6 +62,7 @@ type Interceptor struct {
 	cacheBox *cachebox.CacheBox
 	registry *FaultRegistry
 	onInject InjectionHook
+	logger   *slog.Logger
 }
 
 // noopEval never matches (tracing only, no faults).
@@ -57,7 +72,8 @@ func (noopEval) Evaluate(_ context.Context, _ evaluator.Request) *evaluator.Deci
 	return nil
 }
 
-// New creates an Interceptor. Nil eval/tracer use no-op defaults.
+// New creates an Interceptor. Nil eval/tracer use no-op defaults, and the
+// logger is slog.Default() unless WithLogger sets one.
 func New(eval evaluator.Evaluator, tracer trace.Tracer, opts ...Option) *Interceptor {
 	if eval == nil {
 		eval = noopEval{}
@@ -65,7 +81,7 @@ func New(eval evaluator.Evaluator, tracer trace.Tracer, opts ...Option) *Interce
 	if tracer == nil {
 		tracer = trace.Noop()
 	}
-	i := &Interceptor{eval: eval, tracer: tracer}
+	i := &Interceptor{eval: eval, tracer: tracer, logger: slog.Default()}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(i)
@@ -83,6 +99,13 @@ func (i *Interceptor) CacheBox() *cachebox.CacheBox {
 // Tracer returns the interceptor's tracer. Used by cache-box dispatch.
 func (i *Interceptor) Tracer() trace.Tracer {
 	return i.tracer
+}
+
+// Logger returns the logger the interceptor reports its own errors to; never
+// nil. The layers around it (the gRPC interceptors) log through it too, so one
+// logger carries every request-scoped line.
+func (i *Interceptor) Logger() *slog.Logger {
+	return i.logger
 }
 
 // CheckResult holds the outcome of a fault-injection check.

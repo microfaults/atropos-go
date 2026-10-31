@@ -63,6 +63,18 @@ func TestNewCore_ConnectedBuildsPushAndDrainAndAdoptsRegistry(t *testing.T) {
 	}
 }
 
+// The core's interceptor logs through the core's logger: that is how the host's
+// logger, and the OTel bridge behind it, see the interceptor's request-scoped
+// error lines.
+func TestNewCore_InterceptorLogsThroughTheCoresLogger(t *testing.T) {
+	logger := (&logCapture{}).logger()
+	c := NewCore(CoreConfig{Service: "svc", Instance: "pod-1", Logger: logger})
+	t.Cleanup(c.Stop)
+	if got := c.Interceptor().Logger(); got != logger {
+		t.Fatalf("interceptor logger = %p, want the core's (%p)", got, logger)
+	}
+}
+
 func TestCore_HostRulesWinOverAdminSlot(t *testing.T) {
 	c := NewCore(CoreConfig{Service: "svc", Instance: "pod-1"})
 	t.Cleanup(c.Stop)
