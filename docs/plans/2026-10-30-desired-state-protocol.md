@@ -16,9 +16,12 @@
   config fire/cancel/reap, phase enter/exit/drain/teardown for every service in the phase, freeze/thaw,
   artifact assignment, an instance registering with different capabilities, kill switch. The in-memory
   `IntentTracker` is deleted; a manteion restart changes nothing.
-- The **ETag** of a materialized document is `"<generation>-<sha256 hex[:16] of the canonical JSON>"`.
-  Generation alone is not enough: an instance can see the generation move while its own document is
-  unchanged (another instance's capabilities changed); the hash tells it not to re-apply.
+- The **ETag** of a materialized document is `"<sha256 hex[:16] of the canonical JSON>"` — the content hash
+  alone, never the generation (amended 2026-10-30: the first draft prefixed the generation, which made every
+  bump a new ETag and the 304 path unreachable). The generation travels in `X-Atropos-Generation` and in the
+  body's `version`. An instance can see the generation move while its own document is unchanged (another
+  instance's capabilities changed, an unrelated service in the same phase); the hash tells it not to
+  re-apply, and the 304 carries the new generation for it to adopt.
 
 ## 2. Endpoints
 
