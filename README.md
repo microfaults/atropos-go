@@ -421,6 +421,9 @@ it:
 - **Freeze.** `freeze_cfg.context` scopes the delay source to its
   `(experiment_id, phase_id)`: replays under another pair keep the entry's
   observed latency, and the `/admin/cachebox` stats show the source and its scope.
+  A `200` whose `freeze_cfg` names the source already installed (the same `mu`,
+  `sigma`, `seed` and scope) keeps it, so its sample sequence runs on across the
+  documents of a frozen phase instead of restarting at each.
 - **Status report.** A full snapshot of what the instance holds: applied
   generation, ETag, `unsupported` rules, `errors`, and the desired replay set
   with its pull state (`fetching|committed|failed`: `fetching` and `failed` name

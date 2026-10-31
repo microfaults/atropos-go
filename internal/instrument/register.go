@@ -195,7 +195,10 @@ type applyReport struct {
 // ("replay_set <id>: ...") go to Errors. A slot that cannot be held installs
 // nothing and clears an earlier slot under the same id, stopping its running
 // fault, so the slots held are exactly the ones report.Confirmed names. A
-// rejected freeze config installs nothing; an earlier delay source stays.
+// rejected freeze config installs nothing; an earlier delay source stays. A
+// freeze config naming the source already installed keeps it
+// (freezeInstalled), so its sample sequence runs on across the documents of a
+// frozen phase.
 //
 // Hard errors -- a category present with no target to apply it to: rules
 // without an Evaluator, active faults without a DemoEval, a freeze config
@@ -303,6 +306,8 @@ func reconcile(sync wire.RuleSync, targets applyTargets, scope applyScope) (repo
 
 	if scope&scopeFreeze != 0 {
 		switch {
+		case sync.FreezeCfg != nil && freezeInstalled(*sync.FreezeCfg, targets.CacheBox):
+			// Unchanged: a new source would restart the sample sequence.
 		case sync.FreezeCfg != nil:
 			if err := applyFreezeCfg(*sync.FreezeCfg, targets.CacheBox); err != nil {
 				report.Errors = append(report.Errors, "freeze_cfg: "+err.Error())
@@ -417,6 +422,26 @@ func applyFreezeCfg(req wire.DelayRequest, cb *cachebox.CacheBox) error {
 	}
 	cb.SetDelaySource(src)
 	return nil
+}
+
+// freezeInstalled reports whether cb already samples from the source req
+// would install: a DistributionDelaySource with req's mu, sigma and seed,
+// under req's scope (its context's pair; no context = unscoped). Installing
+// it again would only restart its random sequence, so apply keeps it. A
+// context naming one id of the pair matches no installed scope, so it still
+// reaches applyFreezeCfg, which rejects it.
+func freezeInstalled(req wire.DelayRequest, cb *cachebox.CacheBox) bool {
+	d, scope := cb.DelaySource()
+	src, ok := d.(*cachebox.DistributionDelaySource)
+	if !ok {
+		return false
+	}
+	var want cachebox.PhasePair
+	if c := req.Context; c != nil {
+		want = cachebox.PhasePair{ExperimentID: c.ExperimentID, PhaseID: c.PhaseID}
+	}
+	mu, sigma := src.Params()
+	return mu == req.Mu && sigma == req.Sigma && src.Seed() == req.Seed && scope == want
 }
 
 // reapStaleSlots is one watchdog pass (the manteion client's watchSlots):

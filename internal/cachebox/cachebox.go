@@ -344,6 +344,14 @@ func (cb *CacheBox) SetDelaySource(d DelaySource) {
 	cb.SetScopedDelaySource(d, PhasePair{})
 }
 
+// DelaySource returns the installed replay_with_delay source and its scope
+// (the zero pair when it is unscoped), read under one lock acquisition.
+func (cb *CacheBox) DelaySource() (DelaySource, PhasePair) {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+	return cb.delay, cb.delayScope
+}
+
 // ClearDelaySource atomically restores the default: ObservedDelaySource,
 // unscoped, so replay_with_delay sleeps each entry's recorded latency. It does
 // not bring back Config.Delay; that is the construction-time default only.

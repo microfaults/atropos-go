@@ -102,7 +102,9 @@ desired-state `200` that carries no `freeze_cfg` clears it (that document means
 "no delay source desired"; a registration answer without `freeze_cfg` does the
 same, a `304` leaves it). `freeze_cfg` in the desired state goes through the
 same validation and installs the same scoped source; one that fails it installs
-nothing and is reported under `errors`.
+nothing and is reported under `errors`, and one naming the source already
+installed (the same `mu`, `sigma`, `seed` and scope) keeps it, so its sample
+sequence is not restarted by every document of a frozen phase.
 
 ### /admin/rules
 

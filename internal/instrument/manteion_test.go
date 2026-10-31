@@ -712,6 +712,78 @@ func TestFetchRules_304AdoptsGenerationWithoutApplying(t *testing.T) {
 	}
 }
 
+// TestFetchRules_UnchangedFreezeKeepsTheDelaySource: the documents of a
+// frozen phase keep carrying one freeze_cfg while other parts change (a rule
+// attached, a fault fired). A 200 whose freeze_cfg names the source already
+// installed -- same mu, sigma, seed and scope -- keeps it, so its sample
+// sequence continues instead of restarting at every document. Another seed,
+// or another scope, installs a new source.
+func TestFetchRules_UnchangedFreezeKeepsTheDelaySource(t *testing.T) {
+	ctx := &wire.CacheBoxContext{ExperimentID: "exp-1", PhaseID: "phase-1"}
+	freeze := wire.DelayRequest{Mu: 8.5, Sigma: 0.7, Seed: 42, Context: ctx}
+	doc := func(gen uint64, rules []wire.CompiledRule, fc wire.DelayRequest) wire.RuleSync {
+		return wire.RuleSync{Version: gen, Etag: fmt.Sprintf("%d-f", gen), Rules: rules, ActiveFaults: []wire.FaultRequest{}, FreezeCfg: &fc}
+	}
+	f := newFakeManteion(t)
+	cb := newTestCacheBox(t)
+	c := f.client(applyTargets{Evaluator: newTestEvaluator(), CacheBox: cb})
+	entry := &cachebox.Entry{ObservedLatency: time.Millisecond}
+	poll := func(d wire.RuleSync) {
+		t.Helper()
+		f.setRules(respond200(d))
+		if err := c.fetchRules(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	samples := func(src *cachebox.DistributionDelaySource, n int) []time.Duration {
+		out := make([]time.Duration, n)
+		for i := range out {
+			out[i] = src.Sample(entry)
+		}
+		return out
+	}
+	sampleInstalled := func(n int) []time.Duration {
+		out := make([]time.Duration, n)
+		for i := range out {
+			out[i] = cb.SampleDelayFor(ctx, entry)
+		}
+		return out
+	}
+
+	poll(doc(1, []wire.CompiledRule{}, freeze))
+	got := sampleInstalled(2)
+	poll(doc(2, threeRules()[:1], freeze)) // another document, the same freeze_cfg
+	got = append(got, sampleInstalled(2)...)
+	if want := samples(cachebox.NewDistributionDelaySource(8.5, 0.7, 42), 4); !reflect.DeepEqual(got, want) {
+		t.Fatalf("samples across two 200s = %v, want one sequence %v: an unchanged freeze_cfg must not restart the source", got, want)
+	}
+
+	reseeded := freeze
+	reseeded.Seed = 43
+	poll(doc(3, threeRules()[:1], reseeded))
+	if got, want := sampleInstalled(2), samples(cachebox.NewDistributionDelaySource(8.5, 0.7, 43), 2); !reflect.DeepEqual(got, want) {
+		t.Fatalf("samples after a new seed = %v, want a new source's %v", got, want)
+	}
+	moved := reseeded
+	moved.Context = &wire.CacheBoxContext{ExperimentID: "exp-1", PhaseID: "phase-2"}
+	poll(doc(4, threeRules()[:1], moved))
+	if d := cb.Stats().Delay; d.ExperimentID != "exp-1" || d.PhaseID != "phase-2" {
+		t.Fatalf("delay source scoped to %s/%s, want exp-1/phase-2: another scope installs a new source", d.ExperimentID, d.PhaseID)
+	}
+
+	// A context naming one id of the pair is no scope: with the parameters of
+	// the unscoped source installed, it is still rejected and reported.
+	unscoped := moved
+	unscoped.Context = nil
+	poll(doc(5, threeRules()[:1], unscoped))
+	partial := unscoped
+	partial.Context = &wire.CacheBoxContext{ExperimentID: "exp-1"}
+	poll(doc(6, threeRules()[:1], partial))
+	if errs := c.buildStatus().Errors; !slices.Contains(errs, "freeze_cfg: context needs both experiment_id and phase_id") {
+		t.Fatalf("errors = %q, want the partial freeze context rejected", errs)
+	}
+}
+
 func TestFetchRules_200WithoutEtagAppliesWithoutConditional(t *testing.T) {
 	f := newFakeManteion(t)
 	f.setRules(func(w http.ResponseWriter, _ *http.Request) { // no ETag/X-Atropos-Generation headers, no etag in body

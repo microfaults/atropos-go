@@ -49,6 +49,7 @@ type DistributionDelaySource struct {
 	mu    sync.RWMutex
 	muVal float64 // lognormal mu, in ln(microseconds)
 	sigma float64 // lognormal sigma
+	seed  uint64  // the seed rng was built from; fixed
 	rng   *rand.Rand
 }
 
@@ -60,9 +61,14 @@ func NewDistributionDelaySource(mu, sigma float64, seed uint64) *DistributionDel
 	return &DistributionDelaySource{
 		muVal: mu,
 		sigma: sigma,
+		seed:  seed,
 		rng:   rand.New(rand.NewPCG(seed, seed^0x9E3779B97F4A7C15)),
 	}
 }
+
+// Seed returns the seed the source was built with: with Params, what a
+// source built anew would need to start the same sample sequence.
+func (d *DistributionDelaySource) Seed() uint64 { return d.seed }
 
 // SetParams replaces the (mu, sigma) fit atomically.
 func (d *DistributionDelaySource) SetParams(mu, sigma float64) {
