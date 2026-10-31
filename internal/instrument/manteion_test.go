@@ -1113,6 +1113,73 @@ func TestConnectManteion_RetriesAFailedReplaySetPullWhileDesired(t *testing.T) {
 	}
 }
 
+// TestConnectManteion_A200RenamingAFailedReplaySetRefetchesAtOnce: the
+// register answer names a replay set whose first artifact request is answered
+// 404, and the retry waits seconds. A 200 that names the same set again -- the
+// document changed elsewhere -- is a fresh signal from manteion: the set is
+// fetched again at once, without waiting for the timer, and the status
+// reports walk failed → fetching → committed.
+func TestConnectManteion_A200RenamingAFailedReplaySetRefetchesAtOnce(t *testing.T) {
+	withReplayRetry(t, 10*time.Second, time.Minute) // the timer cannot fire during the test
+	entries := replayEntries(3)
+	art := newFakeArtifact(t, entries)
+	art.failAt[0], art.codeAt[0] = 1, http.StatusNotFound // the first request only, answered at once
+	release := art.hold(t)                                // the refetch waits until its fetching report is in
+	ref := refFor(art, entries)
+	ref.URL = art.srv.URL + ref.URL
+	ref.ExperimentID, ref.PhaseID = "exp-1", "phase-1"
+	doc3 := wire.RuleSync{Version: 3, Etag: "3-a", Rules: []wire.CompiledRule{}, ActiveFaults: []wire.FaultRequest{}, ReplaySet: &ref}
+	f := newFakeManteion(t)
+	f.register = registerAnswer(t, doc3)
+	h := newHoldingRules(doc3)
+	f.setRules(h.serve)
+	cb := newTestCacheBox(t)
+	c, err := connectManteion(t.Context(), manteionConfig{
+		url: f.srv.URL, serviceName: "svc", instanceID: "pod-1",
+		initTimeout: 5 * time.Second, pollInterval: 10 * time.Second, pollWait: 30 * time.Second,
+		targets:    applyTargets{Evaluator: newTestEvaluator(), CacheBox: cb},
+		httpClient: &http.Client{Timeout: 5 * time.Second},
+		logger:     slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+
+	// endsWith reports whether the collapsed report states end with want.
+	endsWith := func(want ...string) bool {
+		_, statuses := f.snapshot()
+		states := replaySetStates(statuses)
+		return len(states) >= len(want) && slices.Equal(states[len(states)-len(want):], want)
+	}
+	waitFor(t, 5*time.Second, func() bool { return endsWith(wire.ReplaySetFailed) })
+	f.waitPolls(t, 2) // the startup fetch, then the loop's poll, held on 3-a
+
+	// The document changes elsewhere (a rule attached) and still names the set.
+	bumped := time.Now()
+	h.bump(wire.RuleSync{Version: 4, Etag: "4-b", Rules: threeRules()[:1], ActiveFaults: []wire.FaultRequest{}, ReplaySet: &ref})
+	waitFor(t, 5*time.Second, func() bool { return endsWith(wire.ReplaySetFailed, wire.ReplaySetFetching) })
+	release()
+	waitFor(t, 5*time.Second, func() bool {
+		return endsWith(wire.ReplaySetFailed, wire.ReplaySetFetching, wire.ReplaySetCommitted)
+	})
+
+	at := art.arrivals()
+	if len(at) != 2 {
+		t.Fatalf("artifact requests = %q, want the 404 and the refetch", art.requests())
+	}
+	if lag := at[1].Sub(bumped); lag > 2*time.Second {
+		t.Fatalf("refetched %v after the 200, want at once: the retry timer waits at least 8s", lag)
+	}
+	if cb.ReplaySetLen() != 3 || cb.ReplaySetPhaseKey() != cachebox.PhaseKey("exp-1", "phase-1") {
+		t.Fatalf("installed %d entries under %q, want the set committed under (exp-1, phase-1)", cb.ReplaySetLen(), cb.ReplaySetPhaseKey())
+	}
+	_, statuses := f.snapshot()
+	if last := statuses[len(statuses)-1]; last.AppliedGeneration != 4 {
+		t.Fatalf("last report = %+v, want generation 4", last)
+	}
+}
+
 // TestClose_CancelsThenClosesThePullerThenWaits: Close cancels the poll
 // context, closes the replay-set puller (ending its fetch and the status
 // reports it would send), and only then waits for the client's goroutines --

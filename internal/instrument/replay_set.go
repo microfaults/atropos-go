@@ -78,7 +78,8 @@ type replaySetPullerConfig struct {
 // and commits only when the entry count and the W5 digest match; Status
 // reports the state for the status report. A pull that fails is pulled again
 // on a timer while its set stays desired (armRetryLocked), since manteion
-// answers an unchanged document 304 and never re-sends the set.
+// answers an unchanged document 304 and never re-sends the set; a document
+// that names the set again has it pulled at once (Reconcile).
 //
 // At most one fetch runs at a time. Every fetch stages into the cache box's
 // single preload slot, so a fetch is cancelled and waited for before the next
@@ -139,11 +140,6 @@ type replayRetry struct {
 	cancel context.CancelFunc
 }
 
-// is reports whether r retries id under scope; false for a nil r.
-func (r *replayRetry) is(id string, scope cachebox.PhasePair) bool {
-	return r != nil && r.id == id && r.scope == scope
-}
-
 // newReplaySetPuller builds a puller from cfg, defaulting the unset fields.
 // It returns nil, the no-replay-set-support puller, when cfg.CacheBox is nil.
 func newReplaySetPuller(cfg replaySetPullerConfig) *replaySetPuller {
@@ -181,18 +177,23 @@ func newReplaySetPuller(cfg replaySetPullerConfig) *replaySetPuller {
 // not wait for a fetch, only for a superseded one to stop:
 //   - ref nil: no set is desired. Any fetch is cancelled, an armed retry
 //     dropped, the installed set is cleared and Status reports nothing.
-//   - ref already being fetched under scope, or failed under scope with its
-//     retry armed: no-op; the retry keeps its schedule.
+//   - ref already being fetched under scope: no-op.
 //   - any other fetch in flight is cancelled and waited for first, since the
 //     next fetch stages into the same preload slot. Left running, it could
-//     also install a set nobody desires any more. A retry armed for another
-//     set (or another scope) is dropped, and the backoff starts over.
+//     also install a set nobody desires any more.
+//   - an armed retry is dropped and the backoff starts over at the base, the
+//     retry of ref itself included: a document naming the failed set again
+//     is a fresh signal from manteion, so the set is fetched again at once
+//     (below) rather than when the timer fires.
 //   - ref.ID is the committed set and it is still installed under scope:
 //     nothing to fetch; the state names ref.ID as committed again (a newer
 //     set may have failed or been cancelled in between).
 //   - otherwise the state turns fetching and a fetch starts in a goroutine.
 //
-// Reconcile after Close does nothing.
+// A state Reconcile sets reaches manteion in the status report its caller
+// sends after the apply (applyDesired), not through OnChange, which would
+// POST under the apply locks Reconcile runs under. Reconcile after Close does
+// nothing.
 func (p *replaySetPuller) Reconcile(ref *wire.ReplaySetRef, scope cachebox.PhasePair) {
 	if p == nil {
 		return
@@ -202,12 +203,12 @@ func (p *replaySetPuller) Reconcile(ref *wire.ReplaySetRef, scope cachebox.Phase
 
 	p.mu.Lock()
 	old := p.current
-	if p.closed || (ref != nil && (old.is(ref.ID, scope) || p.retry.is(ref.ID, scope))) {
+	if p.closed || (ref != nil && old.is(ref.ID, scope)) {
 		p.mu.Unlock()
 		return
 	}
-	p.current = nil // detached: its outcome no longer sets the state, arms a retry or calls OnChange
-	p.dropRetryLocked()
+	p.current = nil     // detached: its outcome no longer sets the state, arms a retry or calls OnChange
+	p.dropRetryLocked() // a retry of ref too: it is fetched at once below
 	p.failures = 0
 	p.mu.Unlock()
 	if old != nil {
@@ -356,8 +357,8 @@ func (p *replaySetPuller) run(ctx context.Context, f *replayFetch, ref wire.Repl
 // armRetryLocked arms the retry of the current set's failed pull, ref under
 // scope: once retryDelay(p.failures) has passed, its goroutine pulls the set
 // again (retryFetch) unless the retry is dropped first -- by a Reconcile
-// naming another set or none, or by Close. It returns the wait. p.mu must be
-// held.
+// naming another set, none, or this set again (which fetches it at once), or
+// by Close. It returns the wait. p.mu must be held.
 func (p *replaySetPuller) armRetryLocked(ref wire.ReplaySetRef, scope cachebox.PhasePair) time.Duration {
 	ctx, cancel := context.WithCancel(p.ctx)
 	r := &replayRetry{id: ref.ID, scope: scope, cancel: cancel}

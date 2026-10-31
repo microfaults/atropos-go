@@ -477,10 +477,11 @@ The fidelity pipeline around a recording phase:
    `committed` | `failed`) is reported as it is reached; a newer `id` supersedes a fetch in flight.
    A failed pull is pulled again on the instance's own timer while the set stays desired (5 s,
    doubling up to 60 s, each wait ±20 %), so manteion sees `failed` → `fetching` → `committed`
-   even while it answers every poll `304`, and a restarted instance converges on its own; only a
-   set no pull can fetch (no `(experiment_id, phase_id)` scopes it, an unsupported key strategy, no
-   artifact `url`) waits for a document naming another. `POST /cachebox/preload/{begin,chunk,commit}`
-   stays mounted for manual use.
+   even while it answers every poll `304`, and a restarted instance converges on its own. A `200`
+   that names the failed set again is a fresh signal: the set is fetched again at once and the
+   backoff starts over. Only a set no pull can fetch (no `(experiment_id, phase_id)` scopes it, an
+   unsupported key strategy, no artifact `url`) gets no timer.
+   `POST /cachebox/preload/{begin,chunk,commit}` stays mounted for manual use.
 4. **Freeze/replay** — the synthesized replay rule + a delay source (`freeze_cfg` in the desired
    state, installed scoped to its `context`'s `(experiment_id, phase_id)`;
    `POST /admin/cachebox/delay` remains for manual use, and a source pushed that way lasts until

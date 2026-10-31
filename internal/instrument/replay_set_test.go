@@ -508,33 +508,56 @@ func TestReplaySetPuller_RetriesAFailedPullWithBackoff(t *testing.T) {
 	}
 }
 
-// TestReplaySetPuller_ReconcileOfTheSetAwaitingARetryKeepsIt: a document that
-// still names the failed set (and its pair) leaves the armed retry on its
-// schedule: no pull at once, and the retry pulls it.
-func TestReplaySetPuller_ReconcileOfTheSetAwaitingARetryKeepsIt(t *testing.T) {
+// TestReplaySetPuller_ReconcileOfAFailedSetRefetchesAtOnce: a document that
+// names the failed set again (same id, same pair) is a fresh signal from
+// manteion: the armed retry is dropped, the backoff starts over at the base,
+// and the set is fetched at once, not when the timer would have fired. A
+// Reconcile naming the set being fetched stays a no-op.
+func TestReplaySetPuller_ReconcileOfAFailedSetRefetchesAtOnce(t *testing.T) {
 	entries := replayEntries(3)
 	f := newFakeArtifact(t, entries)
-	f.failAt[0], f.codeAt[0] = 1, http.StatusNotFound
+	f.failAt[0], f.codeAt[0] = 2, http.StatusNotFound // the first two pulls fail
 	cb := newTestCacheBox(t)
 	var changes atomic.Int32
 	p := newTestPuller(t, f, cb, func() { changes.Add(1) })
-	p.retryBase, p.retryMax = 100*time.Millisecond, 100*time.Millisecond
+	p.retryBase, p.retryMax = 10*time.Second, time.Minute // the timer cannot fire during the test
 	noJitter(p)
+	failures := func() int {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.failures
+	}
+	ref := refFor(f, entries)
 
-	p.Reconcile(ptr(refFor(f, entries)), scope1)
+	p.Reconcile(&ref, scope1)
 	waitState(t, p, wire.ReplaySetFailed)
 	waitChanges(t, &changes, 1)
-	p.Reconcile(ptr(refFor(f, entries)), scope1) // the next 200 still names the set
-	if got := f.requests(); len(got) != 1 {
-		t.Fatalf("requests = %q, want only the failed pull: the retry keeps its schedule", got)
+	p.Reconcile(&ref, scope1) // the next 200 still names the set: pulled again at once
+	if st, _ := p.Status(); st == nil || st.State == wire.ReplaySetCommitted {
+		t.Fatalf("state = %+v right after the re-naming, want the set fetching (or failed again)", st)
 	}
-	if st, _ := p.Status(); st == nil || st.State != wire.ReplaySetFailed {
-		t.Fatalf("state = %+v, want failed until the retry", st)
+	waitFor(t, 5*time.Second, func() bool { return len(f.requests()) == 2 })
+	waitState(t, p, wire.ReplaySetFailed) // the second pull fails too
+	waitChanges(t, &changes, 2)
+	if n := failures(); n != 1 {
+		t.Fatalf("failures = %d after the re-named set failed again, want 1: the backoff starts over at the base", n)
 	}
+
+	release := f.hold(t) // the third pull stays in flight
+	p.Reconcile(&ref, scope1)
+	if st, _ := p.Status(); st == nil || st.State != wire.ReplaySetFetching {
+		t.Fatalf("state = %+v, want fetching at once", st)
+	}
+	waitFor(t, 5*time.Second, func() bool { return len(f.requests()) == 3 })
+	p.Reconcile(&ref, scope1) // the set is being fetched: no-op
+	release()
 	waitState(t, p, wire.ReplaySetCommitted)
-	waitChanges(t, &changes, 3) // failed, fetching (the retry), committed
-	if got := f.requests(); len(got) != 2 {
-		t.Fatalf("requests = %q, want the failed pull and the retry", got)
+	waitChanges(t, &changes, 3) // failed, failed, committed: a fetch a Reconcile starts is reported by its caller
+	if got := f.requests(); len(got) != 3 {
+		t.Fatalf("requests = %q, want three pulls: the re-naming during the fetch must not start another", got)
+	}
+	if n := failures(); n != 0 || cb.ReplaySetLen() != 3 {
+		t.Fatalf("failures=%d installed=%d, want the backoff reset and the set installed", n, cb.ReplaySetLen())
 	}
 }
 

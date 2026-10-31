@@ -187,9 +187,10 @@ sync loop, the status report and the replay-set pull are internal to `Serve`
   is retried from its offset (five requests per chunk at most). A failed pull is
   pulled again on the instance's own timer while the set stays desired (5 s,
   doubling up to 60 s, each wait ±20 %), reported `failed` → `fetching` → ...;
-  a document naming another set or none drops the retry, one still naming it
-  leaves it on its schedule. A set no pull can fetch (no pair scopes it, an
-  unsupported key strategy, no artifact `url`) is not retried.
+  a document naming another set or none drops the retry, and one naming the
+  failed set again (a `200` for a change elsewhere) has it fetched at once,
+  the backoff starting over at 5 s. A set no pull can fetch (no pair scopes
+  it, an unsupported key strategy, no artifact `url`) gets no timer.
 - **Ingest `epoch`.** Cache-push batches (`POST /api/v1/cache/ingest`) carry the
   instance's start time in unix nanoseconds as `epoch`, extending manteion's
   dedupe key across restarts. `batch_seq` is monotonic per epoch and never
