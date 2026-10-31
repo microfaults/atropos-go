@@ -17,12 +17,23 @@ const tracerName = "git.ucsc.edu/microfaults/atropos-go/fault"
 // Tracer creates and manages spans.
 type Tracer interface {
 	Start(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, Span)
+	// StartLinked is Start with links to other spans, set when the span
+	// starts. A link whose span context is invalid is not dropped for that
+	// reason alone (the OTel SDK keeps one that carries attributes), so a
+	// caller links only spans it knows exist.
+	StartLinked(ctx context.Context, name string, links []oteltrace.Link, attrs ...attribute.KeyValue) (context.Context, Span)
 }
 
-// Span records attributes, events, and lifecycle signals on a trace span.
+// Span records attributes, events, links, and lifecycle signals on a trace
+// span.
 type Span interface {
 	SetAttributes(attrs ...attribute.KeyValue)
 	AddEvent(name string, attrs ...attribute.KeyValue)
+	// AddLink links the span to another after it started.
+	AddLink(l oteltrace.Link)
+	// SpanContext identifies the span, e.g. as the target of another span's
+	// link; the zero value when there is no span behind it.
+	SpanContext() oteltrace.SpanContext
 	RecordResult(r fault.Result)
 	EndWithError(err error)
 	End()
@@ -45,6 +56,14 @@ func (t *OTelTracer) Start(ctx context.Context, name string, attrs ...attribute.
 	return ctx, &otelSpan{span: span}
 }
 
+func (t *OTelTracer) StartLinked(ctx context.Context, name string, links []oteltrace.Link, attrs ...attribute.KeyValue) (context.Context, Span) {
+	ctx, span := t.tracer.Start(ctx, name,
+		oteltrace.WithLinks(links...),
+		oteltrace.WithAttributes(attrs...),
+	)
+	return ctx, &otelSpan{span: span}
+}
+
 type otelSpan struct {
 	span oteltrace.Span
 }
@@ -55,6 +74,14 @@ func (s *otelSpan) SetAttributes(attrs ...attribute.KeyValue) {
 
 func (s *otelSpan) AddEvent(name string, attrs ...attribute.KeyValue) {
 	s.span.AddEvent(name, oteltrace.WithAttributes(attrs...))
+}
+
+func (s *otelSpan) AddLink(l oteltrace.Link) {
+	s.span.AddLink(l)
+}
+
+func (s *otelSpan) SpanContext() oteltrace.SpanContext {
+	return s.span.SpanContext()
 }
 
 func (s *otelSpan) RecordResult(r fault.Result) {

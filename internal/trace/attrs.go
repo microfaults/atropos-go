@@ -9,6 +9,16 @@ const (
 	AttrFaultDurationMs     = "atropos.fault.duration_ms"
 	AttrFaultActualDuration = "atropos.fault.actual_duration"
 	AttrFaultDetail         = "atropos.fault.detail"
+	// AttrFaultID is the fault run's id: on the fault span, and on the span
+	// of every request that started or joined the run.
+	AttrFaultID = "atropos.fault.id"
+	// AttrFaultJoined counts the requests that joined a running background
+	// fault instead of starting another (on the run's fault span).
+	AttrFaultJoined = "atropos.fault.joined"
+
+	// Span link attributes. AttrLinkKind says what a link points at; its
+	// values are the LinkKind* names.
+	AttrLinkKind = "atropos.link.kind"
 
 	// Resource attributes (stamped by internal/instrument's InitTelemetry).
 	AttrHost = "atropos.host" // the instrument host: "in-process" or "sidecar"
@@ -62,6 +72,11 @@ const (
 	SpanFaultInject   = "atropos.fault.inject"
 	SpanCacheBoxCheck = "atropos.cachebox.check"
 	SpanHookPrefix    = "atropos.hook."
+
+	// Link kinds (values of AttrLinkKind).
+	LinkKindTrigger = "trigger" // fault span -> the request that started the run
+	LinkKindRecent  = "recent"  // fault span -> a request the interceptor saw before the run started
+	LinkKindFault   = "fault"   // request span -> the fault span of the run it joined
 
 	// Event names.
 	EventFaultInjected = "atropos.fault.injected"

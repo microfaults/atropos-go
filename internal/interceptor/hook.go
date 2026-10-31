@@ -41,7 +41,7 @@ func (i *Interceptor) Hook(ctx context.Context, name string, labels map[string]s
 		return ctx, hookSpan, cr, err
 	}
 
-	if cr.Handle != nil {
+	if cr.Handle != nil || cr.Joined {
 		hookSpan.AddEvent(trace.EventFaultInjected,
 			attribute.String(trace.AttrFaultType, fmt.Sprintf("%T", cr.Decision.Fault)),
 			attribute.String(trace.AttrFaultReason, cr.Decision.Reason),

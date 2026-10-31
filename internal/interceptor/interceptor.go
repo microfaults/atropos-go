@@ -12,6 +12,7 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 
 	"go.opentelemetry.io/otel/attribute"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 // Option configures an Interceptor at construction time.
@@ -63,6 +64,9 @@ type Interceptor struct {
 	registry *FaultRegistry
 	onInject InjectionHook
 	logger   *slog.Logger
+	// recent holds the last requests this interceptor evaluated; background
+	// fault spans link to them.
+	recent *requestRing
 }
 
 // noopEval never matches (tracing only, no faults).
@@ -81,7 +85,7 @@ func New(eval evaluator.Evaluator, tracer trace.Tracer, opts ...Option) *Interce
 	if tracer == nil {
 		tracer = trace.Noop()
 	}
-	i := &Interceptor{eval: eval, tracer: tracer, logger: slog.Default()}
+	i := &Interceptor{eval: eval, tracer: tracer, logger: slog.Default(), recent: newRequestRing(ringSize)}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(i)
@@ -108,16 +112,29 @@ func (i *Interceptor) Logger() *slog.Logger {
 	return i.logger
 }
 
-// CheckResult holds the outcome of a fault-injection check.
+// CheckResult holds the outcome of a fault-injection check. RunID is the id
+// of the fault run the request started or joined (atropos.fault.id). Joined
+// reports that the request joined a background run already in progress
+// instead of starting one: Handle is then nil, so no caller waits on a run
+// it did not start, while Decision still describes the fault.
 type CheckResult struct {
 	Handle   *fault.Handle
 	Decision *evaluator.Decision
+	RunID    string
+	Joined   bool
 }
 
-// Evaluate runs the rule engine and returns the matching decision, if any.
-// This is a side-effect-free read of the current rule set; callers must
-// dispatch (StartFault or cache-box handleCacheBox) based on the result.
+// Evaluate records the request in the interceptor's ring of recent requests
+// (a no-op unless ctx carries a sampled span), then runs the rule engine and
+// returns the matching decision, if any. It does not touch the rule set;
+// callers must dispatch (StartFault or cache-box handleCacheBox) based on
+// the result. A Transient evaluation is not recorded: it runs for a request
+// whose Ingress evaluation already was, and a second entry would spend a
+// ring slot and a link on the same span.
 func (i *Interceptor) Evaluate(ctx context.Context, req evaluator.Request) *evaluator.Decision {
+	if req.Point != evaluator.Transient {
+		i.recent.Record(oteltrace.SpanContextFromContext(ctx), req.Labels)
+	}
 	return i.eval.Evaluate(ctx, req)
 }
 
@@ -136,8 +153,9 @@ func IsInlineFault(f fault.Fault) bool {
 // faults are forced to Background mode. If a registry is configured,
 // non-inline faults are routed through it for deduplication.
 //
-// Returns an empty CheckResult if the decision is nil, has no fault, or was
-// deduplicated by the registry.
+// Returns an empty CheckResult if the decision is nil or has no fault. A
+// start the registry deduplicated returns Joined with the running run's
+// RunID and no Handle.
 func (i *Interceptor) StartFault(ctx context.Context, req evaluator.Request, decision *evaluator.Decision) (CheckResult, error) {
 	if decision == nil || decision.Fault == nil {
 		return CheckResult{}, nil
@@ -155,9 +173,11 @@ func (i *Interceptor) StartFault(ctx context.Context, req evaluator.Request, dec
 		effectiveMode = evaluator.Background
 	}
 
-	// Registry path: non-inline faults with a registry get deduped.
+	// Registry path: non-inline faults with a registry get deduped. The
+	// fault span is a root (parented on the registry context), linked to
+	// the request.
 	if i.registry != nil && !IsInlineFault(decision.Fault) {
-		return i.startRegistered(i.registry.ctx, req, decision, faultType, effectiveMode)
+		return i.startRegistered(ctx, i.registry.ctx, req, decision, faultType, effectiveMode)
 	}
 
 	// Direct path: inline faults (or no registry configured).
@@ -171,11 +191,13 @@ func (i *Interceptor) StartFault(ctx context.Context, req evaluator.Request, dec
 // by StartPolicy) regardless of its type. The fault span is parented on
 // ctx's trace context while the fault runs detached from ctx's cancellation
 // (context.WithoutCancel): it outlives the request without losing the link
-// to it. An inline error fault here has no response to shape; it only
-// leaves its span. It returns once the fault has started, and a fault's
-// Start can block (the registry holds its lock meanwhile), so a caller that
-// still has a response to finish runs it on its own goroutine, as
-// IngressMiddleware does.
+// to it; through the registry the span also links the request as its
+// trigger, like any background fault's. An inline error fault here has no
+// response to shape; it only leaves its span. It returns once the fault has
+// started, and a fault's Start can block (the registry holds its lock
+// meanwhile), so a caller that still has a response to finish runs it on its
+// own goroutine, as IngressMiddleware does -- by then the request's span has
+// usually ended, and the run id stamped on it is dropped.
 func (i *Interceptor) StartTransient(ctx context.Context, req evaluator.Request, decision *evaluator.Decision) (CheckResult, error) {
 	if decision == nil || decision.Fault == nil {
 		return CheckResult{}, nil
@@ -186,19 +208,29 @@ func (i *Interceptor) StartTransient(ctx context.Context, req evaluator.Request,
 	faultType := fmt.Sprintf("%T", decision.Fault)
 	detached := context.WithoutCancel(ctx)
 	if i.registry != nil {
-		return i.startRegistered(detached, req, decision, faultType, evaluator.Background)
+		return i.startRegistered(detached, detached, req, decision, faultType, evaluator.Background)
 	}
 	return i.startDirect(detached, req, decision, faultType, evaluator.Background)
 }
 
-// startDirect is the inline-fault path. It creates a span, wires up events,
-// starts the fault, and hooks the result callback.
-func (i *Interceptor) startDirect(ctx context.Context, req evaluator.Request, decision *evaluator.Decision, faultType string, mode evaluator.Mode) (CheckResult, error) {
-	ctx, span := i.tracer.Start(ctx, trace.SpanFaultInject,
+// faultSpanAttrs are the attributes every fault span starts with.
+func faultSpanAttrs(req evaluator.Request, decision *evaluator.Decision, faultType, runID string) []attribute.KeyValue {
+	return []attribute.KeyValue{
 		attribute.String(trace.AttrFaultType, faultType),
 		attribute.String(trace.AttrFaultInjectionPoint, req.Point.String()),
 		attribute.String(trace.AttrFaultReason, decision.Reason),
-	)
+		attribute.String(trace.AttrFaultID, runID),
+	}
+}
+
+// startDirect is the inline-fault path. It mints the run's id, creates a
+// span (a child of the request's), wires up events, starts the fault, hooks
+// the result callback, and stamps the run id on the request's span once the
+// fault has started.
+func (i *Interceptor) startDirect(ctx context.Context, req evaluator.Request, decision *evaluator.Decision, faultType string, mode evaluator.Mode) (CheckResult, error) {
+	runID := NewRunID()
+	reqSpan := oteltrace.SpanFromContext(ctx) // before ctx becomes the fault span's
+	ctx, span := i.tracer.Start(ctx, trace.SpanFaultInject, faultSpanAttrs(req, decision, faultType, runID)...)
 	for k, v := range req.Labels {
 		span.SetAttributes(attribute.String(k, v))
 	}
@@ -213,6 +245,7 @@ func (i *Interceptor) startDirect(ctx context.Context, req evaluator.Request, de
 		span.EndWithError(err)
 		return CheckResult{}, fmt.Errorf("interceptor: fault start failed: %w", err)
 	}
+	reqSpan.SetAttributes(attribute.String(trace.AttrFaultID, runID))
 	if i.onInject != nil {
 		i.onInject(faultType, req.Point.String())
 	}
@@ -222,27 +255,29 @@ func (i *Interceptor) startDirect(ctx context.Context, req evaluator.Request, de
 
 	d := *decision
 	d.Mode = mode
-	return CheckResult{Handle: handle, Decision: &d}, nil
+	return CheckResult{Handle: handle, Decision: &d, RunID: runID}, nil
 }
 
 // startRegistered routes faults through the registry for deduplication and
 // detachment: the fault runs under the registry context so it can outlive
-// the triggering request and be stopped by key. Its span is parented on
-// spanParent -- the registry context for StartFault (a root span, as
-// before) or the request context stripped of cancellation for
-// StartTransient (a child of the request's server span).
-func (i *Interceptor) startRegistered(spanParent context.Context, req evaluator.Request, decision *evaluator.Decision, faultType string, mode evaluator.Mode) (CheckResult, error) {
+// the triggering request and be stopped by key. ctx is the triggering
+// request's context. The fault span is parented on spanParent -- the
+// registry context for StartFault (a root span, as before) or the request
+// context stripped of cancellation for StartTransient (a child of the
+// request's server span) -- and links the request (trigger) and the
+// requests this interceptor saw before it (recent). Started or joined, the
+// request's span carries the run id; a joiner's span also links the run's
+// fault span, and the run counts the join.
+func (i *Interceptor) startRegistered(ctx, spanParent context.Context, req evaluator.Request, decision *evaluator.Decision, faultType string, mode evaluator.Mode) (CheckResult, error) {
 	key := decision.Name
 	if key == "" {
 		key = faultType
 	}
+	trigger := oteltrace.SpanContextFromContext(ctx)
 
-	handle, deduped, err := i.registry.StartOrJoin(key, decision.StartPolicy, func(regCtx context.Context) (*fault.Handle, error) {
-		_, span := i.tracer.Start(spanParent, trace.SpanFaultInject,
-			attribute.String(trace.AttrFaultType, faultType),
-			attribute.String(trace.AttrFaultInjectionPoint, req.Point.String()),
-			attribute.String(trace.AttrFaultReason, decision.Reason),
-		)
+	run, joined, err := i.registry.StartRun(key, decision.StartPolicy, func(regCtx context.Context, runID string) (*fault.Handle, trace.Span, error) {
+		_, span := i.tracer.StartLinked(spanParent, trace.SpanFaultInject, i.faultLinks(trigger),
+			faultSpanAttrs(req, decision, faultType, runID)...)
 		for k, v := range req.Labels {
 			span.SetAttributes(attribute.String(k, v))
 		}
@@ -254,26 +289,53 @@ func (i *Interceptor) startRegistered(spanParent context.Context, req evaluator.
 		h, err := decision.Fault.Start(regCtx)
 		if err != nil {
 			span.EndWithError(err)
-			return nil, err
+			return nil, nil, err
 		}
 		h.SetOnResult(func(r fault.Result) {
 			span.RecordResult(r)
 		})
-		return h, nil
+		return h, span, nil
 	})
 	if err != nil {
 		return CheckResult{}, fmt.Errorf("interceptor: fault start failed: %w", err)
 	}
-	if deduped {
-		return CheckResult{}, nil
+
+	reqSpan := oteltrace.SpanFromContext(ctx)
+	reqSpan.SetAttributes(attribute.String(trace.AttrFaultID, run.ID))
+	d := *decision
+	d.Mode = mode
+	if joined {
+		if run.Span != nil {
+			if sc := run.Span.SpanContext(); linkable(sc) {
+				reqSpan.AddLink(oteltrace.Link{SpanContext: sc, Attributes: []attribute.KeyValue{
+					attribute.String(trace.AttrLinkKind, trace.LinkKindFault),
+				}})
+			}
+		}
+		run.Join()
+		return CheckResult{Decision: &d, RunID: run.ID, Joined: true}, nil
 	}
 	if i.onInject != nil {
 		i.onInject(faultType, req.Point.String())
 	}
+	return CheckResult{Handle: run.Handle, Decision: &d, RunID: run.ID}, nil
+}
 
-	d := *decision
-	d.Mode = mode
-	return CheckResult{Handle: handle, Decision: &d}, nil
+// faultLinks are a background fault span's links: the triggering request
+// (kind trigger), then up to ringLinks of the requests this interceptor saw,
+// newest first, without the trigger (kind recent). A trigger that is not
+// linkable is left out: Core.Arm starts from context.Background(), whose
+// invalid span context the SDK would still record as a link because the
+// link carries an attribute, and an unsampled request's trace is never
+// stored.
+func (i *Interceptor) faultLinks(trigger oteltrace.SpanContext) []oteltrace.Link {
+	recent := i.recent.Links(ringLinks, trigger.SpanID())
+	if !linkable(trigger) {
+		return recent
+	}
+	return append([]oteltrace.Link{{SpanContext: trigger, Attributes: []attribute.KeyValue{
+		attribute.String(trace.AttrLinkKind, trace.LinkKindTrigger),
+	}}}, recent...)
 }
 
 // Check is a convenience that evaluates and (if appropriate) starts a fault.

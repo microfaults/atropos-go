@@ -2,6 +2,7 @@ package interceptor
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -14,7 +15,11 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault/inline"
 	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
@@ -351,6 +356,8 @@ type recordingTracer struct {
 	spanCount int
 	// startCtx is the context the last Start received (span parent).
 	startCtx context.Context
+	// links collects the links StartLinked was given.
+	links []oteltrace.Link
 }
 
 type recordingSpan struct {
@@ -359,6 +366,7 @@ type recordingSpan struct {
 	ended          bool
 	attrs          []attribute.KeyValue
 	events         []string
+	links          []oteltrace.Link
 }
 
 func (t *recordingTracer) Start(ctx context.Context, name string, _ ...attribute.KeyValue) (context.Context, trace.Span) {
@@ -372,15 +380,33 @@ func (t *recordingTracer) Start(ctx context.Context, name string, _ ...attribute
 	return ctx, &t.span
 }
 
+func (t *recordingTracer) StartLinked(ctx context.Context, name string, links []oteltrace.Link, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
+	t.links = append(t.links, links...)
+	return t.Start(ctx, name, attrs...)
+}
+
 func (s *recordingSpan) SetAttributes(attrs ...attribute.KeyValue) {
 	s.attrs = append(s.attrs, attrs...)
 }
 func (s *recordingSpan) AddEvent(name string, _ ...attribute.KeyValue) {
 	s.events = append(s.events, name)
 }
-func (s *recordingSpan) RecordResult(_ fault.Result) { s.resultRecorded = true }
-func (s *recordingSpan) EndWithError(_ error)        { s.errorRecorded = true; s.ended = true }
-func (s *recordingSpan) End()                        { s.ended = true }
+func (s *recordingSpan) AddLink(l oteltrace.Link)           { s.links = append(s.links, l) }
+func (s *recordingSpan) SpanContext() oteltrace.SpanContext { return oteltrace.SpanContext{} }
+func (s *recordingSpan) RecordResult(_ fault.Result)        { s.resultRecorded = true }
+func (s *recordingSpan) EndWithError(_ error)               { s.errorRecorded = true; s.ended = true }
+func (s *recordingSpan) End()                               { s.ended = true }
+
+// hasAttr reports whether attrs holds key with value, compared in the
+// value's string form (Value.Emit).
+func hasAttr(attrs []attribute.KeyValue, key, value string) bool {
+	for _, a := range attrs {
+		if string(a.Key) == key && a.Value.Emit() == value {
+			return true
+		}
+	}
+	return false
+}
 
 // eventFault is a test fault implementing EventAware.
 // It calls the injected EventEmitter during Start to verify the interceptor
@@ -511,5 +537,358 @@ func TestWithLogger_IsReturnedByLogger(t *testing.T) {
 	}
 	if got := New(nil, nil, WithLogger(nil)).Logger(); got != slog.Default() {
 		t.Fatal("WithLogger(nil) must leave the slog.Default() fallback")
+	}
+}
+
+// installRecordingProvider makes the global tracer provider export
+// synchronously to an in-memory exporter for the test's lifetime.
+func installRecordingProvider(t *testing.T) *tracetest.InMemoryExporter {
+	t.Helper()
+	exp := tracetest.NewInMemoryExporter()
+	prev := otel.GetTracerProvider()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp), sdktrace.WithSampler(sdktrace.AlwaysSample())))
+	t.Cleanup(func() { otel.SetTracerProvider(prev) })
+	return exp
+}
+
+func findSpan(t *testing.T, spans tracetest.SpanStubs, name string) tracetest.SpanStub {
+	t.Helper()
+	for _, s := range spans {
+		if s.Name == name {
+			return s
+		}
+	}
+	t.Fatalf("no span %q in %d spans", name, len(spans))
+	return tracetest.SpanStub{}
+}
+
+func linksOfKind(links []sdktrace.Link, kind string) []sdktrace.Link {
+	var out []sdktrace.Link
+	for _, l := range links {
+		for _, a := range l.Attributes {
+			if a.Key == trace.AttrLinkKind && a.Value.AsString() == kind {
+				out = append(out, l)
+			}
+		}
+	}
+	return out
+}
+
+func backgroundDecision(name string) *evaluator.Decision {
+	return &evaluator.Decision{Name: name, Fault: newStubFault(60 * time.Millisecond), Reason: "test", Mode: evaluator.Background}
+}
+
+// heldDecision is a background decision whose fault runs until the registry
+// stops it, so a test that joins it never races the fault's end.
+func heldDecision(name string) *evaluator.Decision {
+	return &evaluator.Decision{Name: name, Fault: newStubFault(time.Hour), Reason: "test", Mode: evaluator.Background}
+}
+
+func TestStartFault_BackgroundSpanLinksTriggerAndRecent(t *testing.T) {
+	exp := installRecordingProvider(t)
+	reg := NewFaultRegistry()
+	defer reg.Close()
+	i := New(&mockEvaluator{decision: backgroundDecision("bg")}, trace.NewOTelTracer(), WithRegistry(reg))
+	tr := otel.Tracer("test")
+
+	var recent []oteltrace.SpanContext
+	for n := 0; n < 3; n++ { // three earlier requests, evaluated with no fault
+		ctx, s := tr.Start(context.Background(), "earlier")
+		i.Evaluate(ctx, evaluator.Request{Point: evaluator.Ingress, Labels: map[string]string{"n": "x"}})
+		recent = append(recent, s.SpanContext())
+		s.End()
+	}
+	ctx, reqSpan := tr.Start(context.Background(), "trigger")
+	cr, err := i.Check(ctx, evaluator.Request{Point: evaluator.Ingress})
+	if err != nil || cr.Handle == nil || cr.RunID == "" || cr.Joined {
+		t.Fatalf("cr=%+v err=%v", cr, err)
+	}
+	<-cr.Handle.Done()
+	reqSpan.End()
+
+	spans := exp.GetSpans()
+	fs := findSpan(t, spans, trace.SpanFaultInject)
+	if !hasAttr(fs.Attributes, trace.AttrFaultID, cr.RunID) {
+		t.Fatalf("fault span attrs = %v, want %s=%s", fs.Attributes, trace.AttrFaultID, cr.RunID)
+	}
+	if fs.Parent.IsValid() {
+		t.Fatal("background fault span must stay a root (detached from the request)")
+	}
+	trig := linksOfKind(fs.Links, trace.LinkKindTrigger)
+	if len(trig) != 1 || trig[0].SpanContext.SpanID() != reqSpan.SpanContext().SpanID() {
+		t.Fatalf("trigger links = %+v", trig)
+	}
+	rl := linksOfKind(fs.Links, trace.LinkKindRecent)
+	if len(rl) != 3 {
+		t.Fatalf("recent links = %d, want 3 (trigger excluded)", len(rl))
+	}
+	if rl[0].SpanContext.SpanID() != recent[2].SpanID() {
+		t.Fatal("recent links must be newest first")
+	}
+	rs := findSpan(t, spans, "trigger")
+	if !hasAttr(rs.Attributes, trace.AttrFaultID, cr.RunID) {
+		t.Fatalf("request span must carry atropos.fault.id, got %v", rs.Attributes)
+	}
+}
+
+func TestStartFault_JoinLinksRequestToFaultSpan(t *testing.T) {
+	exp := installRecordingProvider(t)
+	reg := NewFaultRegistry()
+	defer reg.Close()
+	i := New(&mockEvaluator{decision: backgroundDecision("bg")}, trace.NewOTelTracer(), WithRegistry(reg))
+	tr := otel.Tracer("test")
+
+	ctx1, s1 := tr.Start(context.Background(), "first")
+	first, err := i.Check(ctx1, evaluator.Request{Point: evaluator.Ingress})
+	if err != nil || first.Handle == nil {
+		t.Fatalf("first: %+v %v", first, err)
+	}
+	s1.End()
+	ctx2, s2 := tr.Start(context.Background(), "joiner")
+	second, err := i.Check(ctx2, evaluator.Request{Point: evaluator.Ingress})
+	if err != nil || !second.Joined || second.Handle != nil || second.RunID != first.RunID {
+		t.Fatalf("second: %+v %v (first run %s)", second, err, first.RunID)
+	}
+	s2.End()
+	<-first.Handle.Done()
+
+	spans := exp.GetSpans()
+	fs := findSpan(t, spans, trace.SpanFaultInject)
+	js := findSpan(t, spans, "joiner")
+	fl := linksOfKind(js.Links, trace.LinkKindFault)
+	if len(fl) != 1 || fl[0].SpanContext.SpanID() != fs.SpanContext.SpanID() {
+		t.Fatalf("joiner links = %+v, want one to the fault span", js.Links)
+	}
+	if !hasAttr(js.Attributes, trace.AttrFaultID, first.RunID) || !hasAttr(fs.Attributes, trace.AttrFaultJoined, "1") {
+		t.Fatalf("joiner attrs %v / fault attrs %v", js.Attributes, fs.Attributes)
+	}
+}
+
+// Review Focus 5: Core.Arm starts from context.Background().
+func TestStartFault_ArmWithoutRequestSpan(t *testing.T) {
+	exp := installRecordingProvider(t)
+	reg := NewFaultRegistry()
+	defer reg.Close()
+	i := New(&mockEvaluator{decision: backgroundDecision("bg")}, trace.NewOTelTracer(), WithRegistry(reg))
+	cr, err := i.StartFault(context.Background(), evaluator.Request{Point: evaluator.Egress, Labels: map[string]string{}}, backgroundDecision("bg"))
+	if err != nil || cr.Handle == nil {
+		t.Fatalf("cr=%+v err=%v", cr, err)
+	}
+	<-cr.Handle.Done()
+	fs := findSpan(t, exp.GetSpans(), trace.SpanFaultInject)
+	if len(linksOfKind(fs.Links, trace.LinkKindTrigger)) != 0 {
+		t.Fatalf("no trigger link expected without a request span, got %+v", fs.Links)
+	}
+}
+
+func TestStartFault_InlineStampsRunIDOnRequestSpan(t *testing.T) {
+	exp := installRecordingProvider(t)
+	i := New(&mockEvaluator{decision: &evaluator.Decision{Fault: &inline.Latency{Delay: 5 * time.Millisecond}, Mode: evaluator.Inline, Reason: "test"}}, trace.NewOTelTracer())
+	ctx, s := otel.Tracer("test").Start(context.Background(), "req")
+	cr, err := i.Check(ctx, evaluator.Request{Point: evaluator.Ingress})
+	if err != nil || cr.RunID == "" {
+		t.Fatalf("cr=%+v err=%v", cr, err)
+	}
+	<-cr.Handle.Done()
+	s.End()
+	spans := exp.GetSpans()
+	if !hasAttr(findSpan(t, spans, "req").Attributes, trace.AttrFaultID, cr.RunID) || !hasAttr(findSpan(t, spans, trace.SpanFaultInject).Attributes, trace.AttrFaultID, cr.RunID) {
+		t.Fatal("both the request span and the inline fault span must carry atropos.fault.id")
+	}
+}
+
+// Ruling (plan A): a Transient run goes through the registry like any
+// background fault and links the request that triggered it, while its span
+// stays a child of that request's span. The request itself is excluded from
+// the recent links (it is the trigger); the request before it is not.
+func TestStartTransient_SpanLinksTriggerRequest(t *testing.T) {
+	exp := installRecordingProvider(t)
+	reg := NewFaultRegistry()
+	defer reg.Close()
+	i := New(nil, trace.NewOTelTracer(), WithRegistry(reg))
+	tr := otel.Tracer("test")
+
+	ctx0, s0 := tr.Start(context.Background(), "earlier")
+	i.Evaluate(ctx0, evaluator.Request{Point: evaluator.Ingress})
+	s0.End()
+	// What IngressMiddleware does: evaluate Ingress, serve, then start the
+	// Transient fault with the request's context.
+	ctx, reqSpan := tr.Start(context.Background(), "request")
+	i.Evaluate(ctx, evaluator.Request{Point: evaluator.Ingress})
+	cr, err := i.StartTransient(ctx, evaluator.Request{Point: evaluator.Transient}, backgroundDecision("after"))
+	if err != nil || cr.Handle == nil || cr.RunID == "" || cr.Joined {
+		t.Fatalf("cr=%+v err=%v", cr, err)
+	}
+	<-cr.Handle.Done()
+	reqSpan.End()
+
+	spans := exp.GetSpans()
+	fs := findSpan(t, spans, trace.SpanFaultInject)
+	if fs.Parent.SpanID() != reqSpan.SpanContext().SpanID() {
+		t.Fatalf("transient fault span parent = %s, want the request span %s", fs.Parent.SpanID(), reqSpan.SpanContext().SpanID())
+	}
+	trig := linksOfKind(fs.Links, trace.LinkKindTrigger)
+	if len(trig) != 1 || trig[0].SpanContext.SpanID() != reqSpan.SpanContext().SpanID() {
+		t.Fatalf("trigger links = %+v, want one to the request span", trig)
+	}
+	rl := linksOfKind(fs.Links, trace.LinkKindRecent)
+	if len(rl) != 1 || rl[0].SpanContext.SpanID() != s0.SpanContext().SpanID() {
+		t.Fatalf("recent links = %+v, want only the earlier request", rl)
+	}
+	if !hasAttr(fs.Attributes, trace.AttrFaultID, cr.RunID) || !hasAttr(findSpan(t, spans, "request").Attributes, trace.AttrFaultID, cr.RunID) {
+		t.Fatal("the transient fault span and its request span must carry atropos.fault.id")
+	}
+}
+
+// Ruling (Review Focus 5): an armed run (Core.Arm starts from
+// context.Background(), so there is no request span) links the recent
+// requests and nothing else -- newest first, at most ringLinks of them.
+func TestStartFault_ArmLinksOnlyRecentRequests(t *testing.T) {
+	exp := installRecordingProvider(t)
+	reg := NewFaultRegistry()
+	defer reg.Close()
+	i := New(nil, trace.NewOTelTracer(), WithRegistry(reg))
+	tr := otel.Tracer("test")
+	var seen []oteltrace.SpanContext
+	for range ringLinks + 4 {
+		ctx, s := tr.Start(context.Background(), "earlier")
+		i.Evaluate(ctx, evaluator.Request{Point: evaluator.Ingress})
+		seen = append(seen, s.SpanContext())
+		s.End()
+	}
+	cr, err := i.StartFault(context.Background(), evaluator.Request{Point: evaluator.Egress, Labels: map[string]string{}}, backgroundDecision("armed"))
+	if err != nil || cr.Handle == nil || cr.RunID == "" {
+		t.Fatalf("cr=%+v err=%v", cr, err)
+	}
+	<-cr.Handle.Done()
+
+	fs := findSpan(t, exp.GetSpans(), trace.SpanFaultInject)
+	if rl := linksOfKind(fs.Links, trace.LinkKindRecent); len(fs.Links) != ringLinks || len(rl) != ringLinks {
+		t.Fatalf("links = %d (%d recent), want exactly %d, all recent", len(fs.Links), len(rl), ringLinks)
+	}
+	for k, l := range fs.Links {
+		if want := seen[len(seen)-1-k]; l.SpanContext.SpanID() != want.SpanID() {
+			t.Fatalf("link %d = %s, want %s (newest first)", k, l.SpanContext.SpanID(), want.SpanID())
+		}
+	}
+}
+
+// Review Focus 2: an unsampled request's trace is never stored, so nothing
+// links to it -- not as the trigger of a background run, and not as a fault
+// span a sampled joiner would link to. Under the SDK's default sampler
+// (ParentBased(AlwaysSample)) a background run is a root, so it is sampled
+// and exported; a Transient run is a child of its request and inherits the
+// request's unsampled flag.
+func TestStartFault_UnsampledSpansAreNeverLinkTargets(t *testing.T) {
+	exp := tracetest.NewInMemoryExporter()
+	prev := otel.GetTracerProvider()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp))) // default sampler
+	t.Cleanup(func() { otel.SetTracerProvider(prev) })
+	reg := NewFaultRegistry()
+	defer reg.Close()
+	i := New(&mockEvaluator{decision: backgroundDecision("bg")}, trace.NewOTelTracer(), WithRegistry(reg))
+	unsampled := oteltrace.ContextWithRemoteSpanContext(context.Background(), sampledSC(7).WithTraceFlags(0))
+
+	// An unsampled trigger: the run starts, as a sampled root, without links.
+	cr, err := i.Check(unsampled, evaluator.Request{Point: evaluator.Ingress})
+	if err != nil || cr.Handle == nil {
+		t.Fatalf("cr=%+v err=%v", cr, err)
+	}
+	<-cr.Handle.Done()
+	fs := findSpan(t, exp.GetSpans(), trace.SpanFaultInject)
+	if len(fs.Links) != 0 {
+		t.Fatalf("fault span links = %+v, want none (the trigger was unsampled and the ring holds nothing)", fs.Links)
+	}
+
+	// An unsampled Transient run, then a sampled request joins it: the joiner
+	// counts as joined but must not link to a fault span that was never stored.
+	run, err := i.StartTransient(unsampled, evaluator.Request{Point: evaluator.Transient}, heldDecision("after"))
+	if err != nil || run.Handle == nil {
+		t.Fatalf("transient: %+v %v", run, err)
+	}
+	ctx, joiner := otel.Tracer("test").Start(context.Background(), "joiner")
+	joined, err := i.StartTransient(ctx, evaluator.Request{Point: evaluator.Transient}, heldDecision("after"))
+	if err != nil || !joined.Joined || joined.RunID != run.RunID {
+		t.Fatalf("joiner: %+v %v (run %s)", joined, err, run.RunID)
+	}
+	joiner.End()
+	reg.Stop("after")
+	<-run.Handle.Done()
+	js := findSpan(t, exp.GetSpans(), "joiner")
+	if len(js.Links) != 0 || !hasAttr(js.Attributes, trace.AttrFaultID, run.RunID) {
+		t.Fatalf("joiner links = %+v attrs = %v, want no link to the unsampled fault span and atropos.fault.id=%s", js.Links, js.Attributes, run.RunID)
+	}
+}
+
+// A Hook that joins a running fault reports it as injected, not skipped: the
+// annotated block runs under that fault.
+func TestHook_JoinedFaultCountsAsInjected(t *testing.T) {
+	reg := NewFaultRegistry()
+	defer reg.Close()
+	recorder := &recordingTracer{}
+	i := New(&mockEvaluator{decision: heldDecision("bg")}, recorder, WithRegistry(reg))
+
+	_, _, first, err := i.Hook(context.Background(), "block", nil)
+	if err != nil || first.Handle == nil {
+		t.Fatalf("first: %+v %v", first, err)
+	}
+	_, _, second, err := i.Hook(context.Background(), "block", nil)
+	if err != nil || !second.Joined {
+		t.Fatalf("second: %+v %v, want a join", second, err)
+	}
+	var injected, skipped int
+	for _, ev := range recorder.span.events {
+		switch ev {
+		case trace.EventFaultInjected:
+			injected++
+		case trace.EventFaultSkipped:
+			skipped++
+		}
+	}
+	if injected != 2 || skipped != 0 {
+		t.Fatalf("hook events: injected=%d skipped=%d, want 2 and 0", injected, skipped)
+	}
+	reg.Stop("bg")
+	<-first.Handle.Done()
+}
+
+// failStartFault fails in Start, after Validate passed.
+type failStartFault struct{}
+
+func (failStartFault) Validate() error { return nil }
+func (failStartFault) Start(context.Context) (*fault.Handle, error) {
+	return nil, errors.New("no start")
+}
+
+// A fault that fails to start leaves no run: the request's span gets no
+// atropos.fault.id on either path (the failed fault span keeps its own id and
+// its error), and the result carries none.
+func TestStartFault_FailedStartLeavesNoRunIDOnTheRequest(t *testing.T) {
+	for _, withRegistry := range []bool{false, true} {
+		t.Run(map[bool]string{false: "direct", true: "registry"}[withRegistry], func(t *testing.T) {
+			exp := installRecordingProvider(t)
+			var opts []Option
+			if withRegistry {
+				reg := NewFaultRegistry()
+				t.Cleanup(reg.Close)
+				opts = append(opts, WithRegistry(reg))
+			}
+			i := New(&mockEvaluator{decision: &evaluator.Decision{Name: "fails", Fault: failStartFault{}, Mode: evaluator.Background, Reason: "test"}}, trace.NewOTelTracer(), opts...)
+			ctx, s := otel.Tracer("test").Start(context.Background(), "req")
+			cr, err := i.Check(ctx, evaluator.Request{Point: evaluator.Ingress})
+			s.End()
+			if err == nil || cr.RunID != "" || cr.Handle != nil {
+				t.Fatalf("cr=%+v err=%v, want an error and no run", cr, err)
+			}
+			spans := exp.GetSpans()
+			for _, a := range findSpan(t, spans, "req").Attributes {
+				if a.Key == trace.AttrFaultID {
+					t.Fatalf("request span carries %s=%s for a fault that never started", a.Key, a.Value.Emit())
+				}
+			}
+			if fs := findSpan(t, spans, trace.SpanFaultInject); fs.Status.Code != codes.Error {
+				t.Fatalf("failed fault span status = %v, want Error", fs.Status.Code)
+			}
+		})
 	}
 }

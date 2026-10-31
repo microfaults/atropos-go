@@ -5,6 +5,7 @@ import (
 
 	fault "git.ucsc.edu/microfaults/atropos-go/internal/fault"
 	"go.opentelemetry.io/otel/attribute"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 type noopTracer struct{}
@@ -17,8 +18,14 @@ func (t *noopTracer) Start(ctx context.Context, _ string, _ ...attribute.KeyValu
 	return ctx, &noopSpan{}
 }
 
+func (t *noopTracer) StartLinked(ctx context.Context, _ string, _ []oteltrace.Link, _ ...attribute.KeyValue) (context.Context, Span) {
+	return ctx, &noopSpan{}
+}
+
 func (s *noopSpan) SetAttributes(_ ...attribute.KeyValue)      {}
 func (s *noopSpan) AddEvent(_ string, _ ...attribute.KeyValue) {}
+func (s *noopSpan) AddLink(_ oteltrace.Link)                   {}
+func (s *noopSpan) SpanContext() oteltrace.SpanContext         { return oteltrace.SpanContext{} }
 func (s *noopSpan) RecordResult(_ fault.Result)                {}
 func (s *noopSpan) EndWithError(_ error)                       {}
 func (s *noopSpan) End()                                       {}
