@@ -683,6 +683,33 @@ func TestInitTelemetry_BYOLoggerIsReturned(t *testing.T) {
 	}
 }
 
+// The exported InitTelemetry threads every BYO field through to the result: the
+// host's tracer provider and logger provider become the global ones, the
+// result's LoggerProvider is the one passed, and its Logger the one passed.
+func TestInitTelemetry_ExportedBYOProvidersAndLogger(t *testing.T) {
+	restoreOTelGlobals(t)
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(tracetest.NewInMemoryExporter()))
+	rec := logtest.NewRecorder()
+	logger := slog.New(slog.DiscardHandler)
+	tel, err := InitTelemetry(context.Background(), TelemetryConfig{TracerProvider: tp, LoggerProvider: rec, Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tel.Shutdown(context.Background())
+	if tel.LoggerProvider != otellog.LoggerProvider(rec) {
+		t.Fatalf("LoggerProvider = %T, want the one passed in", tel.LoggerProvider)
+	}
+	if tel.Logger != logger {
+		t.Fatalf("Logger = %p, want the one passed in (%p)", tel.Logger, logger)
+	}
+	if global.GetLoggerProvider() != otellog.LoggerProvider(rec) {
+		t.Fatal("the BYO LoggerProvider must be registered globally")
+	}
+	if otel.GetTracerProvider() != oteltrace.TracerProvider(tp) {
+		t.Fatal("the BYO TracerProvider must be registered globally")
+	}
+}
+
 func TestNewLogExporter_None(t *testing.T) {
 	pinExporterEnv(t)
 	t.Setenv("OTEL_LOGS_EXPORTER", "none")
@@ -745,14 +772,79 @@ func useTestLogExporter(t *testing.T) *recordingLogExporter {
 	return exp
 }
 
-// The default logger's OTel half goes through the SDK provider: the record
-// carries the request's trace, the bridge's scope and this process's resource,
-// and Shutdown flushes it out of the batch processor.
+// recordingSpanExporter is the in-memory sdktrace.SpanExporter the tracer-half
+// tests assert on. tracetest.InMemoryExporter will not do: its Shutdown clears
+// the spans it holds, so a test could not read what the provider flushed on the
+// way out. This one keeps them and counts its Shutdown calls.
+type recordingSpanExporter struct {
+	mu        sync.Mutex
+	spans     []sdktrace.ReadOnlySpan
+	shutdowns int
+}
+
+func (e *recordingSpanExporter) ExportSpans(_ context.Context, spans []sdktrace.ReadOnlySpan) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.spans = append(e.spans, spans...) // copies the elements: the processor reuses its batch slice
+	return nil
+}
+
+func (e *recordingSpanExporter) Shutdown(context.Context) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.shutdowns++
+	return nil
+}
+
+func (e *recordingSpanExporter) Spans() []sdktrace.ReadOnlySpan {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]sdktrace.ReadOnlySpan(nil), e.spans...)
+}
+
+func (e *recordingSpanExporter) Shutdowns() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.shutdowns
+}
+
+// testSpanExporterName is an OTEL_TRACES_EXPORTER value registered with
+// autoexport for the tests, the traces twin of testLogExporterName.
+const testSpanExporterName = "atropos-test-span-recorder"
+
+var (
+	registerTestSpanExporter sync.Once
+	stagedSpanExporter       atomic.Pointer[recordingSpanExporter]
+)
+
+// useTestSpanExporter makes the next initTelemetry export spans to a fresh
+// recordingSpanExporter, selected through OTEL_TRACES_EXPORTER like any other.
+func useTestSpanExporter(t *testing.T) *recordingSpanExporter {
+	t.Helper()
+	registerTestSpanExporter.Do(func() {
+		autoexport.RegisterSpanExporter(testSpanExporterName, func(context.Context) (sdktrace.SpanExporter, error) {
+			return stagedSpanExporter.Load(), nil
+		})
+	})
+	exp := &recordingSpanExporter{}
+	stagedSpanExporter.Store(exp)
+	t.Setenv("OTEL_TRACES_EXPORTER", testSpanExporterName)
+	return exp
+}
+
+// Both SDK providers export through the exporters the environment names. The
+// default logger's OTel half goes through the logger provider: the record
+// carries the request's trace, the bridge's scope and this process's resource.
+// Shutdown flushes both signals out of their batch processors and stops their
+// exporters. The tracer provider's half is pinned through the span exporter: it
+// is shut down once, which only the tracer provider's own Shutdown does, and by
+// then it holds the request's span. (The 100 ms batch timer can deliver the span
+// before Shutdown runs, so "nothing before Shutdown" is not asserted.)
 func TestInitTelemetry_DefaultLoggerExportsThroughTheSDKProvider(t *testing.T) {
 	pinExporterEnv(t)
 	restoreOTelGlobals(t)
-	t.Setenv("OTEL_TRACES_EXPORTER", "none")
 	unsetEnv(t, "OTEL_TRACES_SAMPLER")
+	spans := useTestSpanExporter(t)
 	exp := useTestLogExporter(t)
 	tel, err := initTelemetry(context.Background(), telemetryConfig{serviceName: "svc", host: HostSidecar})
 	if err != nil {
@@ -763,6 +855,21 @@ func TestInitTelemetry_DefaultLoggerExportsThroughTheSDKProvider(t *testing.T) {
 	span.End()
 	if err := tel.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+
+	if got := spans.Shutdowns(); got != 1 {
+		t.Fatalf("span exporter shut down %d times, want 1: Shutdown must stop the tracer provider", got)
+	}
+	// The global provider is shared with whatever else runs in this process, so
+	// count the request's own span rather than every span exported.
+	delivered := 0
+	for _, s := range spans.Spans() {
+		if s.Name() == "req" && s.SpanContext().TraceID() == span.SpanContext().TraceID() {
+			delivered++
+		}
+	}
+	if delivered != 1 {
+		t.Fatalf("span exporter holds %d spans named %q in trace %s, want 1", delivered, "req", span.SpanContext().TraceID())
 	}
 
 	recs := exp.Records()

@@ -51,8 +51,11 @@ func (h teeHandler) Enabled(ctx context.Context, l slog.Level) bool {
 func (h teeHandler) Handle(ctx context.Context, r slog.Record) error {
 	var errs []error
 	for _, handler := range h.handlers {
-		if handler.Enabled(ctx, r.Level) {
-			errs = append(errs, handler.Handle(ctx, r.Clone()))
+		if !handler.Enabled(ctx, r.Level) {
+			continue
+		}
+		if err := handler.Handle(ctx, r.Clone()); err != nil {
+			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)

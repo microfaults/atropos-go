@@ -17,9 +17,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -124,6 +126,114 @@ func TestServe_ResourceNamesTheInProcessHost(t *testing.T) {
 	if v, ok := ro.Resource().Set().Value("service.instance.id"); !ok || v.AsString() != "inst-serve" {
 		t.Fatalf("service.instance.id = %v (present=%v), want the registration identity inst-serve", v, ok)
 	}
+}
+
+// logEntry is one record a logCapture was handed.
+type logEntry struct {
+	ctx   context.Context
+	level slog.Level
+	msg   string
+	attrs map[string]any
+}
+
+// logCapture keeps every record the loggers it hands out receive, for the tests
+// that check where the SDK's log lines go.
+type logCapture struct {
+	mu      sync.Mutex
+	entries []logEntry
+}
+
+func (c *logCapture) logger() *slog.Logger { return slog.New(&captureHandler{c: c}) }
+
+// messages returns the message of every record captured so far, in order.
+func (c *logCapture) messages() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	msgs := make([]string, len(c.entries))
+	for i, e := range c.entries {
+		msgs[i] = e.msg
+	}
+	return msgs
+}
+
+// find returns the first record whose message starts with prefix.
+func (c *logCapture) find(prefix string) (logEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, e := range c.entries {
+		if strings.HasPrefix(e.msg, prefix) {
+			return e, true
+		}
+	}
+	return logEntry{}, false
+}
+
+// captureHandler is the slog.Handler behind logCapture.logger. Handlers derived
+// with WithAttrs share the capture, and groups are ignored.
+type captureHandler struct {
+	c     *logCapture
+	attrs []slog.Attr
+}
+
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *captureHandler) Handle(ctx context.Context, r slog.Record) error {
+	e := logEntry{ctx: ctx, level: r.Level, msg: r.Message, attrs: map[string]any{}}
+	for _, a := range h.attrs {
+		e.attrs[a.Key] = a.Value.Any()
+	}
+	r.Attrs(func(a slog.Attr) bool {
+		e.attrs[a.Key] = a.Value.Any()
+		return true
+	})
+	h.c.mu.Lock()
+	h.c.entries = append(h.c.entries, e)
+	h.c.mu.Unlock()
+	return nil
+}
+
+func (h *captureHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &captureHandler{c: h.c, attrs: append(slices.Clone(h.attrs), attrs...)}
+}
+
+func (h *captureHandler) WithGroup(string) slog.Handler { return h }
+
+// The SDK's own log lines go to Config.Logger: Serve hands the logger
+// InitTelemetry returns to everything it starts. One line from each of Serve's
+// two code paths pins it: the offline warning is written by the manteion
+// connection through the logger Serve passes it, the passive-mode notice by
+// Serve itself.
+func TestServe_LogsThroughConfigLogger(t *testing.T) {
+	t.Run("embedded host, offline", func(t *testing.T) {
+		t.Setenv("ATROPOS_HOST", "")
+		capture := &logCapture{}
+		serveOffline(t, Config{Service: "log-test", Logger: capture.logger()})
+		if _, ok := capture.find("manteion: running in offline mode"); !ok {
+			t.Fatalf("Config.Logger got %q, want the manteion offline-mode warning", capture.messages())
+		}
+	})
+
+	t.Run("passive beside the sidecar", func(t *testing.T) {
+		t.Setenv("ATROPOS_HOST", "sidecar")
+		t.Setenv("MANTEION_URL", "")
+		capture := &logCapture{}
+		_, shutdown, err := Serve(context.Background(), Config{
+			Service:        "log-test-passive",
+			Logger:         capture.logger(),
+			TracerProvider: sdktrace.NewTracerProvider(sdktrace.WithSyncer(tracetest.NewInMemoryExporter())),
+		})
+		if err != nil {
+			t.Fatalf("Serve: %v", err)
+		}
+		t.Cleanup(func() { _ = shutdown(context.Background()) })
+		e, ok := capture.find("atropos: ATROPOS_HOST=sidecar")
+		if !ok {
+			t.Fatalf("Config.Logger got %q, want the passive-mode notice", capture.messages())
+		}
+		if e.level != slog.LevelInfo || e.attrs["service"] != "log-test-passive" {
+			t.Fatalf("passive-mode notice = %v %v, want an Info record for service log-test-passive", e.level, e.attrs)
+		}
+	})
 }
 
 func TestServe_OfflineServesBusinessAndControlSurface(t *testing.T) {

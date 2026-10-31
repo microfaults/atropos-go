@@ -227,7 +227,7 @@ func Serve(ctx context.Context, cfg Config) (http.Handler, ShutdownFunc, error) 
 		once.Do(func() {
 			// Order matters: stop syncing rules first; then drain the
 			// recorder INTO the push client; then flush the push client's
-			// final batch; then flush spans.
+			// final batch; then flush spans and logs.
 			_ = mc.Close(sctx) // nil-safe in offline mode
 			core.Stop()
 			globalClient.CompareAndSwap(mc, nil)
