@@ -89,6 +89,15 @@ var (
 		Name: "atropos_rules_unsupported_total",
 		Help: "Rules skipped because this host cannot execute their category or rule kind.",
 	}, []string{"category"})
+
+	// ReplaySetState is the replay-set pull state of this instance: 1 on the
+	// state it is in (fetching, committed or failed, the wire.ReplaySet*
+	// values) and 0 on the other two. All three read 0 when no replay set is
+	// desired. Set it through SetReplaySetState.
+	ReplaySetState = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "atropos_replay_set_state",
+		Help: "Replay-set pull state of this instance (1 for the current state).",
+	}, []string{"state"})
 )
 
 func init() {
@@ -104,12 +113,29 @@ func init() {
 		ProxyOverhead,
 		ProxyInflight,
 		RulesUnsupportedTotal,
+		ReplaySetState,
 	)
 }
 
 // RecordFaultInjection is the interceptor.InjectionHook every host installs.
 func RecordFaultInjection(faultType, injectionPoint string) {
 	FaultInjectionsTotal.WithLabelValues(faultType, injectionPoint).Inc()
+}
+
+// replaySetStates are the values of ReplaySetState's state label, spelled as
+// the wire.ReplaySet* constants (this package stays a leaf).
+var replaySetStates = [...]string{"fetching", "committed", "failed"}
+
+// SetReplaySetState makes state the current replay-set pull state: fetching,
+// committed and failed go to 0, then state, when non-empty, to 1. "" leaves
+// all three at 0: no replay set is desired.
+func SetReplaySetState(state string) {
+	for _, s := range replaySetStates {
+		ReplaySetState.WithLabelValues(s).Set(0)
+	}
+	if state != "" {
+		ReplaySetState.WithLabelValues(state).Set(1)
+	}
 }
 
 // Handler serves Prometheus metrics: the atropos series plus the default Go
