@@ -39,11 +39,13 @@ const defaultMissStatus = http.StatusServiceUnavailable
 // handleCacheBox dispatches a cache-box decision for an egress request.
 // Must only be called when i.cacheBox != nil and decision.CacheBox != CacheBoxNone.
 // The function always ends its own span; the caller should not End() it.
+// Once the key is derived it emits the decision event ("cachebox.<action>")
+// under the request's context, whatever the action then does.
 func (i *Interceptor) handleCacheBox(r *http.Request, base http.RoundTripper, req evaluator.Request, decision *evaluator.Decision) (*http.Response, error) {
 	cb := i.cacheBox
-	ctx := r.Context()
+	reqCtx := r.Context()
 
-	ctx, span := i.tracer.Start(ctx, trace.SpanCacheBoxCheck,
+	ctx, span := i.tracer.Start(reqCtx, trace.SpanCacheBoxCheck,
 		attribute.String(trace.AttrCacheBoxMode, decision.CacheBox.String()),
 		attribute.String(trace.AttrCacheBoxInjection, req.Point.String()),
 		attribute.String(trace.AttrCacheBoxReason, decision.Reason),
@@ -91,6 +93,7 @@ func (i *Interceptor) handleCacheBox(r *http.Request, base http.RoundTripper, re
 		key = cb.DeriveKey(r, reqBody)
 	}
 	span.SetAttributes(attribute.String(trace.AttrCacheBoxKey, key))
+	i.emitDecision(reqCtx, req, decision, trace.ActionCacheBoxPrefix+decision.CacheBox.String(), "")
 
 	// A failed body capture under a replay-family action means we cannot
 	// trust the derived key (it's missing a component the record-time key

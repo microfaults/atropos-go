@@ -18,6 +18,9 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
+
+	"go.opentelemetry.io/otel"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 // failRoundTripper fails the test immediately if RoundTrip is ever invoked.
@@ -776,5 +779,70 @@ func TestHandleCacheBox_ReplayMissReasonDistinguishesNotCommitted(t *testing.T) 
 	}
 	if afterKeyAbsent.MissNotCommitted != after2.MissNotCommitted {
 		t.Fatalf("MissNotCommitted must not increment once the right phase is installed: got %d, want %d", afterKeyAbsent.MissNotCommitted, after2.MissNotCommitted)
+	}
+}
+
+func TestHandleCacheBox_EmitsDecisionEventWithExperiment(t *testing.T) {
+	rec := installDecisionRecorder(t)
+	i, _ := newTestInterceptor(t, cacheBoxRuleWithPhase("dep", evaluator.CacheBoxPassthrough, "exp-1", "ph-1"))
+	base := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("ok"))}, nil
+	})
+	resp, err := i.EgressTransport(base).RoundTrip(httptest.NewRequest("GET", "http://dep/x", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	recs := decisionRecords(rec)
+	if len(recs) != 1 {
+		t.Fatalf("records = %d", len(recs))
+	}
+	a := recs[0].Attributes
+	if attrString(a, "atropos.action") != "cachebox.passthrough" || attrString(a, trace.AttrExperimentID) != "exp-1" || attrString(a, trace.AttrPhaseID) != "ph-1" || attrString(a, trace.AttrInjectionPoint) != "egress" {
+		t.Fatalf("attributes = %v", a)
+	}
+}
+
+// A cache-box decision without a CacheBoxContext names no experiment or phase
+// (and no fault id: a cache-box action starts no fault run). Its record
+// carries the egress request's span, not the atropos.cachebox.check span the
+// dispatcher starts under it -- also when the action fails closed.
+func TestHandleCacheBox_DecisionEventWithoutContextCarriesTheRequestSpan(t *testing.T) {
+	exp := installRecordingProvider(t)
+	rec := installDecisionRecorder(t)
+	rule := cacheBoxRule("dep", evaluator.CacheBoxReplay)
+	rule.Decision.Name = rule.Name // what rule decoding does
+	cb := cachebox.New(cachebox.Config{
+		Store:       cachebox.NewRecordBuffer(cachebox.RecordBufferConfig{MaxEntries: 100}),
+		KeyStrategy: cachebox.KeyStrategyExactWithHost,
+	})
+	t.Cleanup(func() { cb.Stop() })
+	i := New(evaluator.NewStaticEvaluator(rule), trace.NewOTelTracer(), WithCacheBox(cb))
+
+	ctx, call := otel.Tracer("test").Start(context.Background(), "egress-call")
+	resp, err := i.EgressTransport(failRoundTripper{t}).RoundTrip(httptest.NewRequest("GET", "http://dep/x", nil).WithContext(ctx))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	call.End()
+
+	recs := decisionRecords(rec)
+	if len(recs) != 1 {
+		t.Fatalf("records = %d, want 1", len(recs))
+	}
+	a := recs[0].Attributes
+	if attrString(a, "atropos.action") != "cachebox.replay" || attrString(a, trace.AttrRuleName) != "test-replay" || attrString(a, trace.AttrReason) != "test cache-box rule" || attrString(a, trace.AttrInjectionPoint) != "egress" {
+		t.Fatalf("attributes = %v", a)
+	}
+	for _, k := range []string{trace.AttrExperimentID, trace.AttrPhaseID, trace.AttrFaultID} {
+		if v := attrString(a, k); v != "" {
+			t.Fatalf("%s = %q, want empty", k, v)
+		}
+	}
+	got := oteltrace.SpanContextFromContext(recs[0].Context)
+	check := findSpan(t, exp.GetSpans(), trace.SpanCacheBoxCheck)
+	if got.SpanID() != call.SpanContext().SpanID() || got.SpanID() == check.SpanContext.SpanID() {
+		t.Fatalf("record span = %s, want the egress call's %s (the cache-box span is %s)", got.SpanID(), call.SpanContext().SpanID(), check.SpanContext.SpanID())
 	}
 }

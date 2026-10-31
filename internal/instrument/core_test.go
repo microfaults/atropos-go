@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +21,8 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/log/global"
+	"go.opentelemetry.io/otel/log/logtest"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
@@ -289,12 +292,17 @@ func (f heldFault) Start(ctx context.Context) (*fault.Handle, error) {
 // Core.Arm marks its start as an arm (interceptor.ArmedContext): no request
 // is behind it. Re-arming the running fault, as every rule delivery does, is
 // not counted as a join; a request that joins the armed fault is, even one
-// that carries no span context.
+// that carries no span context. The decision events agree: the arm's start
+// emits fault.start, the re-arm nothing, the request's join fault.join.
 func TestCore_ArmIsNoRequest(t *testing.T) {
 	exp := tracetest.NewInMemoryExporter()
 	prev := otel.GetTracerProvider()
 	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp)))
 	t.Cleanup(func() { otel.SetTracerProvider(prev) })
+	rec := logtest.NewRecorder()
+	prevLP := global.GetLoggerProvider()
+	global.SetLoggerProvider(rec)
+	t.Cleanup(func() { global.SetLoggerProvider(prevLP) })
 	c := NewCore(CoreConfig{Service: "svc", Instance: "pod-1", Logger: slog.New(slog.DiscardHandler), EagerArm: true})
 	t.Cleanup(c.Stop)
 
@@ -330,5 +338,17 @@ func TestCore_ArmIsNoRequest(t *testing.T) {
 	}
 	if joined != 1 {
 		t.Fatalf("%s = %d, want 1: the request joined, the re-arm did not (-1: absent)", trace.AttrFaultJoined, joined)
+	}
+
+	var actions []string
+	for _, r := range rec.Result()[logtest.Scope{Name: trace.DecisionLoggerName}] {
+		for _, a := range r.Attributes {
+			if a.Key == "atropos.action" {
+				actions = append(actions, a.Value.AsString())
+			}
+		}
+	}
+	if !slices.Equal(actions, []string{"fault.start", "fault.join"}) {
+		t.Fatalf("decision actions = %v, want [fault.start fault.join]: the arm's start and the request's join", actions)
 	}
 }

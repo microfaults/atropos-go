@@ -83,7 +83,8 @@ type Config struct {
 
 	// Logger receives SDK logs. Default: a JSON handler on stdout teed into
 	// the OTel logs bridge, so every *Context call carries trace_id and
-	// span_id.
+	// span_id. The atropos.decision events do not go through it: they are
+	// emitted on the global OTel logger provider (see LoggerProvider).
 	Logger *slog.Logger
 }
 

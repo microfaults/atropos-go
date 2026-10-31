@@ -23,6 +23,18 @@ const (
 	// values are the LinkKind* names.
 	AttrLinkKind = "atropos.link.kind"
 
+	// Decision events: the log record EmitDecision emits for every applied
+	// decision (a log event, not a span event), and its attributes besides
+	// AttrFaultID (the fault run's id; empty for a cache-box action).
+	EventDecision      = "atropos.decision"
+	AttrRuleName       = "atropos.rule.name"
+	AttrReason         = "atropos.reason"
+	AttrInjectionPoint = "atropos.injection_point"
+	AttrExperimentID   = "atropos.experiment.id"
+	AttrPhaseID        = "atropos.phase.id"
+	AttrRecentTraceIDs = "atropos.recent.trace_ids"
+	AttrAction         = "atropos.action" // what was decided: an Action* value
+
 	// Resource attributes (stamped by internal/instrument's InitTelemetry).
 	AttrHost = "atropos.host" // the instrument host: "in-process" or "sidecar"
 
@@ -80,6 +92,11 @@ const (
 	LinkKindTrigger = "trigger" // fault span -> the request that started the run
 	LinkKindRecent  = "recent"  // fault span -> a request the interceptor saw before the run started
 	LinkKindFault   = "fault"   // request span -> the fault span of the run it joined
+
+	// Decision actions (values of AttrAction).
+	ActionFaultStart     = "fault.start" // a fault run started
+	ActionFaultJoin      = "fault.join"  // a request joined a running background fault
+	ActionCacheBoxPrefix = "cachebox."   // + the cache-box action: passthrough, replay, replay_with_delay
 
 	// Event names.
 	EventFaultInjected = "atropos.fault.injected"

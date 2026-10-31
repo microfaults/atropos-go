@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -15,9 +16,14 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault/inline"
 	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	otellog "go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/otel/log/global"
+	"go.opentelemetry.io/otel/log/logtest"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	oteltrace "go.opentelemetry.io/otel/trace"
@@ -1095,5 +1101,373 @@ func TestStartFault_FirstRequestLinksOnlyItsTrigger(t *testing.T) {
 	fs := findSpan(t, exp.GetSpans(), trace.SpanFaultInject)
 	if len(fs.Links) != 1 || len(linksOfKind(fs.Links, trace.LinkKindTrigger)) != 1 || fs.Links[0].SpanContext.SpanID() != reqSpan.SpanContext().SpanID() {
 		t.Fatalf("fault span links = %+v, want exactly the trigger link to the request span", fs.Links)
+	}
+}
+
+func installDecisionRecorder(t *testing.T) *logtest.Recorder {
+	t.Helper()
+	rec := logtest.NewRecorder()
+	prev := global.GetLoggerProvider()
+	global.SetLoggerProvider(rec)
+	t.Cleanup(func() { global.SetLoggerProvider(prev) })
+	return rec
+}
+
+func decisionRecords(rec *logtest.Recorder) []logtest.Record {
+	return rec.Result()[logtest.Scope{Name: trace.DecisionLoggerName}]
+}
+
+func attrString(attrs []attribute.KeyValue, key string) string {
+	for _, a := range attrs {
+		if string(a.Key) == key {
+			return a.Value.AsString()
+		}
+	}
+	return ""
+}
+
+func TestStartFault_EmitsDecisionEvent(t *testing.T) {
+	installRecordingProvider(t)
+	rec := installDecisionRecorder(t)
+	i := New(&mockEvaluator{decision: &evaluator.Decision{Name: "lat", Fault: &inline.Latency{Delay: time.Millisecond}, Mode: evaluator.Inline, Reason: "compiled"}}, trace.NewOTelTracer())
+	ctx, span := otel.Tracer("test").Start(context.Background(), "req")
+	cr, err := i.Check(ctx, evaluator.Request{Point: evaluator.Ingress})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-cr.Handle.Done()
+	span.End()
+
+	recs := decisionRecords(rec)
+	if len(recs) != 1 || recs[0].EventName != trace.EventDecision {
+		t.Fatalf("records = %+v", recs)
+	}
+	a := recs[0].Attributes
+	if attrString(a, trace.AttrRuleName) != "lat" || attrString(a, trace.AttrReason) != "compiled" || attrString(a, trace.AttrFaultID) != cr.RunID || attrString(a, trace.AttrInjectionPoint) != "ingress" || attrString(a, "atropos.action") != "fault.start" {
+		t.Fatalf("attributes = %v", a)
+	}
+	if oteltrace.SpanContextFromContext(recs[0].Context).TraceID() != span.SpanContext().TraceID() {
+		t.Fatal("decision event must be emitted with the request context")
+	}
+}
+
+// The brief joined a 60 ms fault, so the second Check had to come within
+// 60 ms of the first; the fault here runs until reg.Stop.
+func TestStartFault_JoinEmitsDecisionEvent(t *testing.T) {
+	installRecordingProvider(t)
+	rec := installDecisionRecorder(t)
+	reg := NewFaultRegistry()
+	defer reg.Close()
+	i := New(&mockEvaluator{decision: heldDecision("bg")}, trace.NewOTelTracer(), WithRegistry(reg))
+	first, _ := i.Check(context.Background(), evaluator.Request{Point: evaluator.Ingress})
+	second, _ := i.Check(context.Background(), evaluator.Request{Point: evaluator.Ingress})
+	reg.Stop("bg")
+	<-first.Handle.Done()
+	recs := decisionRecords(rec)
+	if len(recs) != 2 || attrString(recs[1].Attributes, "atropos.action") != "fault.join" || attrString(recs[1].Attributes, trace.AttrFaultID) != second.RunID {
+		t.Fatalf("records = %+v", recs)
+	}
+}
+
+// A decision record carries the request's span, not the fault span the
+// interceptor starts: on the direct path the fault span is the request's
+// child (same trace, another span); on the registry path it is a root of its
+// own trace.
+func TestStartFault_DecisionRecordCarriesTheRequestSpan(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		decision *evaluator.Decision
+		registry bool
+	}{
+		{"direct", &evaluator.Decision{Name: "lat", Fault: &inline.Latency{Delay: time.Millisecond}, Mode: evaluator.Inline, Reason: "test"}, false},
+		{"registry", heldDecision("held"), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exp := installRecordingProvider(t)
+			rec := installDecisionRecorder(t)
+			var opts []Option
+			reg := NewFaultRegistry()
+			t.Cleanup(reg.Close)
+			if tc.registry {
+				opts = append(opts, WithRegistry(reg))
+			}
+			i := New(&mockEvaluator{decision: tc.decision}, trace.NewOTelTracer(), opts...)
+			ctx, span := otel.Tracer("test").Start(context.Background(), "req")
+			cr, err := i.Check(ctx, evaluator.Request{Point: evaluator.Ingress})
+			if err != nil || cr.Handle == nil {
+				t.Fatalf("cr=%+v err=%v", cr, err)
+			}
+			span.End()
+			reg.Stop("held")
+			<-cr.Handle.Done()
+
+			recs := decisionRecords(rec)
+			if len(recs) != 1 {
+				t.Fatalf("records = %d, want 1", len(recs))
+			}
+			got := oteltrace.SpanContextFromContext(recs[0].Context)
+			fs := faultSpanOf(t, exp.GetSpans(), cr.RunID)
+			if got.TraceID() != span.SpanContext().TraceID() || got.SpanID() != span.SpanContext().SpanID() || got.SpanID() == fs.SpanContext.SpanID() {
+				t.Fatalf("record span = %s/%s, want the request's %s/%s (the fault span is %s)", got.TraceID(), got.SpanID(), span.SpanContext().TraceID(), span.SpanContext().SpanID(), fs.SpanContext.SpanID())
+			}
+		})
+	}
+}
+
+// Ruling 3: an arm's fresh start is an applied decision (fault.start, at the
+// rule's injection point, with no request span); a re-arm that meets the
+// running fault emits nothing; a request that joins the armed fault emits
+// fault.join under its own context.
+func TestStartFault_ArmEmitsStartButNoJoin(t *testing.T) {
+	rec := installDecisionRecorder(t)
+	reg := NewFaultRegistry()
+	defer reg.Close()
+	i := New(nil, trace.Noop(), WithRegistry(reg))
+	armed := ArmedContext(context.Background())
+	req := evaluator.Request{Point: evaluator.Egress, Labels: map[string]string{}}
+
+	start, err := i.StartFault(armed, req, heldDecision("armed"))
+	if err != nil || start.Handle == nil {
+		t.Fatalf("arm = %+v %v, want a start", start, err)
+	}
+	if again, err := i.StartFault(armed, req, heldDecision("armed")); err != nil || !again.Joined {
+		t.Fatalf("re-arm = %+v %v, want a join", again, err)
+	}
+	recs := decisionRecords(rec)
+	if len(recs) != 1 {
+		t.Fatalf("records after arm and re-arm = %d, want 1 (the start)", len(recs))
+	}
+	a := recs[0].Attributes
+	if attrString(a, "atropos.action") != "fault.start" || attrString(a, trace.AttrInjectionPoint) != "egress" || attrString(a, trace.AttrFaultID) != start.RunID || attrString(a, trace.AttrRuleName) != "armed" {
+		t.Fatalf("armed start attributes = %v", a)
+	}
+	if sc := oteltrace.SpanContextFromContext(recs[0].Context); sc.IsValid() {
+		t.Fatalf("armed start record carries span %s, want none", sc.SpanID())
+	}
+
+	ctx, sc := sampledContext(t)
+	if cr, err := i.StartFault(ctx, req, heldDecision("armed")); err != nil || !cr.Joined {
+		t.Fatalf("request = %+v %v, want a join", cr, err)
+	}
+	reg.Stop("armed")
+	<-start.Handle.Done()
+	recs = decisionRecords(rec)
+	if len(recs) != 2 || attrString(recs[1].Attributes, "atropos.action") != "fault.join" || attrString(recs[1].Attributes, trace.AttrFaultID) != start.RunID {
+		t.Fatalf("records = %+v, want the start, then the request's join", recs)
+	}
+	if got := oteltrace.SpanContextFromContext(recs[1].Context); got.SpanID() != sc.SpanID() {
+		t.Fatalf("join record span = %s, want the request's %s", got.SpanID(), sc.SpanID())
+	}
+}
+
+// recentTraceIDs returns a record's atropos.recent.trace_ids, and whether it
+// has the attribute.
+func recentTraceIDs(attrs []attribute.KeyValue) ([]string, bool) {
+	for _, a := range attrs {
+		if a.Key == trace.AttrRecentTraceIDs {
+			return a.Value.AsStringSlice(), true
+		}
+	}
+	return nil, false
+}
+
+// spanIn is a sampled span context of trace tr with span id sp.
+func spanIn(tr, sp byte) context.Context {
+	return oteltrace.ContextWithSpanContext(context.Background(), oteltrace.NewSpanContext(oteltrace.SpanContextConfig{
+		TraceID: oteltrace.TraceID{tr, 7}, SpanID: oteltrace.SpanID{sp, 7}, TraceFlags: oteltrace.FlagsSampled,
+	}))
+}
+
+// Ruling 4: the ring holds one entry per evaluation, so a request that made
+// several calls repeats its trace. The decision record names each trace
+// once, newest first -- the deciding request's own trace among them -- while
+// the ring keeps every entry.
+func TestStartFault_DecisionRecentTraceIDsAreDistinctNewestFirst(t *testing.T) {
+	rec := installDecisionRecorder(t)
+	i := New(&mockEvaluator{decision: &evaluator.Decision{Name: "lat", Fault: &inline.Latency{Delay: time.Millisecond}, Mode: evaluator.Inline, Reason: "test"}}, trace.Noop())
+	for _, ctx := range []context.Context{spanIn(1, 1), spanIn(1, 2), spanIn(2, 3), spanIn(1, 4)} {
+		i.Evaluate(ctx, evaluator.Request{Point: evaluator.Egress})
+	}
+	cr, err := i.Check(spanIn(2, 5), evaluator.Request{Point: evaluator.Ingress})
+	if err != nil || cr.Handle == nil {
+		t.Fatalf("cr=%+v err=%v", cr, err)
+	}
+	<-cr.Handle.Done()
+
+	recs := decisionRecords(rec)
+	if len(recs) != 1 {
+		t.Fatalf("records = %d, want 1", len(recs))
+	}
+	t1 := oteltrace.SpanContextFromContext(spanIn(1, 1)).TraceID().String()
+	t2 := oteltrace.SpanContextFromContext(spanIn(2, 3)).TraceID().String()
+	if got, _ := recentTraceIDs(recs[0].Attributes); !slices.Equal(got, []string{t2, t1}) {
+		t.Fatalf("recent trace ids = %v, want [%s %s]", got, t2, t1)
+	}
+	if n := len(i.recent.TraceIDs()); n != 5 {
+		t.Fatalf("the ring holds %d entries, want all 5", n)
+	}
+}
+
+// A decision record's recent trace ids are left out when the ring holds no
+// request (an arm before any traffic).
+func TestStartFault_DecisionWithAnEmptyRingHasNoRecentTraceIDs(t *testing.T) {
+	rec := installDecisionRecorder(t)
+	reg := NewFaultRegistry()
+	defer reg.Close()
+	i := New(nil, trace.Noop(), WithRegistry(reg))
+	cr, err := i.StartFault(ArmedContext(context.Background()), evaluator.Request{Point: evaluator.Ingress, Labels: map[string]string{}}, heldDecision("armed"))
+	if err != nil || cr.Handle == nil {
+		t.Fatalf("cr=%+v err=%v", cr, err)
+	}
+	reg.Stop("armed")
+	<-cr.Handle.Done()
+	recs := decisionRecords(rec)
+	if len(recs) != 1 {
+		t.Fatalf("records = %d, want 1", len(recs))
+	}
+	if ids, ok := recentTraceIDs(recs[0].Attributes); ok {
+		t.Fatalf("recent trace ids = %v, want the attribute left out", ids)
+	}
+}
+
+// A fault that fails to start is no applied decision: neither path emits.
+func TestStartFault_FailedStartEmitsNoDecision(t *testing.T) {
+	for _, withRegistry := range []bool{false, true} {
+		t.Run(map[bool]string{false: "direct", true: "registry"}[withRegistry], func(t *testing.T) {
+			rec := installDecisionRecorder(t)
+			var opts []Option
+			if withRegistry {
+				reg := NewFaultRegistry()
+				t.Cleanup(reg.Close)
+				opts = append(opts, WithRegistry(reg))
+			}
+			i := New(&mockEvaluator{decision: &evaluator.Decision{Name: "fails", Fault: failStartFault{}, Mode: evaluator.Background, Reason: "test"}}, trace.Noop(), opts...)
+			if _, err := i.Check(context.Background(), evaluator.Request{Point: evaluator.Ingress}); err == nil {
+				t.Fatal("want the start error")
+			}
+			if recs := decisionRecords(rec); len(recs) != 0 {
+				t.Fatalf("records = %+v, want none", recs)
+			}
+		})
+	}
+}
+
+// When the registered logger provider would drop a decision event, the
+// interceptor does not emit one (nor assemble its recent trace ids). The
+// recorder stores whatever reaches Emit, enabled or not.
+func TestStartFault_NoDecisionRecordWhenLogsAreDisabled(t *testing.T) {
+	rec := logtest.NewRecorder(logtest.WithEnabledFunc(func(context.Context, otellog.EnabledParameters) bool { return false }))
+	prev := global.GetLoggerProvider()
+	global.SetLoggerProvider(rec)
+	t.Cleanup(func() { global.SetLoggerProvider(prev) })
+	i := New(&mockEvaluator{decision: &evaluator.Decision{Name: "lat", Fault: &inline.Latency{Delay: time.Millisecond}, Mode: evaluator.Inline, Reason: "test"}}, trace.Noop())
+	cr, err := i.Check(context.Background(), evaluator.Request{Point: evaluator.Ingress})
+	if err != nil || cr.Handle == nil {
+		t.Fatalf("cr=%+v err=%v", cr, err)
+	}
+	<-cr.Handle.Done()
+	if recs := decisionRecords(rec); len(recs) != 0 {
+		t.Fatalf("records = %d, want none: the provider said it would drop them", len(recs))
+	}
+}
+
+// recordingLogExporter is an in-memory sdklog.Exporter, the shape of the
+// instrument package's test helper.
+type recordingLogExporter struct {
+	mu      sync.Mutex
+	records []sdklog.Record
+}
+
+func (e *recordingLogExporter) Export(_ context.Context, rs []sdklog.Record) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, r := range rs {
+		e.records = append(e.records, r.Clone())
+	}
+	return nil
+}
+func (e *recordingLogExporter) Shutdown(context.Context) error   { return nil }
+func (e *recordingLogExporter) ForceFlush(context.Context) error { return nil }
+func (e *recordingLogExporter) Records() []sdklog.Record {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]sdklog.Record(nil), e.records...)
+}
+
+// sdkAttr returns an exported record's string attribute.
+func sdkAttr(r sdklog.Record, key string) string {
+	var v string
+	r.WalkAttributes(func(kv attribute.KeyValue) bool {
+		if string(kv.Key) == key {
+			v = kv.Value.AsString()
+			return false
+		}
+		return true
+	})
+	return v
+}
+
+// gatedFault's Start waits until its gate opens, then runs until stopped.
+type gatedFault struct{ gate chan struct{} }
+
+func (f *gatedFault) Validate() error { return nil }
+func (f *gatedFault) Start(ctx context.Context) (*fault.Handle, error) {
+	<-f.gate
+	ctx, cancel := context.WithCancel(ctx)
+	h := fault.NewHandle(cancel)
+	go func() {
+		<-ctx.Done()
+		h.Send(fault.Result{})
+	}()
+	return h, nil
+}
+
+// Ruling 6: a Transient fault starts after the response, on the request's
+// context detached from its cancellation, when otelhttp has already ended the
+// server span. The decision is emitted with that context, so the record the
+// SDK exports still carries the server span's trace and span ids. The
+// fault's Start is held until ServeHTTP has returned, so the server span has
+// ended before the decision is emitted.
+func TestStartTransient_DecisionRecordCarriesTheEndedServerSpan(t *testing.T) {
+	logs := &recordingLogExporter{}
+	lp := sdklog.NewLoggerProvider(sdklog.WithProcessor(sdklog.NewSimpleProcessor(logs)))
+	prev := global.GetLoggerProvider()
+	global.SetLoggerProvider(lp)
+	t.Cleanup(func() { global.SetLoggerProvider(prev); _ = lp.Shutdown(context.Background()) })
+	spans := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(spans), sdktrace.WithSampler(sdktrace.AlwaysSample()))
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+
+	reg := NewFaultRegistry()
+	t.Cleanup(reg.Close)
+	f := &gatedFault{gate: make(chan struct{})}
+	hooks := newHookCalls()
+	i := New(evaluator.NewStaticEvaluator(transientRule("after", nil, f)), trace.Noop(), WithRegistry(reg), WithInjectionHook(hooks.hook()))
+	var server oteltrace.SpanContext
+	h := otelhttp.NewHandler(i.IngressMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		server = oteltrace.SpanContextFromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})), "svc", otelhttp.WithTracerProvider(tp))
+
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/x", nil))
+	if ended := spans.GetSpans(); len(ended) != 1 || ended[0].SpanContext.SpanID() != server.SpanID() {
+		t.Fatalf("ended spans = %d, want the server span ended once ServeHTTP returned", len(ended))
+	}
+	close(f.gate)
+	if p, ok := hooks.next(2 * time.Second); !ok || p != "transient" {
+		t.Fatalf("injection hook = %q (called=%v), want transient", p, ok)
+	}
+	defer reg.Stop("after")
+
+	recs := logs.Records()
+	if len(recs) != 1 {
+		t.Fatalf("exported records = %d, want 1", len(recs))
+	}
+	r := recs[0]
+	if r.EventName() != trace.EventDecision || sdkAttr(r, "atropos.action") != "fault.start" || sdkAttr(r, trace.AttrInjectionPoint) != "transient" {
+		t.Fatalf("record event %q action %q point %q", r.EventName(), sdkAttr(r, "atropos.action"), sdkAttr(r, trace.AttrInjectionPoint))
+	}
+	if !server.IsValid() || r.TraceID() != server.TraceID() || r.SpanID() != server.SpanID() || !r.TraceFlags().IsSampled() {
+		t.Fatalf("record trace %s span %s flags %s, want the ended server span's %s/%s, sampled", r.TraceID(), r.SpanID(), r.TraceFlags(), server.TraceID(), server.SpanID())
 	}
 }

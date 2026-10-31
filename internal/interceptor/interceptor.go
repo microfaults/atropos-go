@@ -246,16 +246,50 @@ func faultSpanAttrs(req evaluator.Request, decision *evaluator.Decision, faultTy
 	}
 }
 
+// emitDecision reports a decision applied to req as an atropos.decision event
+// (trace.EmitDecision). ctx is the context of the request it was applied to,
+// so the event carries that request's trace and span -- not those of the
+// fault or cache-box span the interceptor starts for it (Core.Arm's context
+// carries none). faultID is the fault run's id ("" for a cache-box action).
+// The recent trace ids are the ring's, newest first. Nothing is assembled
+// when the registered logger provider would drop the event.
+func (i *Interceptor) emitDecision(ctx context.Context, req evaluator.Request, decision *evaluator.Decision, action, faultID string) {
+	if !trace.DecisionEnabled(ctx) {
+		return
+	}
+	experimentID, phaseID := decisionExperiment(decision)
+	trace.EmitDecision(ctx, trace.Decision{
+		RuleName:       decision.Name,
+		Reason:         decision.Reason,
+		FaultID:        faultID,
+		InjectionPoint: req.Point.String(),
+		ExperimentID:   experimentID,
+		PhaseID:        phaseID,
+		Action:         action,
+		RecentTraceIDs: i.recent.TraceIDs(),
+	})
+}
+
+// decisionExperiment names the experiment and phase a decision event is
+// attributed to -- the one place the event resolves them: the matched
+// rule's CacheBoxContext, when the decision carries one; none otherwise.
+func decisionExperiment(decision *evaluator.Decision) (experimentID, phaseID string) {
+	if c := decision.CacheBoxContext; c != nil {
+		return c.ExperimentID, c.PhaseID
+	}
+	return "", ""
+}
+
 // startDirect is the inline-fault path. It mints the run's id, creates a
 // span (a child of the request's), wires up events, starts the fault, hooks
-// the result callback, and stamps the run id on the request's span once the
-// fault has started -- unless the call is an arm (ArmedContext), which has
-// no request span.
+// the result callback, and, once the fault has started, stamps the run id on
+// the request's span -- unless the call is an arm (ArmedContext), which has
+// no request span -- and emits the fault.start decision event.
 func (i *Interceptor) startDirect(ctx context.Context, req evaluator.Request, decision *evaluator.Decision, faultType string, mode evaluator.Mode) (CheckResult, error) {
 	runID := NewRunID()
 	armed := isArmed(ctx)
-	reqSpan := oteltrace.SpanFromContext(ctx) // before ctx becomes the fault span's
-	ctx, span := i.tracer.Start(ctx, trace.SpanFaultInject, faultSpanAttrs(req, decision, faultType, runID)...)
+	reqSpan := oteltrace.SpanFromContext(ctx)
+	faultCtx, span := i.tracer.Start(ctx, trace.SpanFaultInject, faultSpanAttrs(req, decision, faultType, runID)...)
 	for k, v := range req.Labels {
 		span.SetAttributes(attribute.String(k, v))
 	}
@@ -265,7 +299,7 @@ func (i *Interceptor) startDirect(ctx context.Context, req evaluator.Request, de
 		})
 	}
 
-	handle, err := decision.Fault.Start(ctx)
+	handle, err := decision.Fault.Start(faultCtx)
 	if err != nil {
 		span.EndWithError(err)
 		return CheckResult{}, fmt.Errorf("interceptor: fault start failed: %w", err)
@@ -273,6 +307,7 @@ func (i *Interceptor) startDirect(ctx context.Context, req evaluator.Request, de
 	if !armed {
 		reqSpan.SetAttributes(attribute.String(trace.AttrFaultID, runID))
 	}
+	i.emitDecision(ctx, req, decision, trace.ActionFaultStart, runID)
 	if i.onInject != nil {
 		i.onInject(faultType, req.Point.String())
 	}
@@ -299,7 +334,10 @@ func (i *Interceptor) startDirect(ctx context.Context, req evaluator.Request, de
 // otelgrpc) is counted too, it just has no span to stamp or link. An arm
 // (Core.Arm, on every rule delivery) is no request, whatever its context
 // carries: it has no trigger and no request span, and its join is reported
-// to the caller but not counted.
+// to the caller but not counted. Once StartRun has returned (outside the
+// registry lock, so a slow log pipeline never serializes fault starts), a
+// start emits the fault.start decision event and a request's join the
+// fault.join one; an arm's join emits none.
 func (i *Interceptor) startRegistered(ctx, spanParent context.Context, req evaluator.Request, decision *evaluator.Decision, faultType string, mode evaluator.Mode) (CheckResult, error) {
 	key := decision.Name
 	if key == "" {
@@ -353,12 +391,14 @@ func (i *Interceptor) startRegistered(ctx, spanParent context.Context, req evalu
 				}
 			}
 			run.Join()
+			i.emitDecision(ctx, req, decision, trace.ActionFaultJoin, run.ID)
 		}
 		return CheckResult{Decision: &d, RunID: run.ID, Joined: true}, nil
 	}
 	if !armed {
 		reqSpan.SetAttributes(attribute.String(trace.AttrFaultID, run.ID))
 	}
+	i.emitDecision(ctx, req, decision, trace.ActionFaultStart, run.ID)
 	if i.onInject != nil {
 		i.onInject(faultType, req.Point.String())
 	}
