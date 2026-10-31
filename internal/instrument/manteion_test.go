@@ -697,6 +697,7 @@ func TestFetchRules_200AppliesAndReportsStatus(t *testing.T) {
 }
 
 func TestFetchRules_304AdoptsGenerationWithoutApplying(t *testing.T) {
+	metrics.SyncGeneration.Set(0) // the gauge is process-wide: start from a known value
 	f := newFakeManteion(t)
 	f.setRules(respond304("43", "43-def"))
 	eval := evaluator.NewStaticEvaluator(wire.StaticRule{Name: "keep", Point: evaluator.Ingress})
@@ -706,6 +707,9 @@ func TestFetchRules_304AdoptsGenerationWithoutApplying(t *testing.T) {
 	}
 	if c.ruleVersion.Load() != 43 || c.currentEtag() != "43-def" || len(eval.Rules()) != 1 {
 		t.Fatalf("gen=%d etag=%q rules=%d", c.ruleVersion.Load(), c.currentEtag(), len(eval.Rules()))
+	}
+	if got := syncGeneration(t); got != 43 {
+		t.Fatalf("atropos_sync_generation = %v, want the adopted generation 43", got)
 	}
 	if _, statuses := f.snapshot(); len(statuses) != 0 {
 		t.Fatalf("304 must not send a status report, sent %d", len(statuses))
