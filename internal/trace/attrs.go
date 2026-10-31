@@ -10,6 +10,9 @@ const (
 	AttrFaultActualDuration = "atropos.fault.actual_duration"
 	AttrFaultDetail         = "atropos.fault.detail"
 
+	// Resource attributes (stamped by internal/instrument's InitTelemetry).
+	AttrHost = "atropos.host" // the instrument host: "in-process" or "sidecar"
+
 	// Hook span attributes.
 	AttrHookName = "atropos.hook.name"
 

@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
+
 	"go.opentelemetry.io/contrib/exporters/autoexport"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -379,7 +381,7 @@ func TestInitTelemetry_ResourceCarriesInstanceAndHost(t *testing.T) {
 	}
 	defer tel.Shutdown(context.Background())
 	set := resourceOf(t).Set()
-	for k, want := range map[attribute.Key]string{"service.instance.id": "pod-7", "k8s.pod.name": "pod-7", "atropos.host": "sidecar", "service.name": "svc"} {
+	for k, want := range map[attribute.Key]string{"service.instance.id": "pod-7", "k8s.pod.name": "pod-7", trace.AttrHost: "sidecar", "service.name": "svc"} {
 		if v, ok := set.Value(k); !ok || v.AsString() != want {
 			t.Fatalf("%s = %v (present=%v), want %q", k, v, ok, want)
 		}
@@ -458,7 +460,7 @@ func TestInitTelemetry_NoPodNameOmitsK8sAttribute(t *testing.T) {
 	if _, ok := set.Value("k8s.pod.name"); ok {
 		t.Fatal("k8s.pod.name must be omitted without ATROPOS_POD_NAME/HOSTNAME")
 	}
-	if _, ok := set.Value("atropos.host"); ok {
+	if _, ok := set.Value(trace.AttrHost); ok {
 		t.Fatal("atropos.host must be omitted when the host is unset")
 	}
 }
@@ -883,7 +885,7 @@ func TestInitTelemetry_DefaultLoggerExportsThroughTheSDKProvider(t *testing.T) {
 	if got := r.InstrumentationScope().Name; got != loggerScopeName {
 		t.Fatalf("scope = %q, want %q", got, loggerScopeName)
 	}
-	if v, ok := r.Resource().Set().Value("atropos.host"); !ok || v.AsString() != HostSidecar {
+	if v, ok := r.Resource().Set().Value(trace.AttrHost); !ok || v.AsString() != HostSidecar {
 		t.Fatalf("record resource atropos.host = %v (present=%v), want %q", v, ok, HostSidecar)
 	}
 }

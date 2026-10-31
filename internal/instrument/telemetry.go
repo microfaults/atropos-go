@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
+
 	"go.opentelemetry.io/contrib/exporters/autoexport"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -175,7 +177,7 @@ func newResource(cfg telemetryConfig) (*resource.Resource, error) {
 		attrs = append(attrs, semconv.K8SPodName(podName))
 	}
 	if cfg.host != "" {
-		attrs = append(attrs, attribute.String("atropos.host", cfg.host))
+		attrs = append(attrs, attribute.String(trace.AttrHost, cfg.host))
 	}
 
 	// Use NewSchemaless to avoid schema URL conflicts between
