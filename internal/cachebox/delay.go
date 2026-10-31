@@ -70,6 +70,14 @@ func (d *DistributionDelaySource) SetParams(mu, sigma float64) {
 	d.mu.Unlock()
 }
 
+// Params returns the current (mu, sigma) fit, read under one lock so the pair
+// is never torn by a concurrent SetParams.
+func (d *DistributionDelaySource) Params() (mu, sigma float64) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.muVal, d.sigma
+}
+
 // Sample draws a delay from the fitted distribution. If sigma is zero
 // (distribution not yet fitted), Sample falls back to entry.ObservedLatency.
 func (d *DistributionDelaySource) Sample(entry *Entry) time.Duration {
@@ -99,4 +107,22 @@ func (d *DistributionDelaySource) Sample(entry *Entry) time.Duration {
 		return ObservedDelaySource{}.Sample(entry)
 	}
 	return time.Duration(microseconds) * time.Microsecond
+}
+
+// DelayStats describes the replay_with_delay source a CacheBox is sampling
+// from, as reported in Stats.Delay. GET /admin/cachebox serves Stats
+// verbatim, so the fields carry no json tags, like their siblings there.
+//
+// Installed is true only for a *DistributionDelaySource, the fitted source a
+// freeze installs; the default observed-latency source (and any other
+// DelaySource) reads as not installed, with Mu and Sigma zero. Mu and Sigma
+// are the source's current fit (Params; mu is in ln(microseconds)).
+// ExperimentID and PhaseID are the scope the source is limited to; both empty
+// means it applies to every replay.
+type DelayStats struct {
+	Installed    bool
+	ExperimentID string
+	PhaseID      string
+	Mu           float64
+	Sigma        float64
 }

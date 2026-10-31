@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -425,6 +427,71 @@ func TestHandleCacheBox_ReplayDelaySleepsAtLeastObservedLatency(t *testing.T) {
 	// Allow a wide lower bound -- we want to see the sleep, not exact timing.
 	if elapsed < observed*3/4 {
 		t.Fatalf("replay_with_delay did not sleep: elapsed=%s, expected >= %s", elapsed, observed*3/4)
+	}
+}
+
+// TestHandleCacheBox_ReplayDelayHonoursScopedSource pins that the
+// replay_with_delay path samples through the matched rule's CacheBoxContext:
+// a delay source scoped to another (experiment_id, phase_id) leaves this
+// rule's replays at the recorded latency, while one scoped to the rule's own
+// pair applies the fitted distribution.
+func TestHandleCacheBox_ReplayDelayHonoursScopedSource(t *testing.T) {
+	const observed = time.Millisecond
+
+	cb := cachebox.New(cachebox.Config{KeyStrategy: cachebox.KeyStrategyExactWithHost})
+	t.Cleanup(func() { cb.Stop() })
+
+	req, _ := http.NewRequest(http.MethodGet, "http://cache-hit.test/slow", nil)
+	key := cb.DeriveKey(req, nil)
+	cb.InstallReplaySet(cachebox.PhaseKey("exp-1", "phase-1"), map[string]*cachebox.Entry{
+		key: {
+			Key:             key,
+			StatusCode:      200,
+			Header:          http.Header{},
+			Body:            []byte("slow"),
+			ObservedLatency: observed,
+			RecordedAt:      time.Now(),
+		},
+	})
+
+	i := New(
+		evaluator.NewStaticEvaluator(cacheBoxRuleWithPhase("cache-hit.test", evaluator.CacheBoxReplayDelay, "exp-1", "phase-1")),
+		trace.Noop(),
+		WithCacheBox(cb),
+	)
+	client := &http.Client{Transport: i.EgressTransport(failRoundTripper{t: t})}
+
+	// replayDelayUs serves one replay_with_delay request and returns the delay
+	// the dispatcher reports having slept (X-Atropos-Cache-Latency-Us).
+	replayDelayUs := func() int64 {
+		t.Helper()
+		resp, err := client.Get("http://cache-hit.test/slow")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if string(body) != "slow" || resp.Header.Get(HeaderCacheMode) != "replay_with_delay" {
+			t.Fatalf("not a replay_with_delay hit: body=%q headers=%v", body, resp.Header)
+		}
+		us, err := strconv.ParseInt(resp.Header.Get(HeaderCacheLatencyUs), 10, 64)
+		if err != nil {
+			t.Fatalf("latency header: %v", err)
+		}
+		return us
+	}
+
+	// mu is ln(microseconds): a ~30ms median, far from the 1ms recorded latency.
+	fitted := cachebox.NewDistributionDelaySource(math.Log(30000), 0.2, 1)
+
+	cb.SetScopedDelaySource(fitted, cachebox.PhasePair{ExperimentID: "exp-1", PhaseID: "phase-2"})
+	if got := replayDelayUs(); got != observed.Microseconds() {
+		t.Fatalf("a source scoped to another phase must leave the recorded latency: slept %dus, want %dus", got, observed.Microseconds())
+	}
+
+	cb.SetScopedDelaySource(fitted, cachebox.PhasePair{ExperimentID: "exp-1", PhaseID: "phase-1"})
+	if got := replayDelayUs(); got < 5*observed.Microseconds() {
+		t.Fatalf("a source scoped to the rule's own pair must apply the fitted distribution: slept %dus, recorded %dus", got, observed.Microseconds())
 	}
 }
 

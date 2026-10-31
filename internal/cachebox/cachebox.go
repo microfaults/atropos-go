@@ -28,8 +28,8 @@ const DefaultMaxBodyBytes = 1 << 20 // 1 MiB
 // serve cache-box decisions.
 //
 // A nil *CacheBox is safe for Lookup and Record (both become no-ops)
-// but not for SampleDelay or NeedsRequestBody -- the interceptor must
-// check for nil before dispatching to handleCacheBox.
+// but not for SampleDelay, SampleDelayFor or NeedsRequestBody -- the
+// interceptor must check for nil before dispatching to handleCacheBox.
 type CacheBox struct {
 	store        Store
 	replaySet    *ReplaySet
@@ -41,8 +41,9 @@ type CacheBox struct {
 	maxBodyBytes int
 	otelCapture  int
 
-	mu    sync.RWMutex
-	delay DelaySource
+	mu         sync.RWMutex
+	delay      DelaySource
+	delayScope PhasePair // zero = unscoped; always written together with delay, under mu
 }
 
 // Config builds a CacheBox.
@@ -286,24 +287,70 @@ func (cb *CacheBox) PreloadAbort(experimentID, phaseID string) {
 	cb.preload.Abort(experimentID, phaseID)
 }
 
-// SampleDelay asks the delay source how long replay_with_delay should sleep
-// for this entry. Not nil-safe on the receiver -- callers must check.
+// SampleDelay is SampleDelayFor with no replay context, so it reaches the
+// installed source only while that source is unscoped. Not nil-safe on the
+// receiver -- callers must check.
 func (cb *CacheBox) SampleDelay(entry *Entry) time.Duration {
+	return cb.SampleDelayFor(nil, entry)
+}
+
+// SampleDelayFor asks the delay source how long replay_with_delay should
+// sleep for this entry, on behalf of the replay that matched cbCtx. A scoped
+// source (SetScopedDelaySource) applies only when cbCtx names exactly its
+// (experiment_id, phase_id); a replay under any other pair, or under no
+// context at all, sleeps the entry's observed latency as if no source were
+// installed. An unscoped source applies to every replay. Not nil-safe on the
+// receiver -- callers must check.
+func (cb *CacheBox) SampleDelayFor(cbCtx *CacheBoxContext, entry *Entry) time.Duration {
+	// Source and scope are read under one lock acquisition so a concurrent
+	// swap can never pair the new source with the old scope. The sample itself
+	// is drawn outside the lock: sources synchronise themselves.
 	cb.mu.RLock()
-	d := cb.delay
+	d, scope := cb.delay, cb.delayScope
 	cb.mu.RUnlock()
+
+	if !scope.isZero() && (cbCtx == nil || (PhasePair{ExperimentID: cbCtx.ExperimentID, PhaseID: cbCtx.PhaseID}) != scope) {
+		return ObservedDelaySource{}.Sample(entry)
+	}
 	return d.Sample(entry)
 }
 
-// SetDelaySource atomically swaps the delay source. Used by manteion
-// integration (Stage 3) to push fitted distribution parameters at rule
-// update time.
-func (cb *CacheBox) SetDelaySource(d DelaySource) {
+// SetScopedDelaySource atomically installs d as the replay_with_delay source
+// for replays whose matched rule context names exactly scope; every other
+// replay keeps sleeping the entry's observed latency. A zero scope -- either
+// id empty (PhasePair.isZero) -- means unscoped: d applies to every replay,
+// and is stored and reported as the zero scope. A nil d is ignored, scope
+// included. Source and scope change together, under one lock. Intended for the
+// freeze path, which names the (experiment_id, phase_id) a freeze applies to.
+func (cb *CacheBox) SetScopedDelaySource(d DelaySource, scope PhasePair) {
 	if d == nil {
 		return
 	}
+	if scope.isZero() {
+		scope = PhasePair{}
+	}
 	cb.mu.Lock()
 	cb.delay = d
+	cb.delayScope = scope
+	cb.mu.Unlock()
+}
+
+// SetDelaySource atomically swaps in an unscoped delay source -- one that
+// applies to every replay whatever its context -- dropping any scope the
+// previous source had. It is SetScopedDelaySource(d, PhasePair{}). Used by
+// manteion integration (Stage 3) to push fitted distribution parameters at
+// rule update time.
+func (cb *CacheBox) SetDelaySource(d DelaySource) {
+	cb.SetScopedDelaySource(d, PhasePair{})
+}
+
+// ClearDelaySource atomically restores the default: ObservedDelaySource,
+// unscoped, so replay_with_delay sleeps each entry's recorded latency. It does
+// not bring back Config.Delay; that is the construction-time default only.
+func (cb *CacheBox) ClearDelaySource() {
+	cb.mu.Lock()
+	cb.delay = ObservedDelaySource{}
+	cb.delayScope = PhasePair{}
 	cb.mu.Unlock()
 }
 
@@ -343,10 +390,12 @@ func (cb *CacheBox) Stop() {
 // Stats returns combined store and recorder stats. RecordBuffer is only
 // populated when the record-side Store happens to be a *RecordBuffer
 // (true by default; a caller-supplied custom Store leaves it zero-valued).
+// Delay describes the installed replay_with_delay source and its scope.
 type Stats struct {
 	Store        StoreStats
 	Recorder     RecorderStats
 	RecordBuffer RecordBufferStats
+	Delay        DelayStats
 }
 
 // Stats returns a snapshot of cache-box observability counters.
@@ -357,6 +406,18 @@ func (cb *CacheBox) Stats() Stats {
 	}
 	if rb, ok := cb.store.(*RecordBuffer); ok {
 		s.RecordBuffer = rb.BufferStats()
+	}
+
+	// Snapshot source and scope together, then read the fit outside cb.mu: the
+	// sampling hot path takes cb.mu.RLock, and a pending writer would stall it
+	// behind any lock held longer than the snapshot needs.
+	cb.mu.RLock()
+	d, scope := cb.delay, cb.delayScope
+	cb.mu.RUnlock()
+	s.Delay = DelayStats{ExperimentID: scope.ExperimentID, PhaseID: scope.PhaseID}
+	if dist, ok := d.(*DistributionDelaySource); ok {
+		s.Delay.Installed = true
+		s.Delay.Mu, s.Delay.Sigma = dist.Params()
 	}
 	return s
 }

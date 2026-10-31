@@ -260,6 +260,17 @@ func TestDistributionDelaySource_SetParamsSwitchesMode(t *testing.T) {
 	}
 }
 
+func TestDistributionDelaySource_Params(t *testing.T) {
+	d := NewDistributionDelaySource(math.Log(1000), 0.2, 3)
+	if mu, sigma := d.Params(); mu != math.Log(1000) || sigma != 0.2 {
+		t.Fatalf("Params() = (%v, %v), want (%v, 0.2)", mu, sigma, math.Log(1000))
+	}
+	d.SetParams(1.5, 0.75)
+	if mu, sigma := d.Params(); mu != 1.5 || sigma != 0.75 {
+		t.Fatalf("Params() after SetParams = (%v, %v), want (1.5, 0.75)", mu, sigma)
+	}
+}
+
 // --- Recorder tests ---
 
 func TestRecorder_BasicFlow(t *testing.T) {
@@ -574,6 +585,199 @@ func TestCacheBox_SetDelaySource(t *testing.T) {
 	if got <= 0 {
 		t.Fatalf("expected positive fitted sample, got %s", got)
 	}
+}
+
+func TestCacheBox_ScopedDelaySource_AppliesOnlyToMatchingPair(t *testing.T) {
+	cb := New(Config{})
+	defer cb.Stop()
+	cb.SetScopedDelaySource(NewDistributionDelaySource(math.Log(1000), 0.2, 3), PhasePair{ExperimentID: "exp-1", PhaseID: "phase-1"})
+	entry := &Entry{ObservedLatency: 7 * time.Millisecond}
+
+	same := &CacheBoxContext{ExperimentID: "exp-1", PhaseID: "phase-1"}
+	if got := cb.SampleDelayFor(same, entry); got <= 0 || got == 7*time.Millisecond {
+		t.Fatalf("matching pair must sample the fitted distribution, got %s", got)
+	}
+	other := &CacheBoxContext{ExperimentID: "exp-1", PhaseID: "phase-2"}
+	if got := cb.SampleDelayFor(other, entry); got != 7*time.Millisecond {
+		t.Fatalf("other pair must fall back to the observed latency, got %s", got)
+	}
+	if got := cb.SampleDelayFor(nil, entry); got != 7*time.Millisecond {
+		t.Fatalf("no context under a scoped source must fall back to observed, got %s", got)
+	}
+	s := cb.Stats().Delay
+	if !s.Installed || s.ExperimentID != "exp-1" || s.PhaseID != "phase-1" || s.Mu != math.Log(1000) || s.Sigma != 0.2 {
+		t.Fatalf("Stats().Delay = %+v", s)
+	}
+}
+
+func TestCacheBox_ClearDelaySource_RestoresObserved(t *testing.T) {
+	cb := New(Config{})
+	defer cb.Stop()
+	cb.SetScopedDelaySource(NewDistributionDelaySource(math.Log(1000), 0.2, 3), PhasePair{ExperimentID: "exp-1", PhaseID: "phase-1"})
+	cb.ClearDelaySource()
+	entry := &Entry{ObservedLatency: 7 * time.Millisecond}
+	if got := cb.SampleDelayFor(&CacheBoxContext{ExperimentID: "exp-1", PhaseID: "phase-1"}, entry); got != 7*time.Millisecond {
+		t.Fatalf("cleared source must be the observed latency, got %s", got)
+	}
+	if s := cb.Stats().Delay; s.Installed || s.ExperimentID != "" {
+		t.Fatalf("Stats().Delay after clear = %+v", s)
+	}
+}
+
+// SetDelaySource keeps its pre-scope contract: the source applies to every
+// replay (any context, or none), and installing one over a scoped source
+// drops the scope.
+func TestCacheBox_SetDelaySource_IsUnscoped(t *testing.T) {
+	cb := New(Config{})
+	defer cb.Stop()
+	entry := &Entry{ObservedLatency: 7 * time.Millisecond}
+
+	cb.SetScopedDelaySource(NewDistributionDelaySource(math.Log(1000), 0.2, 3), PhasePair{ExperimentID: "exp-1", PhaseID: "phase-1"})
+	cb.SetDelaySource(NewDistributionDelaySource(math.Log(1000), 0.2, 4))
+
+	for name, cbCtx := range map[string]*CacheBoxContext{
+		"nil context":    nil,
+		"previous scope": {ExperimentID: "exp-1", PhaseID: "phase-1"},
+		"other pair":     {ExperimentID: "exp-2", PhaseID: "phase-2"},
+	} {
+		if got := cb.SampleDelayFor(cbCtx, entry); got <= 0 || got == 7*time.Millisecond {
+			t.Errorf("%s: an unscoped source must sample the fitted distribution, got %s", name, got)
+		}
+	}
+	if got := cb.SampleDelay(entry); got <= 0 || got == 7*time.Millisecond {
+		t.Errorf("SampleDelay must reach an unscoped source, got %s", got)
+	}
+	if s := cb.Stats().Delay; !s.Installed || s.ExperimentID != "" || s.PhaseID != "" {
+		t.Fatalf("Stats().Delay = %+v, want installed and unscoped", s)
+	}
+}
+
+// A scope with either id empty has no attributable identity (PhasePair.isZero),
+// so it is unscoped -- and is reported as such, not as a half-filled pair the
+// source does not actually honour.
+func TestCacheBox_SetScopedDelaySource_PartialScopeIsUnscoped(t *testing.T) {
+	entry := &Entry{ObservedLatency: 7 * time.Millisecond}
+	for _, scope := range []PhasePair{{ExperimentID: "exp-1"}, {PhaseID: "phase-1"}} {
+		cb := New(Config{})
+		cb.SetScopedDelaySource(NewDistributionDelaySource(math.Log(1000), 0.2, 3), scope)
+		if got := cb.SampleDelayFor(&CacheBoxContext{ExperimentID: "exp-9", PhaseID: "phase-9"}, entry); got <= 0 || got == 7*time.Millisecond {
+			t.Errorf("scope %+v: a partial scope must behave as unscoped, got %s", scope, got)
+		}
+		if s := cb.Stats().Delay; !s.Installed || s.ExperimentID != "" || s.PhaseID != "" {
+			t.Errorf("scope %+v: Stats().Delay = %+v, want installed and unscoped", scope, s)
+		}
+		cb.Stop()
+	}
+}
+
+// A nil source is ignored -- scope included -- exactly as SetDelaySource(nil)
+// always was: the installed source and its scope stay put.
+func TestCacheBox_SetScopedDelaySource_NilIsNoop(t *testing.T) {
+	cb := New(Config{})
+	defer cb.Stop()
+	cb.SetScopedDelaySource(NewDistributionDelaySource(math.Log(1000), 0.2, 3), PhasePair{ExperimentID: "exp-1", PhaseID: "phase-1"})
+	cb.SetScopedDelaySource(nil, PhasePair{ExperimentID: "exp-2", PhaseID: "phase-2"})
+	cb.SetDelaySource(nil)
+	if s := cb.Stats().Delay; !s.Installed || s.ExperimentID != "exp-1" || s.PhaseID != "phase-1" {
+		t.Fatalf("a nil source must leave the installed source and scope alone, Stats().Delay = %+v", s)
+	}
+}
+
+// Stats().Delay.Installed means "a fitted *DistributionDelaySource is
+// installed": the default observed-latency source reads as not installed.
+// A scope set with some other DelaySource still gates it and is still reported.
+func TestCacheBox_Stats_DelayInstalledOnlyForDistributionSource(t *testing.T) {
+	cb := New(Config{})
+	defer cb.Stop()
+	if s := cb.Stats().Delay; s != (DelayStats{}) {
+		t.Fatalf("default Stats().Delay = %+v, want the zero value", s)
+	}
+	cb.SetScopedDelaySource(ObservedDelaySource{}, PhasePair{ExperimentID: "exp-1", PhaseID: "phase-1"})
+	if s := cb.Stats().Delay; s.Installed || s.Mu != 0 || s.Sigma != 0 || s.ExperimentID != "exp-1" || s.PhaseID != "phase-1" {
+		t.Fatalf("Stats().Delay with a non-distribution source = %+v", s)
+	}
+}
+
+// TestCacheBox_DelaySourceSwapIsAtomic hammers source swaps against samplers
+// and stats readers (run it under -race). A source and its scope are replaced
+// as one: a sampler scoped to pair A may only ever see A's delay band or the
+// observed latency -- B's band would mean the new source met the old scope --
+// and every Stats().Delay snapshot must pair a scope with that scope's own
+// fit.
+func TestCacheBox_DelaySourceSwapIsAtomic(t *testing.T) {
+	const (
+		observed = 7 * time.Millisecond
+		iters    = 20000
+	)
+	var (
+		muA   = math.Log(100000) // ln(microseconds): ~100ms, sigma 0.01 keeps it in 90-110ms
+		muB   = math.Log(200000) // ~200ms, 180-220ms
+		pairA = PhasePair{ExperimentID: "exp-1", PhaseID: "phase-A"}
+		pairB = PhasePair{ExperimentID: "exp-1", PhaseID: "phase-B"}
+		entry = &Entry{ObservedLatency: observed}
+	)
+	inBand := func(d, centre time.Duration) bool { return d >= centre*9/10 && d <= centre*11/10 }
+
+	cb := New(Config{})
+	defer cb.Stop()
+
+	stop := make(chan struct{})
+	var writer sync.WaitGroup
+	writer.Add(1)
+	go func() {
+		defer writer.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			switch i % 3 {
+			case 0:
+				cb.SetScopedDelaySource(NewDistributionDelaySource(muA, 0.01, uint64(i)), pairA)
+			case 1:
+				cb.SetScopedDelaySource(NewDistributionDelaySource(muB, 0.01, uint64(i)), pairB)
+			default:
+				cb.ClearDelaySource()
+			}
+		}
+	}()
+
+	var readers sync.WaitGroup
+	sampler := func(name string, cbCtx *CacheBoxContext, allowed func(time.Duration) bool) {
+		defer readers.Done()
+		for i := 0; i < iters; i++ {
+			if got := cb.SampleDelayFor(cbCtx, entry); got != observed && !allowed(got) {
+				t.Errorf("%s sampler saw %s: neither its own band nor the observed latency", name, got)
+				return
+			}
+		}
+	}
+	readers.Add(3)
+	go sampler("pair A", &CacheBoxContext{ExperimentID: pairA.ExperimentID, PhaseID: pairA.PhaseID}, func(d time.Duration) bool { return inBand(d, 100*time.Millisecond) })
+	go sampler("pair B", &CacheBoxContext{ExperimentID: pairB.ExperimentID, PhaseID: pairB.PhaseID}, func(d time.Duration) bool { return inBand(d, 200*time.Millisecond) })
+	go sampler("no context", nil, func(time.Duration) bool { return false })
+
+	readers.Add(1)
+	go func() {
+		defer readers.Done()
+		for i := 0; i < iters; i++ {
+			s := cb.Stats().Delay
+			scope := PhasePair{ExperimentID: s.ExperimentID, PhaseID: s.PhaseID}
+			switch {
+			case !s.Installed && scope == (PhasePair{}): // cleared (or not yet installed)
+			case s.Installed && scope == pairA && s.Mu == muA && s.Sigma == 0.01:
+			case s.Installed && scope == pairB && s.Mu == muB && s.Sigma == 0.01:
+			default:
+				t.Errorf("torn Stats().Delay snapshot: %+v", s)
+				return
+			}
+		}
+	}()
+
+	readers.Wait()
+	close(stop)
+	writer.Wait()
 }
 
 func TestCacheBox_CustomKeyFuncOverridesStrategy(t *testing.T) {

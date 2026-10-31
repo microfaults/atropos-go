@@ -114,7 +114,7 @@ func (i *Interceptor) handleCacheBox(r *http.Request, base http.RoundTripper, re
 	case evaluator.CacheBoxReplayDelay:
 		if entry, ok := replayLookup(cb, cbCtx, key); ok {
 			recordReplayHit(cb, cbCtx, entry)
-			delay := cb.SampleDelay(entry)
+			delay := cb.SampleDelayFor(cbCtx, entry)
 			if delay > 0 {
 				select {
 				case <-ctx.Done():
