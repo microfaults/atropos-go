@@ -37,7 +37,7 @@ func swaggerFaultAdminDelete() {}
 // swaggerCacheBoxAdminGet documents GET /admin/cachebox.
 //
 // @Summary  Inspect cache-box state
-// @Description  Store, recorder and record-buffer counters, plus the replay_with_delay source in force: whether a fitted source is installed, its mu and sigma, and the (experiment_id, phase_id) it is scoped to (both empty = every replay).
+// @Description  Store, recorder and record-buffer counters, plus the replay_with_delay source in force: whether a fitted source is installed, its mu and sigma, and the (experiment_id, phase_id) it is scoped to (both empty = every replay). The stats structs carry no JSON tags, so the response keys are the Go field names (Delay.Installed, Store.Entries, ...), not the camelCase names the response schema renders; the keys are a wire surface and stay as they are.
 // @Tags     admin
 // @Produce  json
 // @Success  200  {object}  CacheBoxStats
@@ -152,7 +152,7 @@ func swaggerRulesAdminGet() {}
 // swaggerRulesAdminPost documents POST /admin/rules.
 //
 // @Summary  Replace runtime rules
-// @Description  Applies the rule set through the single apply path the manteion sync also uses, scoped to rules: admin fault slots, the delay source and the installed replay set stay as they are. Rules this host cannot execute (a category outside its capabilities, quota resource faults in-process, network host=inline outside the sidecar or host=proxy without a resolver, compositions) are skipped per rule, logged and counted in atropos_rules_unsupported_total{category}; the rest apply and the answer is 204. A rule that does not decode is skipped too, but the answer is 422. The pushed set holds until the next desired-state 200 answer replaces it.
+// @Description  Applies the rule set through the single apply path the manteion sync also uses, scoped to rules: admin fault slots, the delay source and the installed replay set stay as they are. Rules this host cannot execute (a category outside its capabilities, quota resource faults in-process, network host=inline outside the sidecar or host=proxy without a resolver, compositions) are skipped per rule, logged and counted in atropos_rules_unsupported_total{category}; the rest apply and the answer is 204. A rule that does not decode is skipped and logged, not counted, and the answer is 422. The pushed set holds until the next desired-state 200 answer replaces it.
 // @Tags     admin
 // @Accept   json
 // @Produce  json
@@ -179,7 +179,7 @@ func swaggerHealthGet() {}
 // is listed so the wire types the poll carries are part of this contract.
 //
 // @Summary      Poll the desired state (served by manteion)
-// @Description  Served by manteion, not by Serve: the SDK is the client. version is the generation the instance holds, If-None-Match the ETag of the document it holds (sent only when it holds one), and wait asks manteion to hold the request until the service's generation changes or the wait (seconds) elapses (the SDK sends 30). The ETag is a content hash alone; the generation travels in X-Atropos-Generation and in the body's version. The SDK treats the ETag as opaque. 200 is applied through the single apply path and reported with POST /api/v1/sdk/status; 304 means the document is unchanged and the instance adopts the generation without applying.
+// @Description  Served by manteion, not by Serve: the SDK is the client. version is the generation the instance holds, If-None-Match the ETag of the document it holds (sent only when it holds one), and wait (seconds) asks manteion to hold the request (the SDK sends 30): manteion holds it only when version is the service's current generation and the ETag matches, until the generation changes or the wait elapses, and answers a matching ETag with an older (or absent/zero) version 304 at once, carrying the current generation. The ETag is a content hash alone; the generation travels in X-Atropos-Generation and in the body's version. The SDK treats the ETag as opaque. 200 is applied through the single apply path and reported with POST /api/v1/sdk/status; 304 means the document is unchanged and the instance adopts the generation without applying.
 // @Tags         manteion-protocol
 // @Produce      json
 // @Param        service        query   string  true   "service name"

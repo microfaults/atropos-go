@@ -384,9 +384,11 @@ state and is applied before the first poll. The loop then keeps the instance on
 it:
 
 - **Long-poll.** `GET /api/v1/sdk/rules?...&version=<generation held>&wait=30`
-  with `If-None-Match: "<etag held>"`: manteion holds the request until the
-  service's generation changes or 30 s pass. The ETag is the document's content
-  hash alone and opaque to the SDK; the generation travels in
+  with `If-None-Match: "<etag held>"`. For a current instance (its `version` is
+  the service's generation and its ETag matches) manteion holds the request until
+  the generation changes or 30 s pass; a matching ETag with an older `version`
+  is answered `304` at once, carrying the current generation. The ETag is the
+  document's content hash alone and opaque to the SDK; the generation travels in
   `X-Atropos-Generation` and the body's `version`.
 - **`200`** — the body is the **full desired state** (`RuleSync`: `rules`,
   `active_faults`, `freeze_cfg`, `replay_set`). An empty rule set is
@@ -398,11 +400,13 @@ it:
   `POST /api/v1/sdk/status` and polls again at once.
 - **`304`** — the document is unchanged: the instance adopts the generation in
   `X-Atropos-Generation` and applies nothing.
-- **Skipped per rule.** A rule this host cannot execute (a category outside its
-  capabilities, `quota` in-process, network `host: inline` outside the sidecar or
-  `host: proxy` without a resolver, a composition) or cannot decode never fails
-  the sync: it is skipped, counted in `atropos_rules_unsupported_total{category}`
-  (compositions under `category="composition"`) and reported; the rest apply.
+- **Skipped per rule.** One bad rule never fails the sync; the rest apply. A rule
+  this host cannot execute (a category outside its capabilities, `quota`
+  in-process, network `host: inline` outside the sidecar or `host: proxy` without
+  a resolver, a composition) is skipped, logged, counted in
+  `atropos_rules_unsupported_total{category}` (compositions under
+  `category="composition"`) and reported under `unsupported`. A rule it cannot
+  decode is skipped, logged and reported under `errors`; it is not counted.
 - **Freeze.** `freeze_cfg.context` scopes the delay source to its
   `(experiment_id, phase_id)`: replays under another pair keep the entry's
   observed latency, and the `/admin/cachebox` stats show the source and its scope.
@@ -417,9 +421,10 @@ it:
   interval, a 30 s hold), so manteion's liveness thresholds tolerate the hold. A
   failed poll keeps the stale state and backs off (60 s at most); the sixth
   consecutive failure re-registers once, and the first poll that succeeds after
-  failures drops the held generation and ETag and re-registers, so the next poll
-  is a full pull. The SSE `rules_changed` nudge (`GET /api/v1/sdk/events`) is
-  kept and ends any wait between polls early.
+  failures drops the held generation and ETag and re-registers, so the instance
+  re-converges on a full document through the register answer. The SSE
+  `rules_changed` nudge (`GET /api/v1/sdk/events`) is kept and ends any wait
+  between polls early.
 - **Watchdog.** A fault slot that stays unconfirmed for
   `max(3·max(interval, hold), 30 s)` is dropped: 90 s by default. A `200` that
   names the slot, or a `304` for a document that did, re-confirms it; an

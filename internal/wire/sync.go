@@ -6,7 +6,7 @@ package wire
 // marshal/unmarshal this one struct, so the field set cannot drift between
 // control plane and SDK.
 //
-// Rules and ActiveFaults are deliberately NOT omitempty: under Apply's
+// Rules and ActiveFaults are deliberately NOT omitempty: under apply's
 // reconciliation an empty array means "clear everything in this category",
 // which must be explicit on the wire rather than indistinguishable from
 // "field absent". A null/absent rules field (nil after decode) means "no
@@ -16,7 +16,7 @@ package wire
 // Recording/replay provenance rides each matched rule's CacheBoxContext
 // (design doc Q5/INV-5); there is no ambient recording-phase signal here.
 type RuleSync struct {
-	Version uint64 `json:"version"` // the generation, kept under the old name (spec §5)
+	Version uint64 `json:"version"` // the generation, kept under the old name
 	// Etag is the ETag of this materialized document: a hash of its content
 	// alone, never the generation (that travels in Version and in the
 	// X-Atropos-Generation header), so an unchanged document keeps its ETag
@@ -27,7 +27,11 @@ type RuleSync struct {
 	ActiveFaults []FaultRequest `json:"active_faults"`
 	FreezeCfg    *DelayRequest  `json:"freeze_cfg,omitempty"`
 	// ReplaySet is the replay set desired on this instance: absent means no replay
-	// set is desired, so the instance clears one it holds.
+	// set is desired, so the instance clears one it holds. Present, it names the
+	// set to pull: ExperimentID and PhaseID are the (experiment, phase) pair it
+	// is installed under (the cache-box serves it only to the rule whose context
+	// matches that pair), ID is `sha256:<hex>` of the artifact bytes fetched from
+	// URL, and SHA256 is the W5 digest over its entries.
 	ReplaySet *ReplaySetRef `json:"replay_set,omitempty"`
 } //@name atropos.RuleSync
 
@@ -56,7 +60,7 @@ type UnsupportedRule struct {
 // ReplaySetStatus reports the state of the replay set the instance holds for ID.
 type ReplaySetStatus struct {
 	ID    string `json:"id"`
-	State string `json:"state"` // ReplaySetFetching | ReplaySetCommitted | ReplaySetFailed
+	State string `json:"state"` // fetching | committed | failed
 } //@name atropos.ReplaySetStatus
 
 // StatusReport is the instance's full snapshot of what it holds, sent after

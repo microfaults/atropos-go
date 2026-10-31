@@ -1,6 +1,6 @@
 # OpenAPI Annotation Conventions
 
-All admin handlers in this repo are annotated with [swaggo/swag](https://github.com/swaggo/swag) v2 to generate OpenAPI 3.1. Host services that mount these handlers can publish a combined spec or reference this SDK spec directly.
+All admin handlers in this repo are annotated with [swaggo/swag](https://github.com/swaggo/swag) v2 to generate OpenAPI 3.1. Host services that mount these handlers can publish a combined spec or reference this SDK spec directly. A combined spec must drop the operations tagged `manteion-protocol`: manteion serves those, and `Serve` does not mount them.
 
 ## Toolchain
 

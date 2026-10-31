@@ -380,7 +380,15 @@ components:
       description: 'ReplaySet is the replay set desired on this instance: absent means
         no replay
 
-        set is desired, so the instance clears one it holds.'
+        set is desired, so the instance clears one it holds. Present, it names the
+
+        set to pull: ExperimentID and PhaseID are the (experiment, phase) pair it
+
+        is installed under (the cache-box serves it only to the rule whose context
+
+        matches that pair), ID is `sha256:<hex>` of the artifact bytes fetched from
+
+        URL, and SHA256 is the W5 digest over its entries.'
       properties:
         count:
           type: integer
@@ -406,7 +414,7 @@ components:
         id:
           type: string
         state:
-          description: ReplaySetFetching | ReplaySetCommitted | ReplaySetFailed
+          description: fetching | committed | failed
           type: string
       type: object
     atropos.RuleSync:
@@ -438,7 +446,7 @@ components:
           type: array
           uniqueItems: false
         version:
-          description: "the generation, kept under the old name (spec \xA75)"
+          description: the generation, kept under the old name
           type: integer
       type: object
     atropos.StaticRule:
@@ -704,7 +712,10 @@ paths:
     get:
       description: 'Store, recorder and record-buffer counters, plus the replay_with_delay
         source in force: whether a fitted source is installed, its mu and sigma, and
-        the (experiment_id, phase_id) it is scoped to (both empty = every replay).'
+        the (experiment_id, phase_id) it is scoped to (both empty = every replay).
+        The stats structs carry no JSON tags, so the response keys are the Go field
+        names (Delay.Installed, Store.Entries, ...), not the camelCase names the response
+        schema renders; the keys are a wire surface and stay as they are.'
       responses:
         '200':
           content:
@@ -857,8 +868,8 @@ paths:
         outside the sidecar or host=proxy without a resolver, compositions) are skipped
         per rule, logged and counted in atropos_rules_unsupported_total{category};
         the rest apply and the answer is 204. A rule that does not decode is skipped
-        too, but the answer is 422. The pushed set holds until the next desired-state
-        200 answer replaces it.'
+        and logged, not counted, and the answer is 422. The pushed set holds until
+        the next desired-state 200 answer replaces it.'
       requestBody:
         content:
           application/json:
@@ -906,13 +917,16 @@ paths:
     get:
       description: 'Served by manteion, not by Serve: the SDK is the client. version
         is the generation the instance holds, If-None-Match the ETag of the document
-        it holds (sent only when it holds one), and wait asks manteion to hold the
-        request until the service''s generation changes or the wait (seconds) elapses
-        (the SDK sends 30). The ETag is a content hash alone; the generation travels
-        in X-Atropos-Generation and in the body''s version. The SDK treats the ETag
-        as opaque. 200 is applied through the single apply path and reported with
-        POST /api/v1/sdk/status; 304 means the document is unchanged and the instance
-        adopts the generation without applying.'
+        it holds (sent only when it holds one), and wait (seconds) asks manteion to
+        hold the request (the SDK sends 30): manteion holds it only when version is
+        the service''s current generation and the ETag matches, until the generation
+        changes or the wait elapses, and answers a matching ETag with an older (or
+        absent/zero) version 304 at once, carrying the current generation. The ETag
+        is a content hash alone; the generation travels in X-Atropos-Generation and
+        in the body''s version. The SDK treats the ETag as opaque. 200 is applied
+        through the single apply path and reported with POST /api/v1/sdk/status; 304
+        means the document is unchanged and the instance adopts the generation without
+        applying.'
       parameters:
       - description: service name
         in: query
