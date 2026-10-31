@@ -317,9 +317,11 @@ Two behaviours are sidecar-only: network faults with `network.host: inline`
 run as **armed policies** on the sidecar's upstream calls (stream toxics
 shape request or response bytes; `rst` and `blackhole` are reproduced on
 the app-facing connection, so the app sees a reset or a hang, not a 502),
-and background faults **arm when their rule applies** rather than on the
-first matching request. The in-process host keeps rejecting `host: inline`
-and arming lazily. Proxy overhead per request (total minus upstream) is
+and background faults **arm when their rule applies** (except Transient
+rules) rather than on the first matching request. The in-process host skips
+`host: inline` rules (logged and counted in
+`atropos_rules_unsupported_total{category="network"}`) and arms lazily.
+Proxy overhead per request (total minus upstream) is
 exported as `atropos_proxy_overhead_seconds{point}` for the G-proxy gate.
 
 **Transparent capture** (`ATROPOSD_CAPTURE=transparent`) removes the
@@ -355,9 +357,10 @@ own limits, so semantics and ramps are the in-process ones; `quota`
 lowers the target's `cpu.max` (cpu) or `memory.high` (memory) by
 `target_load` of its capacity, journaled before it is written and restored
 on stop, when the sidecar disconnects, and at agent boot. The in-process
-host runs `burn` natively and rejects `quota` at decode (no cgroup
-authority). A fault lives as long as the sidecar's streaming request to
-the agent; its result lands on the sidecar's fault span as usual.
+host runs `burn` natively and skips `quota` rules per rule (no cgroup
+authority; a single `/admin/fault` slot gets a 400). A fault lives as long
+as the sidecar's streaming request to the agent; its result lands on the
+sidecar's fault span as usual.
 
 Not in this release: the manteion-side capability filter (M3), gRPC and
 the thin-client hook API (deferred), IPv6 original destinations, `quota`

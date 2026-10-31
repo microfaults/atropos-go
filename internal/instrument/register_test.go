@@ -226,20 +226,30 @@ func TestApply_ActiveFault_CPUStress(t *testing.T) {
 	}
 }
 
-func TestApply_ActiveFault_NetworkRequiresResolver(t *testing.T) {
+// TestApply_ActiveFault_NetworkWithoutResolverIsSkipped: a network slot this
+// host cannot run (host=proxy, no NetworkResolver) is skipped and counted
+// like any other unsupported slot instead of failing the whole sync.
+func TestApply_ActiveFault_NetworkWithoutResolverIsSkipped(t *testing.T) {
 	demo := &demoEvaluator{}
 	resp := wire.RegisterResponse{
-		RuleSync: wire.RuleSync{ActiveFaults: []wire.FaultRequest{{
-			Category:   "network",
-			FaultType:  "latency",
-			DurationMs: 5000,
-			Network:    &wire.NetworkEnvelope{Target: "redis"},
-			Params:     json.RawMessage(`{"delay":"100ms"}`),
-		}}},
+		RuleSync: wire.RuleSync{ActiveFaults: []wire.FaultRequest{
+			{
+				ID: "slot-net", Category: "network", FaultType: "latency", DurationMs: 5000,
+				Network: &wire.NetworkEnvelope{Target: "redis"},
+				Params:  json.RawMessage(`{"delay":"100ms"}`),
+			},
+			{ID: "slot-lat", Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"1ms"}`)},
+		}},
 	}
-	err := apply(resp, applyTargets{DemoEval: demo})
-	if err == nil {
-		t.Fatal("expected error: no resolver")
+	before := unsupportedCount(t, "network")
+	if err := apply(resp, applyTargets{DemoEval: demo}); err != nil {
+		t.Fatalf("apply must not fail on a network slot the host cannot run: %v", err)
+	}
+	if ids := demo.ActiveIDs(); len(ids) != 1 || ids[0] != "slot-lat" {
+		t.Fatalf("active slots = %v, want only the supported one", ids)
+	}
+	if got := unsupportedCount(t, "network") - before; got != 1 {
+		t.Fatalf("atropos_rules_unsupported_total{network} += %v, want 1", got)
 	}
 }
 

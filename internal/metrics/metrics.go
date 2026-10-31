@@ -80,8 +80,11 @@ var (
 
 	// RulesUnsupportedTotal counts rules a host skipped because it cannot
 	// execute their category or rule kind: a fault category outside its
-	// capabilities, or a composition. The category label carries that
-	// category or kind (design doc §5.3, D7: no silent drops).
+	// capabilities, a fault it lacks the means to run within a category it
+	// supports (a resource quota in-process; a network host=inline fault
+	// without an inline toxic host, host=proxy without a resolver), or a
+	// composition. The category label carries that category or kind (design
+	// doc §5.3, D7: no silent drops).
 	RulesUnsupportedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "atropos_rules_unsupported_total",
 		Help: "Rules skipped because this host cannot execute their category or rule kind.",

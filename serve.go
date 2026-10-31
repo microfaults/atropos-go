@@ -61,8 +61,9 @@ type Config struct {
 	InstanceID string
 
 	// NetworkResolver maps a logical network-fault target (e.g. "redis") to
-	// a (listen, upstream) proxy address pair. Required only to accept
-	// network-category faults; nil rejects them at decode time.
+	// a (listen, upstream) proxy address pair. Required only to run
+	// network-category faults (host=proxy); with nil such rules are skipped
+	// per rule, logged and counted in atropos_rules_unsupported_total.
 	NetworkResolver NetworkResolver
 
 	// TracerProvider, if set, is registered globally instead of building an

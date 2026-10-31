@@ -55,8 +55,8 @@ func resourceMechanism(params json.RawMessage) string {
 // InlineToxicHost builds the fault that hosts a network toxic whose
 // NetworkEnvelope.Host is "inline". A host that owns the proxied
 // connections (the atroposd sidecar) supplies one; the in-process host does
-// not, and inline network faults stay rejected there. name is the rule or
-// slot the fault belongs to (its fault-registry key).
+// not, and skips inline network rules per rule (an UnsupportedFaultError).
+// name is the rule or slot the fault belongs to (its fault-registry key).
 type InlineToxicHost func(name string, env *wire.NetworkEnvelope, toxic network.Toxic, base fault.FaultConfig) (fault.Fault, error)
 
 // DecodeOption is the exported name of decodeOption, for hosts that supply
@@ -73,7 +73,8 @@ type decodeOption func(*decodeConfig)
 
 // withNetworkResolver supplies the resolver that maps a logical target name
 // (e.g. "redis") to a listen and upstream address pair for network fault
-// proxies. Required when decoding rules whose Network.Host=="proxy".
+// proxies. Rules whose Network.Host is "proxy" (the default) need it;
+// without one they are skipped per rule (an UnsupportedFaultError).
 func withNetworkResolver(r wire.NetworkResolver) decodeOption {
 	return func(c *decodeConfig) { c.resolve = r }
 }
@@ -424,12 +425,10 @@ func decodeNetworkFault(name, faultType string, env *wire.NetworkEnvelope, param
 	case "inline":
 		// The toxic runs on the proxied connection of a host that owns
 		// one (the atroposd sidecar, via WithInlineToxicHost). The
-		// in-process host has no such connection and rejects it.
+		// in-process host has no such connection: it skips the rule
+		// per rule, like any other fault it cannot execute.
 		if cfg.inlineToxic == nil {
-			return nil, fmt.Errorf(
-				"network fault %q with host=%q: this host does not own proxied connections (in-process toxic host is not yet supported; use the atroposd sidecar)",
-				faultType, host,
-			)
+			return nil, &UnsupportedFaultError{Category: CapNetwork, FaultType: faultType + "/inline"}
 		}
 		toxic, err := decodeNetworkToxic(faultType, params)
 		if err != nil {
@@ -443,7 +442,9 @@ func decodeNetworkFault(name, faultType string, env *wire.NetworkEnvelope, param
 
 func decodeNetworkProxyFault(faultType string, env *wire.NetworkEnvelope, params json.RawMessage, baseCfg fault.FaultConfig, resolve wire.NetworkResolver) (fault.Fault, error) {
 	if resolve == nil {
-		return nil, fmt.Errorf("network fault %q with host=proxy requires a wire.NetworkResolver (use withNetworkResolver)", faultType)
+		// Nothing maps the target to a proxy address pair, so this host
+		// cannot run the fault: skipped per rule, not a malformed set.
+		return nil, &UnsupportedFaultError{Category: CapNetwork, FaultType: faultType + "/proxy"}
 	}
 	if env.Target == "" {
 		return nil, fmt.Errorf("network fault %q with host=proxy requires network.target", faultType)

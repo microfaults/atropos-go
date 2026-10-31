@@ -91,11 +91,12 @@ func TestRulesAdminHandler(t *testing.T) {
 		eval := evaluator.NewStaticEvaluator(wire.StaticRule{Name: "keep", Point: evaluator.Ingress})
 		handler := rulesAdminHandler(applyTargets{Evaluator: eval})
 
-		// An unknown category is a malformed set, not an unsupported rule:
-		// it fails the whole delivery and replaces nothing.
+		// Malformed params of a known category make the set unusable: it
+		// fails the whole delivery and replaces nothing. (An unknown category
+		// is not an example: a capability-gated host skips those per rule.)
 		body, err := json.Marshal([]wire.CompiledRule{{
 			Name: "bad", Mode: "inline",
-			Fault: &wire.CompiledFault{Category: "quantum", FaultType: "entangle", Params: json.RawMessage(`{}`)},
+			Fault: &wire.CompiledFault{Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"notaduration"}`)},
 		}})
 		if err != nil {
 			t.Fatalf("marshal: %v", err)
@@ -109,6 +110,39 @@ func TestRulesAdminHandler(t *testing.T) {
 		}
 		if rules := eval.Rules(); len(rules) != 1 || rules[0].Name != "keep" {
 			t.Fatalf("a rejected set must leave the current rules untouched, got %+v", rules)
+		}
+	})
+
+	t.Run("POST skips a network rule this host cannot run and applies the rest", func(t *testing.T) {
+		eval := evaluator.NewStaticEvaluator()
+		handler := rulesAdminHandler(applyTargets{Evaluator: eval}) // no NetworkResolver, no inline toxic host
+
+		body, err := json.Marshal([]wire.CompiledRule{
+			{Name: "net-proxy", Mode: "background", Fault: &wire.CompiledFault{
+				Category: "network", FaultType: "blackhole", DurationMs: 5000, Params: json.RawMessage(`{}`),
+				Network: &wire.NetworkEnvelope{Host: "proxy", Target: "redis"}}},
+			{Name: "net-inline", Mode: "background", Fault: &wire.CompiledFault{
+				Category: "network", FaultType: "latency", DurationMs: 5000, Params: json.RawMessage(`{"delay":"50ms"}`),
+				Network: &wire.NetworkEnvelope{Host: "inline", Target: "redis"}}},
+			{Name: "lat", Mode: "inline", Fault: &wire.CompiledFault{
+				Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"10ms"}`)}},
+		})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+
+		before := unsupportedCount(t, "network")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/rules", bytes.NewReader(body)))
+
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("expected 204, got %d: %s", rec.Code, rec.Body.String())
+		}
+		if rules := eval.Rules(); len(rules) != 1 || rules[0].Name != "lat" {
+			t.Fatalf("installed rules = %+v, want only the supported one", rules)
+		}
+		if got := unsupportedCount(t, "network") - before; got != 2 {
+			t.Fatalf("atropos_rules_unsupported_total{network} += %v, want 2", got)
 		}
 	})
 

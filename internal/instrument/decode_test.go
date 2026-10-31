@@ -2,7 +2,7 @@ package instrument
 
 import (
 	"encoding/json"
-	"strings"
+	"errors"
 	"testing"
 	"time"
 
@@ -325,42 +325,67 @@ func TestDecodeCompiledRules_NonNetworkRejectsEnvelope(t *testing.T) {
 	}
 }
 
-func TestDecodeCompiledRules_NetworkInlineHostNotYetSupported(t *testing.T) {
-	compiled := []wire.CompiledRule{{
-		Name: "net-inline-host",
-		Mode: "inline",
-		Fault: &wire.CompiledFault{
-			Category:   "network",
-			FaultType:  "latency",
-			Network:    &wire.NetworkEnvelope{Host: "inline"},
-			Params:     json.RawMessage(`{"delay":"50ms"}`),
-			DurationMs: 5000,
-		},
-	}}
-	_, err := decodeCompiledRules(compiled)
-	if err == nil {
-		t.Fatal("expected error: inline host without WithInlineToxicHost")
+// TestDecodeCompiledRules_NetworkRulesTheHostCannotRunAreSkippedAndCounted:
+// a network rule needs something the in-process host may lack -- an inline
+// toxic host for host=inline (the sidecar owns proxied connections), a
+// NetworkResolver for host=proxy. Without it the rule is skipped per rule,
+// counted under atropos_rules_unsupported_total{category="network"} and
+// logged, exactly like a quota resource fault; it never fails the set it
+// arrives in. A host that has the missing piece decodes the same rule.
+func TestDecodeCompiledRules_NetworkRulesTheHostCannotRunAreSkippedAndCounted(t *testing.T) {
+	toxicHost := WithInlineToxicHost(func(name string, env *wire.NetworkEnvelope, toxic network.Toxic, base fault.FaultConfig) (fault.Fault, error) {
+		return &inline.Latency{FaultConfig: base, Delay: time.Millisecond}, nil
+	})
+	resolver := withNetworkResolver(stubResolver(":19096", "localhost:6379"))
+	networkRule := func(host, faultType, params string) wire.CompiledRule {
+		return wire.CompiledRule{Name: "net-rule", Mode: "background", Fault: &wire.CompiledFault{
+			Category: "network", FaultType: faultType, DurationMs: 5000, Params: json.RawMessage(params),
+			Network: &wire.NetworkEnvelope{Host: host, Target: "redis"},
+		}}
 	}
-	if !strings.Contains(err.Error(), "does not own proxied connections") {
-		t.Errorf("error should say the host cannot run inline toxics, got: %v", err)
-	}
-}
+	sibling := wire.CompiledRule{Name: "lat", Mode: "inline", Fault: &wire.CompiledFault{
+		Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"10ms"}`)}}
 
-func TestDecodeCompiledRules_NetworkNoResolver(t *testing.T) {
-	compiled := []wire.CompiledRule{{
-		Name: "net-no-resolver",
-		Mode: "background",
-		Fault: &wire.CompiledFault{
-			Category:   "network",
-			FaultType:  "blackhole",
-			Network:    &wire.NetworkEnvelope{Host: "proxy", Target: "redis"},
-			Params:     json.RawMessage(`{}`),
-			DurationMs: 5000,
-		},
-	}}
-	_, err := decodeCompiledRules(compiled)
-	if err == nil {
-		t.Fatal("expected error: no resolver provided")
+	for _, tc := range []struct {
+		name        string
+		rule        wire.CompiledRule
+		opts        []decodeOption
+		wantSkipped string // the UnsupportedFaultError.FaultType, or "" when the rule applies
+	}{
+		{"inline host without an inline toxic host", networkRule("inline", "latency", `{"delay":"50ms"}`), nil, "latency/inline"},
+		{"inline host with an inline toxic host", networkRule("inline", "latency", `{"delay":"50ms"}`), []decodeOption{toxicHost}, ""},
+		{"proxy host without a resolver", networkRule("proxy", "blackhole", `{}`), nil, "blackhole/proxy"},
+		{"default host (proxy) without a resolver", networkRule("", "blackhole", `{}`), nil, "blackhole/proxy"},
+		{"proxy host with a resolver", networkRule("proxy", "blackhole", `{}`), []decodeOption{resolver}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// On its own the rule says what it cannot do, as a typed error.
+			_, err := decodeCompiledRule(tc.rule, tc.opts...)
+			var unsup *UnsupportedFaultError
+			switch {
+			case tc.wantSkipped == "" && err != nil:
+				t.Fatalf("decodeCompiledRule: %v, want the rule to decode", err)
+			case tc.wantSkipped != "" && (!errors.As(err, &unsup) || unsup.Category != "network" || unsup.FaultType != tc.wantSkipped):
+				t.Fatalf("decodeCompiledRule error = %v, want *UnsupportedFaultError{network, %s}", err, tc.wantSkipped)
+			}
+
+			// In a set it is skipped and counted; the rest of the set applies.
+			before := unsupportedCount(t, "network")
+			rules, err := decodeCompiledRules([]wire.CompiledRule{tc.rule, sibling}, tc.opts...)
+			if err != nil {
+				t.Fatalf("a rule the host cannot run must not fail the set: %v", err)
+			}
+			wantRules, wantCount := 2, 0.0
+			if tc.wantSkipped != "" {
+				wantRules, wantCount = 1, 1
+			}
+			if len(rules) != wantRules || rules[len(rules)-1].Name != "lat" {
+				t.Fatalf("rules = %+v, want %d with the sibling applied", rules, wantRules)
+			}
+			if got := unsupportedCount(t, "network") - before; got != wantCount {
+				t.Fatalf("atropos_rules_unsupported_total{network} += %v, want %v", got, wantCount)
+			}
+		})
 	}
 }
 

@@ -32,18 +32,22 @@ func AllCapabilities() []string {
 }
 
 // UnsupportedFaultError says this host cannot execute a rule: its fault's
-// category is outside the host's capabilities (or needs authority the host
-// lacks, such as a resource quota in-process), or the rule is a composition
+// category is outside the host's capabilities, or the host lacks something
+// the fault needs within a category it supports -- cgroup authority for a
+// resource quota (FaultType "<type>/quota"), an inline toxic host for a
+// network host=inline fault ("<type>/inline"), a NetworkResolver for a
+// network host=proxy fault ("<type>/proxy") -- or the rule is a composition
 // (Category is then CapComposition and FaultType the execution mode).
 // Rule decoding skips such rules per rule (counted, logged) instead of
-// failing the whole sync (design §5.3, D7).
+// failing the whole sync (design §5.3, D7); a single admin slot reports the
+// error as a 400.
 type UnsupportedFaultError struct {
 	Category  string
 	FaultType string
 }
 
 func (e *UnsupportedFaultError) Error() string {
-	return fmt.Sprintf("fault %s/%s: category %q is not supported by this host", e.Category, e.FaultType, e.Category)
+	return fmt.Sprintf("fault %s/%s is not supported by this host", e.Category, e.FaultType)
 }
 
 // WithCapabilities restricts decoding to the given fault categories; a

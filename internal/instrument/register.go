@@ -72,7 +72,8 @@ type applyTargets struct {
 	// CacheBox receives the freeze config. Required if resp.FreezeCfg is non-nil.
 	CacheBox *cachebox.CacheBox
 	// NetworkResolver maps logical targets to listen/upstream pairs for network
-	// fault proxies. Required if rules or active_fault contain network-category faults.
+	// fault proxies. Without one, rules and active faults with network
+	// host=proxy are skipped per rule and counted.
 	NetworkResolver wire.NetworkResolver
 	// CacheDrain, if set, observes every authoritative rule set applyRules
 	// installs -- polled, registered or pushed, and the empty set included
@@ -222,7 +223,7 @@ func applyActiveFault(req wire.FaultRequest, targets applyTargets) error {
 		var unsup *UnsupportedFaultError
 		if errors.As(err, &unsup) {
 			metrics.RulesUnsupportedTotal.WithLabelValues(unsup.Category).Inc()
-			slog.Default().Warn("active fault skipped: category not supported by this host",
+			slog.Default().Warn("active fault skipped: not executable by this host",
 				"slot", id, "category", unsup.Category, "fault_type", unsup.FaultType)
 			return nil
 		}

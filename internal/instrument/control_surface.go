@@ -14,7 +14,8 @@ type ControlConfig struct {
 	// (the health endpoint then reports "offline").
 	Client *ManteionClient
 	// NetworkResolver is forwarded to the rule decoders behind /admin/rules
-	// and /admin/fault; nil rejects network-category faults.
+	// and /admin/fault. With nil, /admin/rules skips network host=proxy
+	// rules per rule and /admin/fault rejects such a slot with 400.
 	NetworkResolver wire.NetworkResolver
 	// Host and Capture are stamped on /atropos/health ("in-process" |
 	// "sidecar"; "" | "explicit" | "transparent").

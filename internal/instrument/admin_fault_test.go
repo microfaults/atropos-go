@@ -347,3 +347,33 @@ func TestDemoEvaluator_IgnoresTransientPoint(t *testing.T) {
 		t.Fatalf("armed slot matched at Transient: %+v", d)
 	}
 }
+
+// TestFaultAdmin_PostUnsupportedByThisHostIs400: a single slot has no rest of
+// a set to protect, so what the in-process host cannot run is reported to the
+// caller as 400 (rule sets skip the same faults per rule). Nothing is armed.
+func TestFaultAdmin_PostUnsupportedByThisHostIs400(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want string // the unsupported fault named in the error
+	}{
+		{"resource quota", `{"category":"resource","fault_type":"cpu","duration_ms":5000,"params":{"target_load":0.5,"mechanism":"quota"}}`, "resource/cpu/quota"},
+		{"network host=inline", `{"category":"network","fault_type":"latency","duration_ms":5000,"network":{"host":"inline","target":"redis"},"params":{"delay":"100ms"}}`, "network/latency/inline"},
+		{"network host=proxy without a resolver", `{"category":"network","fault_type":"latency","duration_ms":5000,"network":{"target":"redis"},"params":{"delay":"100ms"}}`, "network/latency/proxy"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eval := &demoEvaluator{}
+			rec := httptest.NewRecorder()
+			faultAdminHandler(eval, nil, nil).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(tc.body)))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), tc.want) {
+				t.Fatalf("body = %s, want it to name %s", rec.Body.String(), tc.want)
+			}
+			if got := eval.ActiveIDs(); len(got) != 0 {
+				t.Fatalf("armed slots = %v, want none", got)
+			}
+		})
+	}
+}

@@ -218,7 +218,7 @@ type ConnectConfig struct {
 	// with no port). Out-of-process hosts pass their bound control address.
 	Address string
 	// NetworkResolver maps network-fault targets to (listen, upstream)
-	// pairs; nil rejects network-category faults at decode time.
+	// pairs; with nil, network host=proxy rules are skipped per rule.
 	NetworkResolver wire.NetworkResolver
 	Logger          *slog.Logger
 }

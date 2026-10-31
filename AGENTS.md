@@ -76,8 +76,9 @@ Common `params` examples: inline latency `{"delay","jitter"}`; inline error
 resource faults `mechanism` is `burn` (default: the stress code runs in the
 target's cgroup, via the node agent in sidecar mode) or `quota` (the node
 agent lowers the target cgroup's `cpu.max`/`memory.high` instead); the
-in-process host has no cgroup authority and rejects `quota` at decode. See
-`faultparams/params.go` for the full catalogue.
+in-process host has no cgroup authority, so it skips a `quota` fault per
+rule in a rule set (see `/admin/rules`) and rejects it with 400 as a single
+admin slot. See `faultparams/params.go` for the full catalogue.
 
 ### /admin/cachebox
 
@@ -104,12 +105,15 @@ host's capabilities, atomic replace, stop of background faults whose rule
 vanished, eager arming (sidecar) and cache-box drain observation happen
 exactly once per delivery. Rules this host cannot execute — categories
 outside its capabilities (unknown categories included), `mechanism: quota`
-resource faults on the in-process host, and composition rules — are skipped
-per rule, logged at WARN and counted in
-`atropos_rules_unsupported_total{category}` (`category="composition"` for
-compositions); the rest of the set still applies. Malformed params of a
-known category reject the whole set with 400. The push body carries no
-version, so the poll's rule version is left untouched.
+resource faults on the in-process host, network rules the in-process host
+has nothing to run (`host=inline`, which needs the sidecar's inline toxic
+host, or `host=proxy` without a `NetworkResolver`), and composition rules —
+are skipped per rule, logged at WARN and counted in
+`atropos_rules_unsupported_total{category}` (`category="network"` for the
+network cases, `category="composition"` for compositions); the rest of the
+set still applies. Malformed params of a known category reject the whole set
+with 400. The push body carries no version, so the poll's rule version is
+left untouched.
 
 ## SDK Bootstrap
 
@@ -149,10 +153,10 @@ and the fidelity endpoint alike.
 
 ### Limitations (current)
 
-- The rule decoder supports all three fault categories: inline (latency, error, hang), network (latency, retransmit_delay, blackhole, drip, rst, throttle), and resource (cpu, disk, io, memory). Network faults require `Config.NetworkResolver`. A host executes only the categories in its capability set; a rule outside it, an unknown category included, is skipped per rule and counted (see `/admin/rules`).
-- The `host=inline` path on network faults (per-request response shaping via RoundTripper) is recognized by the wire format but rejected with a v6 deferral error until `ToxicTransport` is implemented.
+- The rule decoder supports all three fault categories: inline (latency, error, hang), network (latency, retransmit_delay, blackhole, drip, rst, throttle), and resource (cpu, disk, io, memory). Network `host=proxy` faults (the default) need `Config.NetworkResolver`. A host executes only the categories in its capability set; a rule outside it, an unknown category included, is skipped per rule and counted (see `/admin/rules`).
+- Network faults with `host=inline` run in the atroposd sidecar, which executes them as armed proxy policies through `ToxicTransport` (see below). The in-process host has no proxied connection to shape, so it skips such rules per rule (logged at WARN, counted under `atropos_rules_unsupported_total{category="network"}`) and rejects a single `/admin/fault` slot with 400; `host=proxy` without a `NetworkResolver` is handled the same way.
 - Composition rules are skipped per rule on decode (logged at WARN, counted under `atropos_rules_unsupported_total{category="composition"}`) — the SDK has no composition evaluator yet (parallel/sequential fault dispatch with direction inheritance is future work).
-- `DecodeCompiledRules` sorts decoded rules by `Priority` descending (higher = evaluated first). Equal-priority rules preserve input order.
+- The unexported `decodeCompiledRules` (`internal/instrument/decode.go`) sorts decoded rules by `Priority` descending (higher = evaluated first). Equal-priority rules preserve input order.
 - Transient (taxonomy 1.3) is implemented for HTTP ingress. Once the response is complete — the handler returned, or an inline error fault short-circuited it — the Transient point is evaluated with the ingress labels plus `atropos.http.status_code`, and a matching fault is started asynchronously on its own goroutine, so the response is never delayed by it (a failed start is only logged). A matching fault always runs in background mode through the fault registry (inline mode is meaningless after the response and is not honoured), detached from the request's cancellation but with its span parented on the request's server span. Armed `/admin/fault` slots and eager arming do not apply at Transient. The gRPC interceptors and `Hook` do not evaluate it.
 
 ## atroposd (sidecar host)
@@ -165,4 +169,4 @@ comma-separated `listen=upstream` pairs and an optional
 `ATROPOSD_INGRESS_ADDR`/`ATROPOSD_INBOUND_UPSTREAM`. Sidecar-only
 behaviours: `network.host: inline` faults become armed proxy policies
 (`internal/proxy.PolicyTable`), and background faults arm when their rule
-applies (`CoreConfig.EagerArm`).
+applies (except Transient rules; `CoreConfig.EagerArm`).
