@@ -1,6 +1,7 @@
 package instrument
 
 import (
+	"bufio"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -121,5 +122,102 @@ func TestIngressMiddleware_TransientThroughFullComposition(t *testing.T) {
 	case p := <-points:
 		t.Fatalf("unexpected second injection point %q, want exactly [transient]", p)
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// TestIngressMiddleware_FlushReachesClientBeforeHandlerReturns: an SSE-style
+// handler flushes an event while it is still running. The writer it sees is
+// the fault middleware's recorder, wrapped by otelhttp, wrapped by the
+// metrics recorder, wrapped by the server's: each layer must forward Flush,
+// or the client waits for the handler to return and streaming is silently
+// buffered.
+func TestIngressMiddleware_FlushReachesClientBeforeHandlerReturns(t *testing.T) {
+	ic := interceptor.New(nil, nil)
+	returned := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(IngressMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(returned)
+		fl, ok := w.(http.Flusher)
+		if !ok {
+			t.Errorf("the handler's writer %T is not an http.Flusher", w)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: one\n\n")
+		fl.Flush()
+		select {
+		case <-release: // the client has seen the first event
+		case <-time.After(2 * time.Second): // bound the failure: the flush never arrived
+		}
+		_, _ = io.WriteString(w, "data: two\n\n")
+	}), "svc", ic))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	br := bufio.NewReader(resp.Body)
+	first, err := br.ReadString('\n')
+	if err != nil || first != "data: one\n" {
+		t.Fatalf("first event = %q, err=%v, want %q", first, err, "data: one\n")
+	}
+	select {
+	case <-returned:
+		t.Fatal("the handler had already returned when the first event arrived: Flush did not reach the client through the ingress stack")
+	default:
+	}
+	close(release)
+	rest, err := io.ReadAll(br)
+	if err != nil || string(rest) != "\ndata: two\n\n" {
+		t.Fatalf("rest of the stream = %q, err=%v, want the blank line and the second event", rest, err)
+	}
+}
+
+// TestIngressMiddleware_HijackThroughFullComposition: a handler that takes
+// over the connection via http.ResponseController gets it, through every
+// layer's Unwrap, and can write a raw response on it (websocket upgrades and
+// raw TCP handoffs rely on this).
+func TestIngressMiddleware_HijackThroughFullComposition(t *testing.T) {
+	ic := interceptor.New(nil, nil)
+	hijackErr := make(chan error, 1)
+	srv := httptest.NewServer(IngressMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, rw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			hijackErr <- err
+			return
+		}
+		defer conn.Close()
+		_, err = rw.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nhijacked")
+		if err == nil {
+			err = rw.Flush()
+		}
+		hijackErr <- err
+	}), "svc", ic))
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("GET: %v (the handler could not hijack: %v)", err, drain(hijackErr))
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || string(body) != "hijacked" {
+		t.Fatalf("response = %d %q, want the raw 200 hijacked written on the hijacked connection (hijack error: %v)",
+			resp.StatusCode, body, drain(hijackErr))
+	}
+	if err := <-hijackErr; err != nil {
+		t.Fatalf("hijack/write: %v", err)
+	}
+}
+
+// drain returns the error waiting on ch, or nil if none is.
+func drain(ch <-chan error) error {
+	select {
+	case err := <-ch:
+		return err
+	default:
+		return nil
 	}
 }

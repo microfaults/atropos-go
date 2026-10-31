@@ -1,11 +1,16 @@
 package interceptor
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -33,7 +38,10 @@ func TestStartTransient_ForcesBackgroundThroughRegistry(t *testing.T) {
 	i := New(nil, trace.Noop(), WithRegistry(reg), WithInjectionHook(func(_, point string) { points = append(points, point) }))
 	req := evaluator.Request{Point: evaluator.Transient}
 
-	cr, err := i.StartTransient(context.Background(), req, inlineLatencyDecision("after", time.Second))
+	// The delay far outlasts the test: the fault can only end early if the
+	// registry stops it (an expired delay would also satisfy a done-channel
+	// check, which is how a no-op Stop used to pass).
+	cr, err := i.StartTransient(context.Background(), req, inlineLatencyDecision("after", 30*time.Second))
 	if err != nil || cr.Handle == nil {
 		t.Fatalf("StartTransient: handle=%v err=%v", cr.Handle, err)
 	}
@@ -44,14 +52,17 @@ func TestStartTransient_ForcesBackgroundThroughRegistry(t *testing.T) {
 		t.Fatalf("injection hook points = %v, want [transient]", points)
 	}
 	// Registry path: a second start under the same rule joins instead of starting.
-	again, err := i.StartTransient(context.Background(), req, inlineLatencyDecision("after", time.Second))
+	again, err := i.StartTransient(context.Background(), req, inlineLatencyDecision("after", 30*time.Second))
 	if err != nil || again.Handle != nil {
 		t.Fatalf("second start: handle=%v err=%v, want a deduplicated join", again.Handle, err)
 	}
 	// Stoppable by rule name, as rule removal requires.
 	reg.Stop("after")
 	select {
-	case <-cr.Handle.Done():
+	case res := <-cr.Handle.Done():
+		if !errors.Is(res.Err, context.Canceled) {
+			t.Fatalf("stopped transient fault ended with err = %v, want context.Canceled", res.Err)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("transient fault did not stop through the registry")
 	}
@@ -320,6 +331,89 @@ func TestIngressMiddleware_TransientAfterInlineError(t *testing.T) {
 	}
 }
 
+// panicStartFault panics inside Start, as a buggy fault implementation, the
+// tracer or the injection hook could. It counts the starts that reach it.
+type panicStartFault struct{ attempts atomic.Int32 }
+
+func (f *panicStartFault) Validate() error { return nil }
+func (f *panicStartFault) Start(context.Context) (*fault.Handle, error) {
+	f.attempts.Add(1)
+	panic("boom")
+}
+
+// syncBuffer is a goroutine-safe sink for the standard logger.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// TestIngressMiddleware_TransientStartPanicIsContained: the start runs on its
+// own goroutine, beyond net/http's per-connection recover, so a panic in
+// Fault.Start (or the tracer, or the injection hook) would take the host
+// process down. It must be recovered and logged, the response must complete
+// normally, and a later request must still work: its start reaches
+// Fault.Start too, so neither the registry lock nor the middleware was left
+// wedged by the first panic.
+func TestIngressMiddleware_TransientStartPanicIsContained(t *testing.T) {
+	var logs syncBuffer
+	prev := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	reg := NewFaultRegistry()
+	t.Cleanup(func() {
+		// Close takes the registry lock: if a panic had left it held, fail
+		// instead of hanging the package.
+		done := make(chan struct{})
+		go func() { reg.Close(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("registry Close hung: a panicking Start left its lock held")
+		}
+	})
+	boom := &panicStartFault{}
+	i := New(evaluator.NewStaticEvaluator(transientRule("boom", nil, boom)), trace.Noop(), WithRegistry(reg))
+	h := i.IngressMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte("ok"))
+	}))
+
+	for n := 1; n <= 2; n++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", "/x", nil))
+		if rec.Code != http.StatusAccepted || rec.Body.String() != "ok" {
+			t.Fatalf("request %d: response = %d %q, want 202 ok", n, rec.Code, rec.Body.String())
+		}
+	}
+
+	// Each start panics on its own goroutine; both must be recovered and logged.
+	const want = "atropos: transient start panic: boom"
+	deadline := time.Now().Add(2 * time.Second)
+	for strings.Count(logs.String(), want) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("recovered panics logged = %d (Fault.Start reached %d times), want 2 of each; log:\n%s",
+				strings.Count(logs.String(), want), boom.attempts.Load(), logs.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := boom.attempts.Load(); got != 2 {
+		t.Fatalf("Fault.Start reached %d times, want 2", got)
+	}
+}
+
 // TestStatusRecorder pins the status the Transient label is built from: 200
 // until the handler writes, the first WriteHeader wins, a bare Write is 200,
 // and Unwrap exposes the underlying writer for http.ResponseController.
@@ -341,5 +435,48 @@ func TestStatusRecorder(t *testing.T) {
 	}
 	if r.Unwrap() != w {
 		t.Fatal("Unwrap must return the underlying writer")
+	}
+}
+
+// statusLog records every status code forwarded to the writer it wraps.
+type statusLog struct {
+	http.ResponseWriter
+	codes []int
+}
+
+func (s *statusLog) WriteHeader(code int) {
+	s.codes = append(s.codes, code)
+	s.ResponseWriter.WriteHeader(code)
+}
+
+// TestStatusRecorder_InformationalStatusIsNotFinal: net/http sends a 1xx
+// other than 101 as an informational response and lets the handler go on to
+// write the final status (103 Early Hints, then 500), so the recorder must
+// forward it without recording it -- the Transient label and the request
+// metrics read the final status. 101 Switching Protocols is the one 1xx that
+// is final.
+func TestStatusRecorder_InformationalStatusIsNotFinal(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		do        func(http.ResponseWriter)
+		want      int
+		forwarded []int
+	}{
+		{"103 then 500", func(w http.ResponseWriter) { w.WriteHeader(103); w.WriteHeader(500) }, 500, []int{103, 500}},
+		{"100 and 103 then 201", func(w http.ResponseWriter) { w.WriteHeader(100); w.WriteHeader(103); w.WriteHeader(201) }, 201, []int{100, 103, 201}},
+		{"103 then an implicit 200", func(w http.ResponseWriter) { w.WriteHeader(103); _, _ = w.Write([]byte("x")) }, 200, []int{103}},
+		{"101 is final", func(w http.ResponseWriter) { w.WriteHeader(101); w.WriteHeader(500) }, 101, []int{101, 500}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			under := &statusLog{ResponseWriter: httptest.NewRecorder()}
+			r := NewStatusRecorder(under)
+			tc.do(r)
+			if r.Status() != tc.want {
+				t.Fatalf("recorded status = %d, want %d", r.Status(), tc.want)
+			}
+			if !slices.Equal(under.codes, tc.forwarded) {
+				t.Fatalf("forwarded WriteHeader calls = %v, want %v (every call is forwarded, in order)", under.codes, tc.forwarded)
+			}
+		})
 	}
 }

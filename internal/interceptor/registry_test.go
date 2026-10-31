@@ -228,3 +228,41 @@ func TestRegistry_StopUnknownKeyAndNil(t *testing.T) {
 	var nilReg *FaultRegistry
 	nilReg.Stop("x") // no-op, no panic
 }
+
+// TestRegistry_PanickingStartReleasesTheLock: startFn runs under the registry
+// lock. When a fault's Start panics, the panic must still reach the caller
+// and the lock must come free -- a mutex left held would hang Stop, Close and
+// every later start (the admin DELETE and the SDK shutdown among them).
+func TestRegistry_PanickingStartReleasesTheLock(t *testing.T) {
+	r := NewFaultRegistry()
+
+	func() {
+		defer func() {
+			if p := recover(); p != "boom" {
+				t.Fatalf("recovered %v, want the Start panic to propagate to the caller", p)
+			}
+		}()
+		_, _, _ = r.StartOrJoin("k", evaluator.DeduplicateByRule, func(context.Context) (*fault.Handle, error) {
+			panic("boom")
+		})
+		t.Fatal("StartOrJoin returned normally; the panic must propagate")
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h, deduped, err := r.StartOrJoin("k", evaluator.DeduplicateByRule, func(ctx context.Context) (*fault.Handle, error) {
+			return newStubFault(time.Hour).Start(ctx)
+		})
+		if err != nil || deduped || h == nil {
+			t.Errorf("start after the panic: handle=%v deduped=%v err=%v, want a fresh start", h, deduped, err)
+		}
+		r.Stop("k")
+		r.Close()
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("registry is wedged: a panicking Start left its lock held")
+	}
+}

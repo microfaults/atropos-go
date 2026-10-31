@@ -26,9 +26,11 @@ import (
 	"time"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
+	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 // serveOffline embeds a trivial business handler with no control plane and
@@ -234,6 +236,79 @@ func TestServe_BusinessThroughMiddleware_ControlBypassed(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed >= 250*time.Millisecond {
 		t.Fatalf("business request still slow (%v) after disarm", elapsed)
+	}
+}
+
+// TestServe_TransientFaultSpanJoinsTheRequestTrace pins the Transient span's
+// parenting with the production tracer (the interceptor unit tests use a
+// recording stub): a Transient rule pushed through /admin/rules fires once
+// the response is complete, and its fault span is a child of the request's
+// server span, in the same trace, tagged with the transient injection point.
+func TestServe_TransientFaultSpanJoinsTheRequestTrace(t *testing.T) {
+	biz := http.NewServeMux()
+	biz.HandleFunc("GET /work", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "done")
+	})
+	ts, exporter := serveOffline(t, Config{Service: "transient-span-test", Handler: biz})
+
+	code, body := postJSON(t, ts.URL+"/admin/rules", `[{
+		"name": "after-200",
+		"injection_point": "transient",
+		"mode": "inline",
+		"labels": {"atropos.http.status_code": "200"},
+		"fault": {"category": "inline", "fault_type": "latency", "params": {"delay": "20ms"}}
+	}]`)
+	if code != http.StatusNoContent {
+		t.Fatalf("push transient rule: code=%d body=%q", code, body)
+	}
+
+	exporter.Reset()
+	if code, body := mustGet(t, ts.URL+"/work"); code != 200 || body != "done" {
+		t.Fatalf("/work: code=%d body=%q", code, body)
+	}
+
+	// The fault starts on its own goroutine and its span ends after the 20ms
+	// delay, so wait for both spans to be exported.
+	var faultSpan, serverSpan *tracetest.SpanStub
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		faultSpan, serverSpan = nil, nil
+		spans := exporter.GetSpans()
+		for i := range spans {
+			switch {
+			case spans[i].Name == trace.SpanFaultInject:
+				faultSpan = &spans[i]
+			case spans[i].SpanKind == oteltrace.SpanKindServer:
+				serverSpan = &spans[i]
+			}
+		}
+		if faultSpan != nil && serverSpan != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			names := make([]string, 0, len(spans))
+			for _, s := range spans {
+				names = append(names, s.Name)
+			}
+			t.Fatalf("after 3s the exporter has spans %v; want the %q span and the server span", names, trace.SpanFaultInject)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !faultSpan.Parent.IsValid() || faultSpan.Parent.SpanID() != serverSpan.SpanContext.SpanID() {
+		t.Fatalf("fault span parent = %s, want the server span %s", faultSpan.Parent.SpanID(), serverSpan.SpanContext.SpanID())
+	}
+	if faultSpan.SpanContext.TraceID() != serverSpan.SpanContext.TraceID() {
+		t.Fatalf("fault span trace = %s, want the request's trace %s", faultSpan.SpanContext.TraceID(), serverSpan.SpanContext.TraceID())
+	}
+	point := ""
+	for _, a := range faultSpan.Attributes {
+		if string(a.Key) == trace.AttrFaultInjectionPoint {
+			point = a.Value.AsString()
+		}
+	}
+	if point != "transient" {
+		t.Fatalf("%s = %q, want transient", trace.AttrFaultInjectionPoint, point)
 	}
 }
 

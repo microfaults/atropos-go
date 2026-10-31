@@ -57,30 +57,18 @@ func NewFaultRegistry() *FaultRegistry {
 // startFn receives the registry's context (see the type comment) and runs
 // under the registry lock -- fault Start implementations only validate and
 // spawn, so this serializes control-plane fault starts, not request
-// traffic.
+// traffic. A panic in startFn propagates to the caller, but the lock is
+// released first: a mutex left held would hang Stop, Close and every later
+// start.
 func (r *FaultRegistry) StartOrJoin(
 	key string,
 	policy evaluator.StartPolicy,
 	startFn func(ctx context.Context) (*fault.Handle, error),
 ) (*fault.Handle, bool, error) {
-	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
-		return nil, false, errRegistryClosed
+	h, deduped, err := r.admit(key, policy, startFn)
+	if err != nil || deduped {
+		return nil, deduped, err
 	}
-	if policy == evaluator.DeduplicateByRule && len(r.active[key]) > 0 {
-		r.mu.Unlock()
-		return nil, true, nil
-	}
-
-	h, err := startFn(r.ctx)
-	if err != nil {
-		r.mu.Unlock()
-		return nil, false, err
-	}
-	r.active[key] = append(r.active[key], h)
-	r.wg.Add(1)
-	r.mu.Unlock()
 
 	// Handle.SetOnResult fires immediately if the fault already finished,
 	// so a near-instant fault cannot leak its tracking entry.
@@ -100,6 +88,33 @@ func (r *FaultRegistry) StartOrJoin(
 		r.wg.Done()
 	})
 
+	return h, false, nil
+}
+
+// admit is StartOrJoin's locked section: refuse once closed, join an
+// already-running fault under DeduplicateByRule, or run startFn and track
+// the handle it returns. The deferred unlock is what keeps a panicking
+// startFn from leaving the lock held.
+func (r *FaultRegistry) admit(
+	key string,
+	policy evaluator.StartPolicy,
+	startFn func(ctx context.Context) (*fault.Handle, error),
+) (*fault.Handle, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil, false, errRegistryClosed
+	}
+	if policy == evaluator.DeduplicateByRule && len(r.active[key]) > 0 {
+		return nil, true, nil
+	}
+
+	h, err := startFn(r.ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	r.active[key] = append(r.active[key], h)
+	r.wg.Add(1)
 	return h, false, nil
 }
 

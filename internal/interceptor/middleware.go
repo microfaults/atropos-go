@@ -69,8 +69,11 @@ func (i *Interceptor) IngressMiddleware(next http.Handler) http.Handler {
 // delayed by it. The goroutine gets the request's context snapshotted here
 // and detached from the request's cancellation, keeping the trace parent;
 // it never touches r, so the request may finish while the fault starts. A
-// start failure is only logged. Cache-box decisions have no meaning here
-// and are ignored.
+// start failure is only logged, and so is a panic in the start (the fault,
+// the tracer or the injection hook): the goroutine is beyond net/http's
+// per-connection recover, so without its own an escaped panic would take
+// the host process down. Cache-box decisions have no meaning here and are
+// ignored.
 func (i *Interceptor) transient(r *http.Request, labels map[string]string, status int) {
 	tl := maps.Clone(labels)
 	tl[trace.AttrHTTPStatusCode] = strconv.Itoa(status)
@@ -81,6 +84,11 @@ func (i *Interceptor) transient(r *http.Request, labels map[string]string, statu
 		return
 	}
 	go func() {
+		defer func() {
+			if p := recover(); p != nil {
+				log.Printf("atropos: transient start panic: %v", p)
+			}
+		}()
 		if _, err := i.StartTransient(ctx, req, d); err != nil {
 			log.Printf("atropos: transient check error: %v", err)
 		}
