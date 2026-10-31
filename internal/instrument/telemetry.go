@@ -7,16 +7,13 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/contrib/exporters/autoexport"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	oteltrace "go.opentelemetry.io/otel/trace"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 // telemetryConfig is the OTel bootstrap input. Serve fills it from Config;
@@ -25,9 +22,6 @@ type telemetryConfig struct {
 	serviceName    string
 	serviceVersion string
 	environment    string // "" = "development"
-	endpoint       string // "" = env (OTEL_EXPORTER_OTLP_ENDPOINT, COLLECTOR_SERVICE_ADDR), then localhost
-	useHTTP        bool   // OTLP over HTTP instead of gRPC
-	secure         bool   // TLS on the exporter; default insecure (lab clusters)
 	sampler        sdktrace.Sampler
 	tracerProvider oteltrace.TracerProvider // BYO: registered globally, caller owns shutdown
 }
@@ -48,56 +42,11 @@ func initTelemetry(ctx context.Context, cfg telemetryConfig) (func(context.Conte
 		return func(context.Context) error { return nil }, nil
 	}
 
-	// Resolve OTLP endpoint.
-	endpoint := cfg.endpoint
-	if endpoint == "" {
-		endpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-	}
-	if endpoint == "" {
-		endpoint = os.Getenv("COLLECTOR_SERVICE_ADDR")
-	}
-	if endpoint == "" {
-		if cfg.useHTTP {
-			endpoint = "localhost:4318"
-		} else {
-			endpoint = "localhost:4317"
-		}
-	}
-
-	var exporter sdktrace.SpanExporter
-	var err error
-
-	if cfg.useHTTP {
-		// OTLP HTTP: WithEndpoint expects "host:port", but env vars like
-		// OTEL_EXPORTER_OTLP_ENDPOINT typically carry a full URL. Split on
-		// the scheme to pick the right option.
-		var exporterOpts []otlptracehttp.Option
-		if strings.Contains(endpoint, "://") {
-			exporterOpts = append(exporterOpts, otlptracehttp.WithEndpointURL(endpoint))
-		} else {
-			exporterOpts = append(exporterOpts, otlptracehttp.WithEndpoint(endpoint))
-		}
-		if !cfg.secure {
-			exporterOpts = append(exporterOpts, otlptracehttp.WithInsecure())
-		}
-		exporter, err = otlptracehttp.New(ctx, exporterOpts...)
-	} else {
-		dialOpts := []grpc.DialOption{}
-		if !cfg.secure {
-			dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		}
-		exporterOpts := []otlptracegrpc.Option{
-			otlptracegrpc.WithEndpoint(endpoint),
-			otlptracegrpc.WithDialOption(dialOpts...),
-		}
-		if !cfg.secure {
-			exporterOpts = append(exporterOpts, otlptracegrpc.WithInsecure())
-		}
-		exporter, err = otlptracegrpc.New(ctx, exporterOpts...)
-	}
-
+	// The span exporter is chosen by the standard OTEL_* environment (see
+	// newSpanExporter).
+	exporter, err := newSpanExporter(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("atropos: init otlp exporter: %w", err)
+		return nil, fmt.Errorf("atropos: init span exporter: %w", err)
 	}
 
 	serviceName := cfg.serviceName
@@ -142,9 +91,69 @@ func initTelemetry(ctx context.Context, cfg telemetryConfig) (func(context.Conte
 	return tp.Shutdown, nil
 }
 
-// TelemetryConfig is the host-facing OTel bootstrap input. Endpoint,
-// transport and sampler come from the environment (OTEL_EXPORTER_OTLP_ENDPOINT
-// > COLLECTOR_SERVICE_ADDR > localhost:4317, insecure, AlwaysSample).
+// applyExporterEnvFallback maps the bed's COLLECTOR_SERVICE_ADDR onto the
+// standard OTLP variables when they are unset, and keeps the legacy
+// schemeless endpoint form working: the OTLP exporters parse
+// OTEL_EXPORTER_OTLP_ENDPOINT as a URL (a bare host:port yields an empty
+// host), and autoexport defaults to http/protobuf while every schemeless
+// endpoint this SDK ever accepted was a gRPC collector port. It mutates the
+// process environment so autoexport and the exporters see one truth.
+//
+// An OTEL_EXPORTER_OTLP_ENDPOINT that is already a URL is left alone, and so
+// is an environment that names no endpoint at all (the exporters' own
+// defaults apply). Otherwise the endpoint gets an http:// scheme if it lacks
+// one and the protocol becomes grpc unless the environment already names one.
+// The result holds the variables set and their values, empty when nothing
+// changed; a second call changes nothing.
+func applyExporterEnvFallback() map[string]string {
+	const (
+		endpointKey = "OTEL_EXPORTER_OTLP_ENDPOINT"
+		protocolKey = "OTEL_EXPORTER_OTLP_PROTOCOL"
+		addrKey     = "COLLECTOR_SERVICE_ADDR"
+	)
+	applied := map[string]string{}
+	set := func(key, value string) {
+		if err := os.Setenv(key, value); err == nil {
+			applied[key] = value
+		}
+	}
+
+	explicit := os.Getenv(endpointKey)
+	endpoint := explicit
+	if endpoint == "" {
+		endpoint = os.Getenv(addrKey)
+	}
+	if endpoint == "" || strings.Contains(explicit, "://") {
+		// No endpoint named, or the standard variable already holds a URL.
+		return applied
+	}
+	if !strings.Contains(endpoint, "://") {
+		endpoint = "http://" + endpoint
+	}
+	set(endpointKey, endpoint)
+	if os.Getenv(protocolKey) == "" {
+		set(protocolKey, "grpc")
+	}
+	return applied
+}
+
+// newSpanExporter builds the span exporter the environment selects:
+// OTEL_TRACES_EXPORTER (otlp by default, console, none) and, for otlp,
+// OTEL_EXPORTER_OTLP_PROTOCOL and the other OTEL_EXPORTER_OTLP_* variables,
+// after applyExporterEnvFallback.
+func newSpanExporter(ctx context.Context) (sdktrace.SpanExporter, error) {
+	applyExporterEnvFallback()
+	return autoexport.NewSpanExporter(ctx)
+}
+
+// TelemetryConfig is the host-facing OTel bootstrap input. The span exporter
+// comes from the environment through contrib autoexport: OTEL_TRACES_EXPORTER
+// (otlp by default, console, none), OTEL_EXPORTER_OTLP_ENDPOINT,
+// OTEL_EXPORTER_OTLP_PROTOCOL (grpc or http/protobuf; autoexport defaults to
+// http/protobuf) and the other OTEL_EXPORTER_OTLP_* variables the exporters
+// read. The bed's COLLECTOR_SERVICE_ADDR, and a schemeless
+// OTEL_EXPORTER_OTLP_ENDPOINT such as otel-collector:4317, still work and
+// mean a gRPC collector. The sampler is AlwaysSample.
 type TelemetryConfig struct {
 	ServiceName    string
 	ServiceVersion string

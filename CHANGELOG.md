@@ -4,6 +4,10 @@ All notable changes to atropos-go are documented in this file.
 
 ## Unreleased
 
+### Changed — Telemetry (ADR-3)
+
+- Exporters are selected by `OTEL_TRACES_EXPORTER` / `OTEL_LOGS_EXPORTER` / `OTEL_EXPORTER_OTLP_*` through contrib `autoexport`; `COLLECTOR_SERVICE_ADDR` and a schemeless `OTEL_EXPORTER_OTLP_ENDPOINT` still work and imply gRPC.
+
 ### Changed — Desired-state protocol v1 (ADR-2)
 
 The in-process host (`Serve`) and the atroposd sidecar converge on manteion's materialized desired state (contract: `docs/plans/2026-10-30-desired-state-protocol.md`). The wire additions are additive, and `version` keeps its name (it now carries the generation).

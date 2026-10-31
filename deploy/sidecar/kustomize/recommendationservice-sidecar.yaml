@@ -59,7 +59,9 @@ spec:
             - name: MANTEION_ADVERTISE_ADDR
               value: "$(POD_IP):16020"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: otel-collector:4317
+              value: http://otel-collector:4317
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: grpc
             - name: ATROPOSD_CAPTURE
               value: transparent
             - name: ATROPOSD_INBOUND_PORTS
