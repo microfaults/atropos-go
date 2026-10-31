@@ -29,6 +29,8 @@ components:
       type: object
     atropos.CacheBoxStats:
       properties:
+        delay:
+          $ref: '#/components/schemas/cachebox.DelayStats'
         recordBuffer:
           $ref: '#/components/schemas/cachebox.RecordBufferStats'
         recorder:
@@ -266,17 +268,20 @@ components:
     atropos.NetworkEnvelope:
       properties:
         direction:
-          description: 'Direction selects which half of a proxied connection to apply
-            the
-
-            toxic to. Required when Host=="proxy". For Host=="inline" only
-
-            "downstream" (response body) is meaningful.'
+          description: "Direction selects which half of a proxied connection to apply\
+            \ the\ntoxic to: \"upstream\" (client \u2192 server, request bytes) or\
+            \ \"downstream\"\n(server \u2192 client, response bytes). It defaults\
+            \ to \"upstream\" with\nHost==\"proxy\" and to \"downstream\" with Host==\"\
+            inline\"."
           type: string
         host:
           description: "Host selects where the toxic runs.\n  \"proxy\"  \u2192 TCP\
-            \ proxy sidecar (current behaviour; requires NetworkResolver)\n  \"inline\"\
-            \ \u2192 in-process RoundTripper wrapping response.Body (not yet supported)"
+            \ proxy (requires a NetworkResolver; the in-process default)\n  \"inline\"\
+            \ \u2192 armed policy on the atroposd sidecar's proxied upstream calls\n\
+            The in-process host has no proxied connection to shape: it skips a rule\n\
+            with Host==\"inline\" (reported as unsupported) and rejects a single\n\
+            /admin/fault slot with 400. An empty Host means \"inline\" on a host that\n\
+            owns the proxied connections (the sidecar) and \"proxy\" in-process."
           type: string
         scope:
           description: 'Scope is the fraction of connections (proxy) or requests (inline)
@@ -284,12 +289,16 @@ components:
             to which the toxic applies. Zero means 1.0 (all).'
           type: number
         target:
-          description: 'Target is the logical name of the upstream service, resolved
-            by
+          description: 'Target is the logical name of the upstream service. Required
+            for both
 
-            NetworkResolver into a (listen, upstream) address pair.
+            hosts. With Host=="proxy" a NetworkResolver turns it into a
 
-            Required when Host=="proxy"; ignored when Host=="inline".'
+            (listen, upstream) address pair; with Host=="inline" it is the
+
+            upstream''s host or host:port, matched against the outbound request''s
+
+            host (a target without a port matches any port).'
           type: string
       type: object
     atropos.PreloadAbortRequest:
@@ -367,6 +376,71 @@ components:
         ok:
           type: boolean
       type: object
+    atropos.ReplaySetRef:
+      description: 'ReplaySet is the replay set desired on this instance: absent means
+        no replay
+
+        set is desired, so the instance clears one it holds.'
+      properties:
+        count:
+          type: integer
+        experiment_id:
+          type: string
+        id:
+          type: string
+        key_strategy:
+          type: string
+        phase_id:
+          type: string
+        sha256:
+          description: W5 digest over entries (cachebox.SetChecksum)
+          type: string
+        size_bytes:
+          type: integer
+        url:
+          description: relative to the manteion base URL
+          type: string
+      type: object
+    atropos.ReplaySetStatus:
+      properties:
+        id:
+          type: string
+        state:
+          description: ReplaySetFetching | ReplaySetCommitted | ReplaySetFailed
+          type: string
+      type: object
+    atropos.RuleSync:
+      properties:
+        active_faults:
+          items:
+            $ref: '#/components/schemas/atropos.FaultRequest'
+          type: array
+          uniqueItems: false
+        etag:
+          description: 'Etag is the ETag of this materialized document: a hash of
+            its content
+
+            alone, never the generation (that travels in Version and in the
+
+            X-Atropos-Generation header), so an unchanged document keeps its ETag
+
+            while the generation moves. The instance treats it as opaque and sends
+
+            it back as `If-None-Match`.'
+          type: string
+        freeze_cfg:
+          $ref: '#/components/schemas/atropos.DelayRequest'
+        replay_set:
+          $ref: '#/components/schemas/atropos.ReplaySetRef'
+        rules:
+          items:
+            $ref: '#/components/schemas/atropos.CompiledRule'
+          type: array
+          uniqueItems: false
+        version:
+          description: "the generation, kept under the old name (spec \xA75)"
+          type: integer
+      type: object
     atropos.StaticRule:
       properties:
         decision:
@@ -380,6 +454,36 @@ components:
           type: string
         point:
           $ref: '#/components/schemas/evaluator.InjectionPoint'
+      type: object
+    atropos.StatusReport:
+      properties:
+        applied_generation:
+          type: integer
+        errors:
+          items:
+            type: string
+          type: array
+          uniqueItems: false
+        etag:
+          type: string
+        instance_id:
+          type: string
+        replay_set:
+          $ref: '#/components/schemas/atropos.ReplaySetStatus'
+        service:
+          type: string
+        unsupported:
+          items:
+            $ref: '#/components/schemas/atropos.UnsupportedRule'
+          type: array
+          uniqueItems: false
+      type: object
+    atropos.UnsupportedRule:
+      properties:
+        category:
+          type: string
+        rule:
+          type: string
       type: object
     cachebox.CacheBoxContext:
       description: 'CacheBoxContext, when present, is authoritative end-to-end (design
@@ -407,6 +511,19 @@ components:
           type: string
         strategy_version:
           type: integer
+      type: object
+    cachebox.DelayStats:
+      properties:
+        experimentID:
+          type: string
+        installed:
+          type: boolean
+        mu:
+          type: number
+        phaseID:
+          type: string
+        sigma:
+          type: number
       type: object
     cachebox.RecordBufferStats:
       properties:
@@ -558,7 +675,13 @@ info:
 
     Serve mounts these on the returned handler at the documented
 
-    paths; the generated spec documents that control surface.'
+    paths; the generated spec documents that control surface.
+
+    The manteion-protocol operations document the desired-state
+
+    endpoints the SDK calls (the poll and the status report);
+
+    manteion serves those, Serve does not mount them.'
   title: Atropos SDK Admin API
   version: '1.0'
 openapi: 3.1.0
@@ -579,6 +702,9 @@ paths:
       tags:
       - admin
     get:
+      description: 'Store, recorder and record-buffer counters, plus the replay_with_delay
+        source in force: whether a fitted source is installed, its mu and sigma, and
+        the (experiment_id, phase_id) it is scoped to (both empty = every replay).'
       responses:
         '200':
           content:
@@ -597,6 +723,11 @@ paths:
       - admin
   /admin/cachebox/delay:
     post:
+      description: 'Installs a lognormal delay source for replay_with_delay. A context
+        scopes it to its (experiment_id, phase_id): a replay under any other pair
+        keeps sleeping the entry''s observed latency, and without a context the source
+        applies to every replay. A source installed here lasts until the next desired-state
+        200 answer without freeze_cfg clears it; a 304 leaves it.'
       requestBody:
         content:
           application/json:
@@ -616,7 +747,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/atropos.ErrorResponse'
-          description: invalid delay request
+          description: malformed JSON, negative mu or sigma, or a context naming only
+            one of experiment_id and phase_id
         '405':
           content:
             application/json:
@@ -718,6 +850,15 @@ paths:
       tags:
       - admin
     post:
+      description: 'Applies the rule set through the single apply path the manteion
+        sync also uses, scoped to rules: admin fault slots, the delay source and the
+        installed replay set stay as they are. Rules this host cannot execute (a category
+        outside its capabilities, quota resource faults in-process, network host=inline
+        outside the sidecar or host=proxy without a resolver, compositions) are skipped
+        per rule, logged and counted in atropos_rules_unsupported_total{category};
+        the rest apply and the answer is 204. A rule that does not decode is skipped
+        too, but the answer is 422. The pushed set holds until the next desired-state
+        200 answer replaces it.'
       requestBody:
         content:
           application/json:
@@ -732,22 +873,129 @@ paths:
         required: true
       responses:
         '204':
-          description: rules replaced
+          description: rules replaced (rules this host cannot execute are skipped)
         '400':
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/atropos.ErrorResponse'
-          description: invalid rules
+          description: malformed JSON
         '405':
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/atropos.ErrorResponse'
           description: method not allowed
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/atropos.ErrorResponse'
+          description: some rules did not decode and were skipped, the rest were applied;
+            error joins the per-rule messages with '; '
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/atropos.ErrorResponse'
+          description: 'hard error: this host cannot hold rules, nothing was applied'
       summary: Replace runtime rules
       tags:
       - admin
+  /api/v1/sdk/rules:
+    get:
+      description: 'Served by manteion, not by Serve: the SDK is the client. version
+        is the generation the instance holds, If-None-Match the ETag of the document
+        it holds (sent only when it holds one), and wait asks manteion to hold the
+        request until the service''s generation changes or the wait (seconds) elapses
+        (the SDK sends 30). The ETag is a content hash alone; the generation travels
+        in X-Atropos-Generation and in the body''s version. The SDK treats the ETag
+        as opaque. 200 is applied through the single apply path and reported with
+        POST /api/v1/sdk/status; 304 means the document is unchanged and the instance
+        adopts the generation without applying.'
+      parameters:
+      - description: service name
+        in: query
+        name: service
+        required: true
+        schema:
+          type: string
+      - description: instance id
+        in: query
+        name: instance_id
+        required: true
+        schema:
+          type: string
+      - description: generation the instance holds
+        in: query
+        name: version
+        schema:
+          type: integer
+      - description: long-poll hold in seconds
+        in: query
+        name: wait
+        schema:
+          type: integer
+      - description: ETag of the document the instance holds
+        in: header
+        name: If-None-Match
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/atropos.RuleSync'
+          description: the full desired state
+          headers:
+            ETag:
+              description: ETag of the document
+              schema:
+                type: string
+            X-Atropos-Generation:
+              description: generation of the desired state
+              schema:
+                type: integer
+        '304':
+          description: unchanged since If-None-Match
+          headers:
+            ETag:
+              description: ETag of the document
+              schema:
+                type: string
+            X-Atropos-Generation:
+              description: generation of the desired state, to adopt
+              schema:
+                type: integer
+      summary: Poll the desired state (served by manteion)
+      tags:
+      - manteion-protocol
+  /api/v1/sdk/status:
+    post:
+      description: 'Served by manteion, not by Serve: the SDK is the client. Sent
+        after every apply and whenever the replay-set state changes. The report is
+        a full snapshot of what the instance holds: unsupported and errors replace
+        the previous report (an empty list clears it), and an absent replay_set means
+        the instance holds none. Any 2xx counts as delivered (manteion answers 204);
+        a report that fails to send is re-sent.'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              oneOf:
+              - type: object
+              - $ref: '#/components/schemas/atropos.StatusReport'
+                description: what the instance holds
+                summary: status
+        description: what the instance holds
+        required: true
+      responses:
+        '204':
+          description: report stored
+      summary: Report the desired state held (served by manteion)
+      tags:
+      - manteion-protocol
   /cachebox/fidelity:
     get:
       description: Synchronous, pull-based snapshot of everything needed to compute

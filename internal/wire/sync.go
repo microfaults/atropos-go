@@ -17,8 +17,11 @@ package wire
 // (design doc Q5/INV-5); there is no ambient recording-phase signal here.
 type RuleSync struct {
 	Version uint64 `json:"version"` // the generation, kept under the old name (spec §5)
-	// Etag is the ETag of this materialized document: `<generation>-<sha256 hex[:16]>`;
-	// the instance sends it back as `If-None-Match`.
+	// Etag is the ETag of this materialized document: a hash of its content
+	// alone, never the generation (that travels in Version and in the
+	// X-Atropos-Generation header), so an unchanged document keeps its ETag
+	// while the generation moves. The instance treats it as opaque and sends
+	// it back as `If-None-Match`.
 	Etag         string         `json:"etag,omitempty"`
 	Rules        []CompiledRule `json:"rules"`
 	ActiveFaults []FaultRequest `json:"active_faults"`

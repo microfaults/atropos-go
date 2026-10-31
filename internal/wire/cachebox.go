@@ -23,13 +23,18 @@ type CacheBoxContext = cachebox.CacheBoxContext //@name atropos.CacheBoxContext
 type CacheBoxWireEntry = cachebox.WireEntry //@name atropos.CacheBoxWireEntry
 
 // CacheBoxStats is the GET /admin/cachebox response: combined store,
-// recorder, and record-buffer counters.
+// recorder, and record-buffer counters, plus the replay_with_delay source in
+// force (Delay: whether a fitted source is installed, its mu and sigma, and
+// the (experiment_id, phase_id) it is scoped to; both ids empty = every
+// replay).
 type CacheBoxStats = cachebox.Stats //@name atropos.CacheBoxStats
 
-// DelayRequest is the JSON body for POST /admin/cachebox/delay -- the freeze
-// command manteion sends at freezeServices time. Context, when present,
-// carries the (experiment_id, phase_id, key_strategy, ...) that authorizes
-// and scopes the freeze (wire spec §W1).
+// DelayRequest configures the replay_with_delay source: the JSON body for
+// POST /admin/cachebox/delay and the freeze_cfg of the desired state
+// (RuleSync.FreezeCfg). Context (wire spec §W1), when present, scopes the
+// source to its (experiment_id, phase_id): a replay under any other pair keeps
+// sleeping the entry's observed latency. The SDK rejects a context naming only
+// one of the pair; without a context the source applies to every replay.
 type DelayRequest struct {
 	Mu      float64          `json:"mu"`
 	Sigma   float64          `json:"sigma"`

@@ -46,18 +46,25 @@ type FaultStatus struct {
 // from the toxic-specific params (delay, rate, etc.).
 type NetworkEnvelope struct {
 	// Host selects where the toxic runs.
-	//   "proxy"  → TCP proxy sidecar (current behaviour; requires NetworkResolver)
-	//   "inline" → in-process RoundTripper wrapping response.Body (not yet supported)
+	//   "proxy"  → TCP proxy (requires a NetworkResolver; the in-process default)
+	//   "inline" → armed policy on the atroposd sidecar's proxied upstream calls
+	// The in-process host has no proxied connection to shape: it skips a rule
+	// with Host=="inline" (reported as unsupported) and rejects a single
+	// /admin/fault slot with 400. An empty Host means "inline" on a host that
+	// owns the proxied connections (the sidecar) and "proxy" in-process.
 	Host string `json:"host"`
 
-	// Target is the logical name of the upstream service, resolved by
-	// NetworkResolver into a (listen, upstream) address pair.
-	// Required when Host=="proxy"; ignored when Host=="inline".
+	// Target is the logical name of the upstream service. Required for both
+	// hosts. With Host=="proxy" a NetworkResolver turns it into a
+	// (listen, upstream) address pair; with Host=="inline" it is the
+	// upstream's host or host:port, matched against the outbound request's
+	// host (a target without a port matches any port).
 	Target string `json:"target,omitempty"`
 
 	// Direction selects which half of a proxied connection to apply the
-	// toxic to. Required when Host=="proxy". For Host=="inline" only
-	// "downstream" (response body) is meaningful.
+	// toxic to: "upstream" (client → server, request bytes) or "downstream"
+	// (server → client, response bytes). It defaults to "upstream" with
+	// Host=="proxy" and to "downstream" with Host=="inline".
 	Direction string `json:"direction,omitempty"`
 
 	// Scope is the fraction of connections (proxy) or requests (inline)

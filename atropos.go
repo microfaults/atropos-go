@@ -3,6 +3,9 @@
 // @description Admin and health handlers exposed by the atropos-go SDK.
 // @description Serve mounts these on the returned handler at the documented
 // @description paths; the generated spec documents that control surface.
+// @description The manteion-protocol operations document the desired-state
+// @description endpoints the SDK calls (the poll and the status report);
+// @description manteion serves those, Serve does not mount them.
 //
 // Package atropos embeds the faults-lab measurement instrument in a Go
 // service: OpenTelemetry instrumentation, rule-driven fault injection, the

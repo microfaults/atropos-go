@@ -159,13 +159,13 @@ func (d *demoEvaluator) Active() []*wire.FaultRequest {
 // handler that could is gone.
 //
 // Interaction with manteion: admin POSTs key the slot by req.ID (or the
-// effectiveCategory when ID is empty). When connected, every successful poll
+// effectiveCategory when ID is empty). When connected, every 200 poll answer
 // runs reconciliation in apply, which drops slot IDs not present in the
-// server's active_faults response. And because admin POST never calls
-// Confirm, the fault watchdog will reap admin slots after the grace period
-// (watchdogGrace: three poll cadences, at least 30s). Treat admin faults as
-// short-lived overrides when connected to manteion; in offline mode they
-// persist until DELETEd.
+// server's active_faults response (a 304 applies nothing). And because admin
+// POST never calls Confirm, the fault watchdog will reap admin slots after the
+// grace period (watchdogGrace: three poll cadences, at least 30s; 90s with the
+// defaults). Treat admin faults as short-lived overrides when connected to
+// manteion; in offline mode they persist until DELETEd.
 func faultAdminHandler(eval *demoEvaluator, reg *interceptor.FaultRegistry, arm armFunc, opts ...decodeOption) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

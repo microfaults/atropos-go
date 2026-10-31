@@ -6,7 +6,7 @@ type RegisterRequest struct {
 	Service        string `json:"service"`
 	Version        string `json:"version,omitempty"`
 	Address        string `json:"address"`
-	PollIntervalMs int64  `json:"poll_interval_ms,omitempty"` // SDK's poll cadence; manteion uses it for liveness detection
+	PollIntervalMs int64  `json:"poll_interval_ms,omitempty"` // how often this instance's polls come back: the longer of its poll interval and its long-poll hold (30s by default); manteion uses it for liveness detection
 	// Routes is the HTTP route inventory for manteion's workflow-builder
 	// catalog. Optional — gRPC services register without routes.
 	Routes []Route `json:"routes,omitempty"`

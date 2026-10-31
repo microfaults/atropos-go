@@ -31,18 +31,20 @@ func (ObservedDelaySource) Sample(entry *Entry) time.Duration {
 	return entry.ObservedLatency
 }
 
-// DistributionDelaySource is a scaffold for Stage 3: sampling replay delays
-// from a fitted lognormal distribution. Manteion will push Mu/Sigma fit
-// parameters once it has collected enough latency samples. Until Sigma is
-// set, Sample falls back to ObservedDelaySource.
+// DistributionDelaySource samples replay delays from a fitted lognormal
+// distribution. Manteion supplies the Mu/Sigma fit once it has collected
+// enough latency samples. Until Sigma is set, Sample falls back to
+// ObservedDelaySource.
 //
 // The lognormal form is chosen because per-request service latencies are
 // empirically well-modeled by heavy-tailed distributions, and lognormal is
 // a common two-parameter fit in the distributed-systems literature.
 //
-// This type is currently only exercised by tests. It is wired into the
-// coordinator's SetDelaySource hook so manteion integration in Stage 3 can
-// swap the delay source at rule-update time without restarting the SDK.
+// It is the source a freeze installs, through SetDelaySource or
+// SetScopedDelaySource: the desired state's freeze_cfg installs one (scoped to
+// its context's (experiment_id, phase_id)), and POST /admin/cachebox/delay
+// installs one by hand, so the delay source can change without restarting the
+// SDK.
 type DistributionDelaySource struct {
 	mu    sync.RWMutex
 	muVal float64 // lognormal mu, in ln(microseconds)

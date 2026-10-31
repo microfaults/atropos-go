@@ -4,7 +4,7 @@ Go SDK for fault injection, observability instrumentation, and request correlati
 
 Atropos embeds into your services as a library. It provides OpenTelemetry instrumentation out of the box, evaluates developer-defined rules to decide when and where to inject faults, and emits rich trace data so the effects of those faults are observable. The SDK is useful for pure observability even without fault injection configured.
 
-In the faults-lab instrument, atropos is the in-process measurement arm: it records a service's egress HTTP responses during baseline phases, replays them **fail-closed** when the service is frozen for isolation phases, injects faults on rule match, and keeps per-`(experiment, phase)` fidelity counters — all driven by rules polled from the manteion control plane.
+In the faults-lab instrument, atropos is the in-process measurement arm: it records a service's egress HTTP responses during baseline phases, replays them **fail-closed** when the service is frozen for isolation phases, injects faults on rule match, and keeps per-`(experiment, phase)` fidelity counters — all driven by the desired state long-polled from the manteion control plane.
 
 Embedding is one call:
 
@@ -40,7 +40,7 @@ A snapshot of what's shipped on `main`. For the research vision (cache-box primi
 | Network faults (TCP proxy: RST, blackhole, retransmit_delay, latency, throttle, drip) | Shipped |
 | Resource faults (CPU, I/O, disk, memory) | Shipped |
 | Cache-box fidelity stack — fail-closed replay, split record/replay store, staged preload (W5 checksum), per-phase fidelity counters, drain reports | Shipped |
-| SDK ↔ manteion wire protocol — poll loop (empty rule set is authoritative), register/apply, `CompiledRule` decoders, SSE nudge | Shipped |
+| SDK ↔ manteion wire protocol — long-poll desired state (ETag/generation), single apply path, status report, replay-set pull, SSE nudge | Shipped |
 | Fault registry — per-key stop, fired on rule replace / slot clear / watchdog / admin delete | Shipped |
 | Route publishing — `Config.Routes` rides the register payload | Shipped |
 | `/admin/fault`, `/admin/rules`, `/admin/cachebox` runtime control (mounted by `Serve`, outside the fault middleware) | Shipped |
@@ -249,8 +249,11 @@ POST `/admin/fault` body fields by `fault_type`: `latency` requires
 `params.delay` (e.g. `"500ms"`, optional `jitter`); `error` defaults to
 status 500, `"injected fault"`; `hang` requires `params.duration`. The
 admin slot composes AFTER the host evaluator, so an armed admin fault can
-never shadow the rules of a running experiment — and manteion reconciliation
-plus the fault watchdog reap admin slots when connected.
+never shadow the rules of a running experiment. When connected, manteion stays
+authoritative over slots: the next `200` desired-state document that does not
+name a slot drops (and stops) it, and the fault watchdog drops one that stays
+unconfirmed for the grace period (90 s with the default poll settings; see
+"Manteion integration" below). Offline, slots persist until deleted.
 
 ### 5. Cache-Box (Egress)
 
@@ -258,7 +261,7 @@ Cache-box is the measurement primitive that "freezes" a downstream dependency by
 
 - **passthrough**: forward to real upstream, record the request/response pair asynchronously under the rule's authoritative key strategy
 - **replay**: serve from the installed replay set; a miss is a **counted synthetic 503**, never a live call (fail-closed — this is what makes a frozen phase trustworthy)
-- **replay_with_delay**: replay plus a synthetic delay (fitted lognormal pushed by manteion, or observed)
+- **replay_with_delay**: replay plus a synthetic delay (fitted lognormal from the desired state's `freeze_cfg`, or observed)
 
 The store is split so record traffic can never evict replay data: an immutable, atomically-swapped **ReplaySet** serves replays (installed only via staged preload commit), while a bounded **RecordBuffer** absorbs recording. Replay lookups are scoped to the rule's `(experiment_id, phase_id)` — a hit against another phase's set fails closed and is counted. Every drop (recorder backpressure, oversize response, push failure) increments a per-phase fidelity counter, and phase end triggers a flush + **drain report** to manteion so recording completeness is verified, not assumed.
 
@@ -271,7 +274,10 @@ Cache-box covers **egress HTTP only**. Ingress and gRPC are tracked in Ongoing D
 `GET /metrics` (mounted by `Serve`, outside the middleware) exposes
 `http_server_requests_total`, `http_server_request_duration_seconds`,
 `http_client_requests_total`, `http_client_request_duration_seconds`, the
-cache-box hit/miss/record counters, and `atropos_fault_injections_total`.
+cache-box hit/miss/record counters, `atropos_fault_injections_total`, and the
+sync series: `atropos_sync_generation` (the generation held),
+`atropos_replay_set_state{state}` (the replay-set pull state; all three read 0
+when no set is desired) and `atropos_rules_unsupported_total{category}`.
 
 ### 7. atroposd: the out-of-process host
 
@@ -371,10 +377,55 @@ for `io`/`disk`. Design and milestones:
 
 ## Manteion integration & the fidelity pipeline
 
-The SDK-initiated path is the production one: `Serve` registers the instance,
-then polls `GET /api/v1/sdk/rules` (SSE `rules_changed` nudges between
-intervals). The poll payload is the **full desired state** — an empty rule set is authoritative
-(rules cleared, running background faults stopped by key, drain tracker fired), not "no change".
+The SDK-initiated path is the production one, and it is **desired-state sync**
+(contract: `docs/plans/2026-10-30-desired-state-protocol.md`). `Serve`
+registers the instance; the registration answer is the materialized desired
+state and is applied before the first poll. The loop then keeps the instance on
+it:
+
+- **Long-poll.** `GET /api/v1/sdk/rules?...&version=<generation held>&wait=30`
+  with `If-None-Match: "<etag held>"`: manteion holds the request until the
+  service's generation changes or 30 s pass. The ETag is the document's content
+  hash alone and opaque to the SDK; the generation travels in
+  `X-Atropos-Generation` and the body's `version`.
+- **`200`** — the body is the **full desired state** (`RuleSync`: `rules`,
+  `active_faults`, `freeze_cfg`, `replay_set`). An empty rule set is
+  authoritative (rules cleared, running background faults stopped by key, drain
+  tracker fired), not "no change"; so is an empty `active_faults`, and an absent
+  `freeze_cfg` or `replay_set` clears the delay source or the installed replay
+  set. It goes through the single `apply` path (`POST /admin/rules` takes the
+  same one, scoped to rules), then the instance reports with
+  `POST /api/v1/sdk/status` and polls again at once.
+- **`304`** — the document is unchanged: the instance adopts the generation in
+  `X-Atropos-Generation` and applies nothing.
+- **Skipped per rule.** A rule this host cannot execute (a category outside its
+  capabilities, `quota` in-process, network `host: inline` outside the sidecar or
+  `host: proxy` without a resolver, a composition) or cannot decode never fails
+  the sync: it is skipped, counted in `atropos_rules_unsupported_total{category}`
+  (compositions under `category="composition"`) and reported; the rest apply.
+- **Freeze.** `freeze_cfg.context` scopes the delay source to its
+  `(experiment_id, phase_id)`: replays under another pair keep the entry's
+  observed latency, and the `/admin/cachebox` stats show the source and its scope.
+- **Status report.** A full snapshot of what the instance holds: applied
+  generation, ETag, `unsupported` rules, `errors` and the replay-set state
+  (`fetching|committed|failed`; absent = none held). It goes out after every
+  apply and on every replay-set transition. One that fails to send is re-sent
+  before the next poll and by its own retry (2 s, doubling up to the poll wait),
+  so manteion's convergence barrier does not starve on one lost report.
+- **Cadence.** Registration advertises
+  `poll_interval_ms = max(poll interval, hold)`: 30 s with the defaults (a 10 s
+  interval, a 30 s hold), so manteion's liveness thresholds tolerate the hold. A
+  failed poll keeps the stale state and backs off (60 s at most); the sixth
+  consecutive failure re-registers once, and the first poll that succeeds after
+  failures drops the held generation and ETag and re-registers, so the next poll
+  is a full pull. The SSE `rules_changed` nudge (`GET /api/v1/sdk/events`) is
+  kept and ends any wait between polls early.
+- **Watchdog.** A fault slot that stays unconfirmed for
+  `max(3·max(interval, hold), 30 s)` is dropped: 90 s by default. A `200` that
+  names the slot, or a `304` for a document that did, re-confirms it; an
+  `/admin/fault` slot is never confirmed, so connected it lives that long (or
+  until the next `200` that does not name it).
+
 Cache-box record/replay rules arrive with a `CacheBoxContext` carrying the `(experiment_id,
 phase_id)` pair and the authoritative key strategy; the record path keys entries with exactly that
 strategy and ships it as wire provenance.
@@ -382,16 +433,28 @@ strategy and ships it as wire provenance.
 The fidelity pipeline around a recording phase:
 
 1. **Record** — passthrough rule active; entries land in the RecordBuffer and stream to manteion
-   (`POST /api/v1/cache/ingest`) in batches with per-pair monotonic `batch_seq`.
-2. **Drain** — the rule leaves the poll set at phase end; the drain tracker flushes the recorder,
+   (`POST /api/v1/cache/ingest`) in batches with per-pair monotonic `batch_seq` and the instance's
+   `epoch` (its start time in unix nanoseconds), so manteion's dedupe key stays unique across restarts.
+2. **Drain** — the rule leaves the rule set at phase end; the drain tracker flushes the recorder,
    settles all in-flight batches, then POSTs a per-pair drain report (recorded / pushed / dropped).
    Manteion's drain barrier compares those against what it actually received.
-3. **Preload** — for the isolation phase, manteion stages the recording back in via
-   `POST /cachebox/preload/{begin,chunk,commit}`; commit verifies a W5 checksum and atomically
-   installs the ReplaySet. Mismatch = 409, staging dropped, prior set untouched.
-4. **Freeze/replay** — the synthesized replay rule + a delay source (`POST /admin/cachebox/delay`)
-   freeze the service; misses fail closed and are counted; manteion pulls
-   `GET /cachebox/fidelity?experiment_id=&phase_id=` (W6) at phase end for the verdict.
+3. **Pull** — for the isolation phase the desired state carries a `replay_set` (artifact `id`, the
+   `(experiment_id, phase_id)` pair it is installed under, entry `count`, W5 `sha256`, `size_bytes`,
+   `url`). When its `id` differs from the committed one the instance fetches
+   `GET /api/v1/cache/artifacts/{id}` (NDJSON, one entry per line) in `Range` chunks of at most
+   4 MiB, retrying a failed chunk from the same offset, stages the entries through the preload path
+   and commits only when the entry count and the W5 checksum match, which atomically installs the
+   ReplaySet. A mismatch or any fetch failure leaves the prior set untouched and reports `failed`
+   (the reason lands in the status report's `errors`). Each state (`fetching` → `committed` |
+   `failed`) is reported as it is reached; a newer `id` supersedes a fetch in flight, and a
+   restarted instance converges on its own. `POST /cachebox/preload/{begin,chunk,commit}` stays
+   mounted for manual use.
+4. **Freeze/replay** — the synthesized replay rule + a delay source (`freeze_cfg` in the desired
+   state, installed scoped to its `context`'s `(experiment_id, phase_id)`;
+   `POST /admin/cachebox/delay` remains for manual use, and a source pushed that way lasts until
+   the next `200` without `freeze_cfg`) freeze the service; misses fail closed and are counted;
+   manteion pulls `GET /cachebox/fidelity?experiment_id=&phase_id=` (W6) at phase end for the
+   verdict.
 
 All of the host wiring this pipeline needs — identity resolution, the push
 client bound to the cache-box's fidelity registry, and every handler mount at
