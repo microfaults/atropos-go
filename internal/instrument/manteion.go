@@ -17,8 +17,9 @@ import (
 //
 // Blocks until manteion is ready, registers the instance, fetches initial
 // rules without a long-poll hold, configures the evaluator, and starts the
-// background poll loop (long-polling when cfg.pollWait > 0), the SSE
-// listener and, with a DemoEval target, the fault-slot watchdog.
+// background poll loop (long-polling when cfg.pollWait > 0), the status
+// report retry, the SSE listener and, with a DemoEval target, the fault-slot
+// watchdog.
 //
 // Returns (nil, nil) if cfg.url is empty (offline mode — tracing-only). All
 // methods on *ManteionClient are nil-receiver safe, so callers can
@@ -71,6 +72,9 @@ func connectManteion(ctx context.Context, cfg manteionConfig) (*ManteionClient, 
 		sseClient:  sseClient,
 		targets:    cfg.targets,
 		logger:     cfg.logger,
+		// Before register: a report that fails before retryStatus starts
+		// leaves its wake-up queued here.
+		statusRetry: make(chan struct{}, 1),
 	}
 	if cfg.pollWait > 0 {
 		// A held poll outlives httpClient's timeout: manteion answers it
@@ -120,10 +124,16 @@ func connectManteion(ctx context.Context, cfg manteionConfig) (*ManteionClient, 
 	c.pollCtx = pollCtx
 	c.cancel = cancel
 
+	// Connected before any goroutine starts: the loop's first poll goes out at
+	// once with a hold and may fail at once, and the degraded it then records
+	// must not be overwritten.
+	c.status.Store(int32(manteionConnected))
+
 	// Channel used by the SSE listener to trigger an immediate poll tick.
 	triggerPoll := make(chan struct{}, 1)
 
 	c.wg.Go(func() { c.pollLoopWithTrigger(pollCtx, triggerPoll) })
+	c.wg.Go(func() { c.retryStatus(pollCtx) })
 	c.wg.Go(func() {
 		c.listenSSE(pollCtx, func() {
 			select {
@@ -136,7 +146,6 @@ func connectManteion(ctx context.Context, cfg manteionConfig) (*ManteionClient, 
 		grace := watchdogGrace(cfg.pollInterval, cfg.pollWait)
 		c.wg.Go(func() { c.watchSlots(pollCtx, grace) })
 	}
-	c.status.Store(int32(manteionConnected))
 
 	return c, nil
 }
@@ -256,8 +265,9 @@ type ConnectConfig struct {
 }
 
 // ConnectManteion connects a host's core to the control plane: waits for
-// readiness, registers, fetches initial rules, and starts the poll/SSE/
-// watchdog goroutines. Returns (nil, nil) when URL is empty (offline).
+// readiness, registers, fetches initial rules, and starts the poll, status
+// retry, SSE and watchdog goroutines. Returns (nil, nil) when URL is empty
+// (offline).
 func ConnectManteion(ctx context.Context, c ConnectConfig) (*ManteionClient, error) {
 	cfg := defaultManteionConfig(c.Core.service)
 	cfg.url = c.URL

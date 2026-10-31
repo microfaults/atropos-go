@@ -40,8 +40,9 @@ const (
 // statusMu, under which buildStatus takes syncMu and, after releasing it, the
 // replay-set puller's lock (puller.Status). syncMu is a leaf. The
 // /admin/rules push takes only the core's apply mutex; the puller calls
-// OnChange (sendStatus) with no lock held. Nothing takes applyMu while
-// holding any of the others.
+// OnChange (sendStatus), and the poll loop and retryStatus call resendStatus
+// (statusMu), with no lock held. Nothing takes applyMu while holding any of
+// the others.
 type ManteionClient struct {
 	cfg        manteionConfig
 	httpClient *http.Client // short-lived calls: init, register, status, deregister, a poll without a hold
@@ -80,9 +81,14 @@ type ManteionClient struct {
 	syncMu        sync.Mutex
 	etag          string      // ETag of the document held, sent as If-None-Match; "" = none (writers: see ruleVersion)
 	lastReport    applyReport // what the last apply could not hold
-	statusPending bool        // the last status report failed; the poll loop re-sends it before its next poll
+	statusPending bool        // the last status report failed; retryStatus re-sends it, and so does the poll loop before its next poll
 
-	statusMu sync.Mutex // serializes sendStatus: reports go out one at a time, in order
+	statusMu sync.Mutex // serializes sending: reports go out one at a time, in order
+	// statusRetry wakes retryStatus once a status report has failed (capacity
+	// 1: one wake-up stands for any number of failures). Nil in a client not
+	// built by connectManteion, which has no retry: the poll loop's resend
+	// is its only one.
+	statusRetry chan struct{}
 
 	// puller converges the cache box's replay set; nil when this host has no
 	// cache box (no replay-set support). Closed by Close.
@@ -233,16 +239,17 @@ var pollFloor = time.Second
 // has just run). A trigger (an SSE rules_changed nudge) ends any wait.
 //
 // Before each poll a status report that did not reach manteion is re-sent
-// (sendStatus), so manteion's convergence barrier never starves on one lost
-// report. A failed poll keeps the stale state, marks the client degraded and
-// backs off pollInterval·2^min(failures,6), at most 60 s. The sixth
-// consecutive failure re-registers once -- manteion may have lost the
-// registration (restart, eviction); register is an idempotent upsert on the
-// instance id -- and later failures do not, so a struggling server is not
-// hammered. The first poll that succeeds after failures forgets the document
-// held (forgetDocument) and only then re-registers: manteion may have
-// restarted or moved on meanwhile, so the next poll is a full pull. A poll
-// cut short by ctx is not a failure.
+// (resendStatus), so manteion's convergence barrier never starves on one lost
+// report; retryStatus re-sends it sooner, since a hold can keep the next poll
+// away for up to pollWait. A failed poll keeps the stale state, marks the
+// client degraded and backs off pollInterval·2^min(failures,6), at most
+// 60 s. The sixth consecutive failure re-registers once -- manteion may have
+// lost the registration (restart, eviction); register is an idempotent
+// upsert on the instance id -- and later failures do not, so a struggling
+// server is not hammered. The first poll that succeeds after failures
+// forgets the document held (forgetDocument) and only then re-registers:
+// manteion may have restarted or moved on meanwhile, so the next poll is a
+// full pull. A poll cut short by ctx is not a failure.
 func (c *ManteionClient) pollLoopWithTrigger(ctx context.Context, trigger <-chan struct{}) {
 	var delay time.Duration // with a hold, straight into the held poll
 	if c.cfg.pollWait == 0 {
@@ -258,9 +265,7 @@ func (c *ManteionClient) pollLoopWithTrigger(ctx context.Context, trigger <-chan
 			case <-trigger:
 			}
 		}
-		if c.statusIsPending() {
-			c.sendStatus(ctx)
-		}
+		c.resendStatus(ctx)
 		start := time.Now()
 		if err := c.fetchRules(ctx); err != nil {
 			if ctx.Err() != nil {
@@ -585,15 +590,35 @@ func (c *ManteionClient) buildStatus() wire.StatusReport {
 
 // sendStatus POSTs the current status snapshot to /api/v1/sdk/status, with
 // a statusTimeout deadline on top of ctx. Any 2xx clears statusPending; a
-// transport error or another status logs a warning and sets it, so the poll
-// loop re-sends before its next poll -- manteion's convergence barrier must
-// not starve on one lost report. Serialized on statusMu: reports go out one
-// at a time, each built when it is sent, so the last one manteion receives
-// is the newest.
+// transport error or another status logs a warning, sets it and wakes
+// retryStatus, which re-sends after a short backoff, as the poll loop does
+// before its next poll -- manteion's convergence barrier must not starve on
+// one lost report. Serialized on statusMu: reports go out one at a time, each
+// built when it is sent, so the last one manteion receives is the newest.
 func (c *ManteionClient) sendStatus(ctx context.Context) {
 	c.statusMu.Lock()
 	defer c.statusMu.Unlock()
+	c.postStatus(ctx)
+}
 
+// resendStatus re-sends the status report if one is pending. The flag is
+// checked again once statusMu is held, so a report that landed while this
+// waited for the lock -- the retry's, the loop's, a later apply's -- is not
+// sent twice.
+func (c *ManteionClient) resendStatus(ctx context.Context) {
+	if !c.statusIsPending() {
+		return
+	}
+	c.statusMu.Lock()
+	defer c.statusMu.Unlock()
+	if c.statusIsPending() {
+		c.postStatus(ctx)
+	}
+}
+
+// postStatus sends one status report (see sendStatus). Called with statusMu
+// held.
+func (c *ManteionClient) postStatus(ctx context.Context) {
 	status := c.buildStatus()
 	body, err := json.Marshal(status)
 	if err != nil {
@@ -624,13 +649,54 @@ func (c *ManteionClient) sendStatus(ctx context.Context) {
 	c.syncMu.Unlock()
 }
 
-// statusFailed logs a status report that did not reach manteion and marks it
-// pending for a re-send.
+// statusFailed logs a status report that did not reach manteion, marks it
+// pending for a re-send and wakes retryStatus (nothing to do when a wake-up
+// is already queued, or when the client has no retry).
 func (c *ManteionClient) statusFailed(what string, err error) {
 	c.logger.Warn("status report not delivered, will re-send", "step", what, "error", err)
 	c.syncMu.Lock()
 	c.statusPending = true
 	c.syncMu.Unlock()
+	select {
+	case c.statusRetry <- struct{}{}:
+	default:
+	}
+}
+
+// statusRetryBase is retryStatus's first wait after a failed status report;
+// each failed re-send doubles it, up to the poll wait. Tests shrink it.
+var statusRetryBase = 2 * time.Second
+
+// retryStatus re-sends a status report that did not reach manteion, on its
+// own, until ctx is cancelled. The poll loop re-sends before each poll, but a
+// held poll keeps the next one away for up to pollWait, while manteion's
+// convergence barrier (MANTEION_CONVERGE_TIMEOUT, 30 s by default) must not
+// starve on one lost report -- above all the replay set's committed, which
+// the puller sends in the middle of a hold. Woken by statusFailed, it waits
+// statusRetryBase, doubling up to the poll wait (the poll interval without a
+// hold), and re-sends while the report is pending. The first report that
+// lands -- this retry's, the loop's or a later apply's -- ends the run; the
+// next failure starts again from statusRetryBase. One goroutine, and every
+// send under statusMu: retries never overlap each other or another report.
+func (c *ManteionClient) retryStatus(ctx context.Context) {
+	limit := c.cfg.pollWait
+	if limit <= 0 {
+		limit = c.cfg.pollInterval
+	}
+	limit = max(limit, statusRetryBase)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.statusRetry:
+		}
+		for wait := statusRetryBase; c.statusIsPending(); wait = min(2*wait, limit) {
+			if !sleepCtx(ctx, wait) {
+				return
+			}
+			c.resendStatus(ctx)
+		}
+	}
 }
 
 // currentEtag is the ETag held ("" = none): the next poll's If-None-Match.

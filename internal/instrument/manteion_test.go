@@ -498,7 +498,9 @@ type fakeManteion struct {
 	polls      []pollSeen
 	statuses   []wire.StatusReport
 	rawStatus  [][]byte
+	statusAt   []time.Time                                  // arrival time of each status report
 	statusCode int                                          // response to POST /api/v1/sdk/status; 0 = 204
+	failStatus int                                          // the next failStatus reports are answered 500 whatever statusCode says
 	register   string                                       // 201 body; default `{"status":"registered","version":0,"rules":[],"active_faults":[]}`
 	rules      func(w http.ResponseWriter, r *http.Request) // answers GET /api/v1/sdk/rules; read and written under mu (setRules)
 }
@@ -540,7 +542,12 @@ func newFakeManteion(t *testing.T) *fakeManteion {
 			f.mu.Lock()
 			f.statuses = append(f.statuses, rep)
 			f.rawStatus = append(f.rawStatus, b)
+			f.statusAt = append(f.statusAt, time.Now())
 			code := f.statusCode
+			if f.failStatus > 0 {
+				f.failStatus--
+				code = http.StatusInternalServerError
+			}
 			f.mu.Unlock()
 			if code == 0 {
 				code = http.StatusNoContent
@@ -1210,8 +1217,17 @@ func TestPollLoop_FailuresBackOffAndReRegisterOnce(t *testing.T) {
 	c.cfg.pollWait = 2 * time.Second
 	c.pollClient = &http.Client{Timeout: 17 * time.Second}
 	stop := startLoop(t, c, make(chan struct{}, 1))
-	f.waitPolls(t, 9)
-	for deadline := time.Now().Add(5 * time.Second); len(f.registered()) == 0 && time.Now().Before(deadline); {
+	// Wait on the slice indexed below, not on the fake's poll count: the fake
+	// counts a poll before this handler records its time.
+	attempts := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(at)
+	}
+	for deadline := time.Now().Add(5 * time.Second); attempts() < 9 || len(f.registered()) == 0; {
+		if time.Now().After(deadline) {
+			t.Fatalf("after 5s: %d poll attempts recorded and %d registers, want 9 and 1", attempts(), len(f.registered()))
+		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	stop()
@@ -1564,5 +1580,202 @@ func TestConnectManteion_OnlyAHeldPollGetsTheLongTimeout(t *testing.T) {
 	polls := f.waitPolls(t, 3) // the startup fetch, a held poll answered, the next held poll
 	if polls[0].Wait != "" || polls[1].Wait != "1" || c.Status() != manteionConnected || c.lastPollAt.Load() == 0 {
 		t.Fatalf("polls=%+v status=%v, want an unheld startup fetch, then held polls answered without a timeout", polls, c.Status())
+	}
+}
+
+// TestConnectManteion_TheLoopsFirstFailureIsTheLastWord: connecting records
+// the client connected before it starts the poll loop, whose first poll -- a
+// held poll goes out at once -- may fail at once. That failure is then the
+// last word on the status: health reads degraded until a poll succeeds, not
+// connected because connecting finished after the failure.
+func TestConnectManteion_TheLoopsFirstFailureIsTheLastWord(t *testing.T) {
+	f := newFakeManteion(t)
+	f.register = `{"status":"registered","version":1,"etag":"1-a","rules":[],"active_faults":[]}`
+	f.setRules(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("wait") != "" { // the loop's polls fail; the startup fetch does not
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		respond304("1", "1-a")(w, r)
+	})
+	c, err := connectManteion(t.Context(), manteionConfig{
+		url: f.srv.URL, serviceName: "svc", instanceID: "pod-1",
+		initTimeout: 5 * time.Second, pollInterval: 10 * time.Second, pollWait: 30 * time.Second,
+		targets:    applyTargets{Evaluator: newTestEvaluator()},
+		httpClient: &http.Client{Timeout: 5 * time.Second},
+		logger:     slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+	f.waitPolls(t, 2) // the startup fetch, then the loop's first poll, which fails
+	// The loop's next poll is 20 s away (pollInterval·2), so nothing but the
+	// first failure can set the status within this wait.
+	for deadline := time.Now().Add(5 * time.Second); c.Status() != manteionDegraded; {
+		if time.Now().After(deadline) {
+			t.Fatalf("status = %v after the loop's first poll failed, want degraded", c.Status())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// ---------- status report retry ----------
+
+// startStatusRetry runs c's status retry on a context of its own until stop
+// (also registered as a cleanup) cancels it and waits for it.
+func startStatusRetry(t *testing.T, c *ManteionClient) (stop func()) {
+	t.Helper()
+	c.statusRetry = make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(t.Context())
+	c.wg.Go(func() { c.retryStatus(ctx) })
+	var once sync.Once
+	stop = func() { once.Do(func() { cancel(); c.wg.Wait() }) }
+	t.Cleanup(stop)
+	return stop
+}
+
+// TestConnectManteion_RetriesALostCommittedReportWithoutAPoll: the replay
+// set's committed report goes out while the loop sits in a held poll; when
+// it does not reach manteion it is re-sent on its own a couple of seconds
+// later -- not a whole hold later, when the loop's before-poll resend would
+// carry it: manteion's convergence barrier gives an instance 30 s, as long
+// as a hold.
+func TestConnectManteion_RetriesALostCommittedReportWithoutAPoll(t *testing.T) {
+	entries := replayEntries(3)
+	art := newFakeArtifact(t, entries)
+	release := art.hold(t) // the fetch completes once the loop is in its held poll
+	ref := refFor(art, entries)
+	ref.URL = art.srv.URL + ref.URL
+	ref.ExperimentID, ref.PhaseID = "exp-1", "phase-1"
+	doc := wire.RuleSync{Version: 3, Etag: "3-a", Rules: []wire.CompiledRule{}, ActiveFaults: []wire.FaultRequest{}, ReplaySet: &ref}
+	reg, err := json.Marshal(wire.RegisterResponse{Status: "registered", RuleSync: doc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFakeManteion(t)
+	f.register = string(reg)
+	f.setRules(newHoldingRules(doc).serve)
+	c, err := connectManteion(t.Context(), manteionConfig{
+		url: f.srv.URL, serviceName: "svc", instanceID: "pod-1",
+		initTimeout: 5 * time.Second, pollInterval: 10 * time.Second, pollWait: 30 * time.Second,
+		targets:    applyTargets{Evaluator: newTestEvaluator(), CacheBox: newTestCacheBox(t)},
+		httpClient: &http.Client{Timeout: 5 * time.Second},
+		logger:     slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+	f.waitPolls(t, 2) // the startup fetch, then the loop's poll, held
+	f.mu.Lock()
+	f.failStatus = 1 // the committed report is lost
+	f.mu.Unlock()
+	release()
+
+	statuses := f.waitStatuses(t, 3) // within 5 s: the register's, the lost one, the resend
+	polls, _ := f.snapshot()
+	f.mu.Lock()
+	gap := f.statusAt[2].Sub(f.statusAt[1])
+	f.mu.Unlock()
+	committed := &wire.ReplaySetStatus{ID: ref.ID, State: wire.ReplaySetCommitted}
+	if !reflect.DeepEqual(statuses[1].ReplaySet, committed) || !reflect.DeepEqual(statuses[2], statuses[1]) {
+		t.Fatalf("reports after the commit = %+v and %+v, want the committed report re-sent unchanged", statuses[1], statuses[2])
+	}
+	if want := (pollSeen{Version: "3", IfNoneMatch: `"3-a"`, Wait: "30"}); len(polls) != 2 || polls[1] != want {
+		t.Fatalf("polls = %+v, want the startup fetch and one poll held since: the resend must not wait for a poll", polls)
+	}
+	if gap < statusRetryBase {
+		t.Fatalf("re-sent %v after the lost report, want a backoff of at least %v first", gap, statusRetryBase)
+	}
+	for deadline := time.Now().Add(5 * time.Second); c.statusIsPending(); {
+		if time.Now().After(deadline) {
+			t.Fatal("the delivered resend left the report pending")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestRetryStatus_BacksOffDoublingToThePollWait: while the report keeps
+// failing, the retry waits statusRetryBase, doubling up to the poll wait --
+// the poll interval when there is no hold -- and the first report that
+// lands ends the retries.
+func TestRetryStatus_BacksOffDoublingToThePollWait(t *testing.T) {
+	statusRetryBase = 10 * time.Millisecond
+	t.Cleanup(func() { statusRetryBase = 2 * time.Second })
+	for _, tc := range []struct {
+		name                   string
+		pollInterval, pollWait time.Duration
+	}{
+		{"held polls", 10 * time.Second, 40 * time.Millisecond},
+		{"no hold", 40 * time.Millisecond, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeManteion(t)
+			f.failStatus = 8 // the first report and seven retries fail
+			c := f.client(applyTargets{Evaluator: newTestEvaluator()})
+			c.cfg.pollInterval, c.cfg.pollWait = tc.pollInterval, tc.pollWait
+			stop := startStatusRetry(t, c)
+			c.sendStatus(t.Context())
+			f.waitStatuses(t, 9)
+			for deadline := time.Now().Add(5 * time.Second); c.statusIsPending(); {
+				if time.Now().After(deadline) {
+					t.Fatal("the delivered retry left the report pending")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			time.Sleep(160 * time.Millisecond) // four capped backoffs: no report may follow the one that landed
+			stop()
+
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if len(f.statusAt) != 9 {
+				t.Fatalf("got %d reports, want 9: the first, seven failed retries and the one that landed", len(f.statusAt))
+			}
+			wants := []time.Duration{10, 20, 40, 40, 40, 40, 40, 40}
+			for i, w := range wants {
+				if gap := f.statusAt[i+1].Sub(f.statusAt[i]); gap < w*time.Millisecond {
+					t.Errorf("retry %d came %v after the failure before it, want at least %v", i+1, gap, w*time.Millisecond)
+				}
+			}
+			// Capped: 10+20+6·40 ms = 270 ms. Uncapped doubling: 10+20+...+1280 ms = 2.55 s.
+			if total := f.statusAt[8].Sub(f.statusAt[0]); total > 1500*time.Millisecond {
+				t.Errorf("eight retries took %v, want the backoff capped at 40ms", total)
+			}
+		})
+	}
+}
+
+// TestClose_EndsTheStatusRetry: the status retry is one of the client's
+// goroutines on its poll context, so Close ends it: nothing is re-sent once
+// Close has returned, however long manteion keeps refusing the report.
+func TestClose_EndsTheStatusRetry(t *testing.T) {
+	statusRetryBase = 100 * time.Millisecond
+	t.Cleanup(func() { statusRetryBase = 2 * time.Second })
+	f := newFakeManteion(t)
+	f.statusCode = http.StatusInternalServerError // every report is refused
+	f.register = `{"status":"registered","version":1,"etag":"1-a","rules":[],"active_faults":[]}`
+	f.setRules(newHoldingRules(wire.RuleSync{Version: 1, Etag: "1-a", Rules: []wire.CompiledRule{}, ActiveFaults: []wire.FaultRequest{}}).serve)
+	c, err := connectManteion(t.Context(), manteionConfig{
+		url: f.srv.URL, serviceName: "svc", instanceID: "pod-1",
+		initTimeout: 5 * time.Second, pollInterval: 10 * time.Second, pollWait: 30 * time.Second,
+		targets:    applyTargets{Evaluator: newTestEvaluator()},
+		httpClient: &http.Client{Timeout: 5 * time.Second},
+		logger:     slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close(context.Background()) }) // a failed wait must not leave the held poll to srv.Close
+	// The register's report, the loop's resend before its held poll, the
+	// first retry; the next retry is 200 ms away.
+	f.waitStatuses(t, 3)
+	if err := c.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_, statuses := f.snapshot()
+	time.Sleep(700 * time.Millisecond) // the next two backoffs
+	if _, after := f.snapshot(); len(after) != len(statuses) {
+		t.Fatalf("%d reports before Close returned, %d after: the retry outlived Close", len(statuses), len(after))
 	}
 }
