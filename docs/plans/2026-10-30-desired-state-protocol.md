@@ -89,6 +89,10 @@ Body gains `epoch` (int64, the instance's start time in unix nanoseconds). Dedup
 `POST /api/v1/sdk/register` persists `host` (`in-process|sidecar`, column `host_kind TEXT`) and
 `capabilities` (`JSONB`). The response body is the materialized `RuleSync` (same shape as a 200 poll)
 plus `status`. Registering with capabilities different from the stored ones bumps the service generation.
+If manteion cannot materialize the document (a broken rule or spec), register still answers 201 with a
+**no-document** body — `version: 0`, `etag: ""`, `rules: null`, `active_faults: null`, no `freeze_cfg`, no
+`replay_set` — and logs the cause; the instance applies nothing for such a body (it keeps its rules, slots,
+delay source and replay set) and keeps polling. Outside this case `rules` and `active_faults` are never null.
 
 ## 3. Instance behaviour (SDK and sidecar, shared core)
 - Loop: `wait=30` long-poll with `If-None-Match`; on 200 apply through the single `apply()` path (the path
