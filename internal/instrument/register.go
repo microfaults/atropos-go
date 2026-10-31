@@ -85,10 +85,11 @@ type applyTargets struct {
 	// CacheDrain, if set, observes every authoritative rule set apply
 	// installs -- polled, registered or pushed, and the empty set included
 	// (it is the common drain trigger). It diffs against the
-	// previously-seen active recording phases and fires a flush + W3 drain
-	// report for any that just ended (design doc Q2). Optional — nil means
-	// this SDK doesn't need automatic drain-report generation (e.g. it
-	// never records, or triggers draining some other way).
+	// previously-seen active recording phases, under ApplyMu, and a flush +
+	// W3 drain report goes out for any that just ended (design doc Q2) once
+	// ApplyMu is released. Optional — nil means this SDK doesn't need
+	// automatic drain-report generation (e.g. it never records, or triggers
+	// draining some other way).
 	CacheDrain *cacheDrainTracker
 	// Registry holds every running background fault; rule/slot removal stops
 	// faults through it (nil-safe: a nil registry stops nothing).
@@ -153,6 +154,13 @@ type applyReport struct {
 // once per delivery whichever way it arrives (design review §5;
 // desired-state protocol §3). Calls are serialized on targets.ApplyMu.
 //
+// No network I/O runs under that lock: reconcile applies the document under
+// it and collects the recording phases the rule set ended, and apply sends
+// their drain reports (CacheDrain.Drain) after releasing it, before it
+// returns. A caller holding a lock of its own across the apply (the manteion
+// client's applyMu) calls reconcile and drains once it has released that
+// lock too.
+//
 // scope selects the categories apply touches; the rest stay exactly as they
 // are. The client applies scopeAll. The /admin/rules push applies scopeRules,
 // so a pushed rule set never clears an admin fault slot, the delay source or
@@ -196,25 +204,35 @@ type applyReport struct {
 // ...", "apply active_faults: ...", "apply freeze_cfg: ...") so log grepping
 // can filter a single bootstrap phase without ambiguity.
 func apply(sync wire.RuleSync, targets applyTargets, scope applyScope) (applyReport, error) {
+	report, ended, err := reconcile(sync, targets, scope)
+	targets.CacheDrain.Drain(ended) // network I/O: after targets.ApplyMu is released
+	return report, err
+}
+
+// reconcile is apply but for the drain reports: it applies the document
+// under targets.ApplyMu and returns, with the report, the recording phases
+// the rule set ended, whose drain reports the caller sends once it holds no
+// lock (CacheDrain.Drain). A hard error applies nothing and ends no phase.
+func reconcile(sync wire.RuleSync, targets applyTargets, scope applyScope) (report applyReport, ended []recordingPhaseKey, err error) {
 	if targets.ApplyMu != nil {
 		targets.ApplyMu.Lock()
 		defer targets.ApplyMu.Unlock()
 	}
-	report := applyReport{Unsupported: []wire.UnsupportedRule{}, Errors: []string{}}
+	report = applyReport{Unsupported: []wire.UnsupportedRule{}, Errors: []string{}}
 
 	if scope == scopeAll && sync.Etag == "" && sync.Rules == nil {
 		slog.Default().Warn("desired state: manteion sent no document; keeping the current state")
-		return report, nil
+		return report, nil, nil
 	}
 
 	if scope&scopeRules != 0 && len(sync.Rules) > 0 && targets.Evaluator == nil {
-		return report, fmt.Errorf("apply rules: no Evaluator target for %d rules", len(sync.Rules))
+		return report, nil, fmt.Errorf("apply rules: no Evaluator target for %d rules", len(sync.Rules))
 	}
 	if scope&scopeFaults != 0 && len(sync.ActiveFaults) > 0 && targets.DemoEval == nil {
-		return report, errors.New("apply active_faults: no DemoEval target")
+		return report, nil, errors.New("apply active_faults: no DemoEval target")
 	}
 	if scope&scopeFreeze != 0 && sync.FreezeCfg != nil && targets.CacheBox == nil {
-		return report, errors.New("apply freeze_cfg: no CacheBox target")
+		return report, nil, errors.New("apply freeze_cfg: no CacheBox target")
 	}
 
 	if scope&scopeRules != 0 && sync.Rules != nil {
@@ -227,7 +245,7 @@ func apply(sync wire.RuleSync, targets applyTargets, scope applyScope) (applyRep
 		// Observe every authoritative rule set, INCLUDING empty: the recording
 		// phase whose rule drops out most often leaves the set empty, and that
 		// transition is exactly what triggers the flush + drain report.
-		targets.CacheDrain.Observe(sync.Rules)
+		ended = targets.CacheDrain.Observe(sync.Rules)
 	}
 
 	if scope&scopeFaults != 0 && sync.ActiveFaults != nil && targets.DemoEval != nil {
@@ -302,7 +320,7 @@ func apply(sync wire.RuleSync, targets applyTargets, scope applyScope) (applyRep
 		}
 	}
 
-	return report, nil
+	return report, ended, nil
 }
 
 // replayScope is the (experiment_id, phase_id) pair the document's replay

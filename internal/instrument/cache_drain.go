@@ -54,7 +54,9 @@ func endedRecordingPhases(prev, curr map[recordingPhaseKey]bool) []recordingPhas
 // applyTargets.CacheDrain; apply calls Observe for every authoritative
 // (non-nil, including empty) rule set it applies -- the empty set is the
 // common drain trigger, since a baseline-recorded service usually has no
-// rules besides the synthesized recording rule.
+// rules besides the synthesized recording rule -- under the core's apply
+// mutex, and Drain for the phases it returned once that mutex (and any lock
+// of the caller's) is released.
 type cacheDrainTracker struct {
 	cb     *cachebox.CacheBox
 	pusher *cachePushClient
@@ -74,22 +76,34 @@ func newCacheDrainTracker(cb *cachebox.CacheBox, pusher *cachePushClient, logger
 	return &cacheDrainTracker{cb: cb, pusher: pusher, logger: logger, active: map[recordingPhaseKey]bool{}}
 }
 
-// Observe diffs rules' active recording phases against the previous call
-// and, for each phase that dropped out, synchronously flushes cb and sends
-// a drain report via pusher. Best-effort: a drain failure is logged, never
-// returned, so it never blocks rule application. Nil-safe (a nil tracker's
-// Observe is a no-op), so applyTargets.CacheDrain is a true optional.
-func (t *cacheDrainTracker) Observe(rules []wire.CompiledRule) {
+// Observe diffs rules' active recording phases against the previous call,
+// records them as the active set, and returns the phases that dropped out:
+// their recording ended with this rule set. It does no I/O, so apply calls it
+// under the core's apply mutex and every delivery is observed exactly once,
+// in apply order; the drain reports go out through Drain. Nil-safe (a nil
+// tracker observes nothing), so applyTargets.CacheDrain is a true optional.
+func (t *cacheDrainTracker) Observe(rules []wire.CompiledRule) []recordingPhaseKey {
 	if t == nil {
-		return
+		return nil
 	}
 	curr := activeRecordingPhases(rules)
 
 	t.mu.Lock()
+	defer t.mu.Unlock()
 	ended := endedRecordingPhases(t.active, curr)
 	t.active = curr
-	t.mu.Unlock()
+	return ended
+}
 
+// Drain synchronously flushes cb and sends a drain report via pusher for
+// each phase in ended (what Observe returned). It is network I/O -- the push
+// client's flush, then the drain POST, each retried -- so callers run it with
+// no lock held. Best-effort: a drain failure is logged, never returned, so it
+// never blocks rule application. Nil-safe.
+func (t *cacheDrainTracker) Drain(ended []recordingPhaseKey) {
+	if t == nil {
+		return
+	}
 	for _, key := range ended {
 		resp := t.pusher.SendDrainReport(key.ExperimentID, key.PhaseID, t.cb)
 		if !resp.Accepted {

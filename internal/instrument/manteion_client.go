@@ -50,15 +50,31 @@ var errUnknownInstance = errors.New("manteion does not know this instance (404)"
 // startup polling, registration, desired-state sync with its status report,
 // and graceful shutdown.
 //
-// Lock order: applyMu comes first. While it is held, apply, confirmSlots and
-// the watchdog's reap (reapSlots) take the core's apply mutex
-// (targets.ApplyMu) and release it before they return, and sendStatus takes
-// statusMu, under which buildStatus takes syncMu and, after releasing it, the
-// replay-set puller's lock (puller.Status). syncMu is a leaf. The
-// /admin/rules push takes only the core's apply mutex; the puller calls
-// OnChange (sendStatus), and the poll loop and retryStatus call resendStatus
-// (statusMu), with no lock held. Nothing takes applyMu while holding any of
-// the others.
+// Lock order, outermost first: applyMu, the core's apply mutex
+// (targets.ApplyMu), the replay-set puller's reconcileMu, the puller's p.mu.
+// syncMu is a leaf, and statusMu is taken with no other lock held.
+//   - applyMu is taken with no lock held: by applyDesired's locked half
+//     (applyAndRecord), the 304 adoption and the watchdog's reap (reapSlots).
+//     Under it, reconcile, confirmSlots and reapStaleSlots take the core's
+//     apply mutex and release it before they return. The /admin/rules push
+//     takes the core's apply mutex alone.
+//   - Under the core's apply mutex, reconcile hands the replay set to the
+//     puller: Reconcile takes reconcileMu, then p.mu, and waits for a fetch
+//     it supersedes to stop with p.mu released (that fetch's goroutine takes
+//     only p.mu, and a superseded fetch calls no OnChange). The puller's
+//     retry of a failed pull takes reconcileMu, then p.mu, with nothing else
+//     held.
+//   - statusMu serializes the status reports. sendStatus (applyDesired after
+//     releasing applyMu, the puller's OnChange) and resendStatus (the poll
+//     loop, retryStatus) take it with no other lock held; under it,
+//     buildStatus takes syncMu and, after releasing it, p.mu (puller.Status).
+//   - syncMu is taken under applyMu (the bookkeeping, adoptGeneration,
+//     reapSlots) and under statusMu, and nothing is taken under it.
+//
+// No lock is held across network I/O but statusMu, which exists to send the
+// reports one at a time: polls and registrations go out with no lock held,
+// and applyDesired releases applyMu -- apply, the core's mutex -- before the
+// drain reports and the status report go out.
 type ManteionClient struct {
 	cfg        manteionConfig
 	httpClient *http.Client // short-lived calls: init, register, status, deregister, a poll without a hold
@@ -83,10 +99,10 @@ type ManteionClient struct {
 	lastPollAt  atomic.Int64 // unix nanos; 0 = never polled
 	status      atomic.Int32
 
-	// applyMu serializes applyDesired, the 304 adoption and the watchdog's
-	// reap: an apply and the generation/ETag/report bookkeeping that follows
-	// it are one unit, so a register goroutine, the poll loop and the
-	// watchdog never interleave.
+	// applyMu serializes applyDesired's apply with its bookkeeping
+	// (applyAndRecord), the 304 adoption and the watchdog's reap: an apply and
+	// the generation/ETag/report bookkeeping that follows it are one unit, so
+	// a register goroutine, the poll loop and the watchdog never interleave.
 	applyMu sync.Mutex
 	// confirmed lists the active-fault slots the last successful apply that
 	// reconciled slots confirmed, less any the watchdog has dropped since.
@@ -545,8 +561,12 @@ func (c *ManteionClient) forgetDocument() {
 // register answer -- through the single apply path (scopeAll), records what
 // the instance now holds and reports it: the generation (ruleVersion,
 // atropos_sync_generation), the ETag the next poll sends back as
-// If-None-Match, and the report of what could not be held; then the status
-// report goes out. source ("poll" | "register") labels the log lines.
+// If-None-Match, and the report of what could not be held. The apply and the
+// bookkeeping run under applyMu (applyAndRecord); then, with no lock held,
+// the drain reports of the recording phases the rule set ended go out, and
+// the status report after them (statusMu and the snapshot built at send time
+// keep the reports in order). source ("poll" | "register") labels the log
+// lines.
 //
 // A no-document body -- neither an etag nor rules: manteion could not
 // materialize the desired state (spec §2 Register) -- changes nothing: the
@@ -562,6 +582,17 @@ func (c *ManteionClient) forgetDocument() {
 // sends the status report; a failed report is marked pending by sendStatus,
 // never returned: applyDesired returns nil.
 func (c *ManteionClient) applyDesired(ctx context.Context, doc wire.RuleSync, etag, source string) error {
+	ended := c.applyAndRecord(doc, etag, source)
+	c.targets.CacheDrain.Drain(ended)
+	c.sendStatus(ctx)
+	return nil
+}
+
+// applyAndRecord is applyDesired's half under applyMu: the apply (reconcile,
+// which takes the core's apply mutex) and the bookkeeping that records what
+// the instance now holds. It returns the recording phases whose drain
+// reports are due, for applyDesired to send once applyMu is released.
+func (c *ManteionClient) applyAndRecord(doc wire.RuleSync, etag, source string) []recordingPhaseKey {
 	c.applyMu.Lock()
 	defer c.applyMu.Unlock()
 	c.syncMu.Lock()
@@ -574,36 +605,38 @@ func (c *ManteionClient) applyDesired(ctx context.Context, doc wire.RuleSync, et
 		c.logger.Warn("desired state: manteion sent no document; keeping the current state",
 			"source", source, "generation", c.ruleVersion.Load(), "etag", c.currentEtag())
 		c.confirmSlots()
-	} else if report, err := apply(doc, c.targets, scopeAll); err != nil {
+		return nil
+	}
+	report, ended, err := reconcile(doc, c.targets, scopeAll)
+	if err != nil {
 		c.logger.Error("apply failed, keeping stale state", "source", source, "generation", doc.Version, "error", err)
 		c.syncMu.Lock()
 		c.lastReport = applyReport{Unsupported: []wire.UnsupportedRule{}, Errors: []string{err.Error()}}
 		c.syncMu.Unlock()
-	} else {
-		for _, e := range report.Errors {
-			c.logger.Warn(source+": desired state not fully applied", "error", e)
-		}
-		if report.Confirmed != nil { // nil: the document left the slots alone
-			c.confirmed = report.Confirmed
-		}
-		c.syncMu.Lock()
-		c.ruleVersion.Store(doc.Version)
-		c.etag = etag
-		c.lastReport = report
-		metrics.SyncGeneration.Set(float64(doc.Version))
-		c.syncMu.Unlock()
-		c.logger.Info("rules updated",
-			"source", source,
-			"version", doc.Version,
-			"generation", doc.Version,
-			"etag", etag,
-			"rules_count", len(doc.Rules),
-			"manual_faults", len(doc.ActiveFaults),
-			"unsupported", len(report.Unsupported))
-		c.confirmSlots()
+		return nil // a hard error applies nothing and ends no phase
 	}
-	c.sendStatus(ctx)
-	return nil
+	for _, e := range report.Errors {
+		c.logger.Warn(source+": desired state not fully applied", "error", e)
+	}
+	if report.Confirmed != nil { // nil: the document left the slots alone
+		c.confirmed = report.Confirmed
+	}
+	c.syncMu.Lock()
+	c.ruleVersion.Store(doc.Version)
+	c.etag = etag
+	c.lastReport = report
+	metrics.SyncGeneration.Set(float64(doc.Version))
+	c.syncMu.Unlock()
+	c.logger.Info("rules updated",
+		"source", source,
+		"version", doc.Version,
+		"generation", doc.Version,
+		"etag", etag,
+		"rules_count", len(doc.Rules),
+		"manual_faults", len(doc.ActiveFaults),
+		"unsupported", len(report.Unsupported))
+	c.confirmSlots()
+	return ended
 }
 
 // confirmSlots re-confirms the active-fault slots the last successful apply

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -130,5 +131,98 @@ func TestApply_PollAndPushSerializeOnTheCoreMutex(t *testing.T) {
 	wg.Wait()
 	if n := overlaps.Load(); n != 0 {
 		t.Fatalf("%d applies overlapped: poll and push must serialize on the core's apply mutex", n)
+	}
+}
+
+// TestApply_NetworkIOGoesOutWithNoApplyLockHeld: applies serialize on the
+// client's applyMu and the core's apply mutex, but neither is held across
+// network I/O. The drain report of a recording phase a rule set ends goes out
+// once the core's mutex -- and, from the sync, the client's too -- is
+// released, and so does the status report after a sync apply. Held, a slow
+// manteion would stall the poll loop's 304s, the watchdog and every
+// /admin/rules push behind the report.
+func TestApply_NetworkIOGoesOutWithNoApplyLockHeld(t *testing.T) {
+	var mu sync.Mutex
+	var locks []*sync.Mutex  // the apply locks each drain and status POST must find free
+	var docs []wire.RuleSync // the poll's answers, in order
+	posts, held := map[string]int{}, map[string]int{}
+	check := func(path string) {
+		mu.Lock()
+		defer mu.Unlock()
+		posts[path]++
+		for _, l := range locks {
+			if !l.TryLock() {
+				held[path]++
+				continue
+			}
+			l.Unlock()
+		}
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/cache/ingest":
+			w.WriteHeader(http.StatusCreated)
+		case "/api/v1/sdk/cachebox/drain":
+			check(r.URL.Path)
+			_ = json.NewEncoder(w).Encode(wire.DrainReportResponse{Accepted: true})
+		case "/api/v1/sdk/status":
+			check(r.URL.Path)
+			w.WriteHeader(http.StatusNoContent)
+		case "/api/v1/sdk/rules":
+			mu.Lock()
+			doc := docs[0]
+			docs = docs[1:]
+			mu.Unlock()
+			respond200(doc)(w, r)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	logger := slog.New(slog.DiscardHandler)
+	core := NewCore(CoreConfig{Service: "svc", Instance: "pod-1", ManteionURL: srv.URL, Logger: logger})
+	t.Cleanup(core.Stop)
+	c := &ManteionClient{
+		cfg:        manteionConfig{url: srv.URL, serviceName: "svc", instanceID: "pod-1", pollInterval: 10 * time.Second},
+		httpClient: &http.Client{Timeout: 5 * time.Second},
+		targets:    core.targets(nil),
+		logger:     logger,
+	}
+	recording := []wire.CompiledRule{recordingRule("r1", "exp-1", "phase-1")}
+	mu.Lock()
+	locks = []*sync.Mutex{&core.applyMu, &c.applyMu}
+	docs = []wire.RuleSync{
+		{Version: 1, Etag: "1-a", Rules: recording, ActiveFaults: []wire.FaultRequest{}},
+		{Version: 2, Etag: "2-b", Rules: []wire.CompiledRule{}, ActiveFaults: []wire.FaultRequest{}}, // the phase's recording ends
+	}
+	mu.Unlock()
+	for range 2 {
+		if err := c.fetchRules(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The push records, then tears down: its drain report goes out with the
+	// core's mutex released too.
+	push := rulesAdminHandler(core.targets(nil))
+	body, err := json.Marshal(recording)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range []string{string(body), "null"} {
+		rec := httptest.NewRecorder()
+		push.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/rules", strings.NewReader(b)))
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("push %s: %d %s", b, rec.Code, rec.Body.String())
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if posts["/api/v1/sdk/cachebox/drain"] != 2 || posts["/api/v1/sdk/status"] != 2 {
+		t.Fatalf("POSTs = %v, want 2 drain reports (the sync's and the push's teardown, each once) and 2 status reports (one per sync apply)", posts)
+	}
+	if len(held) != 0 {
+		t.Fatalf("POSTs that found an apply lock held: %v, want none", held)
 	}
 }
