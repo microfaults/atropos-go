@@ -64,21 +64,34 @@ func TestRuleSync_WireRoundTripAndApply(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 	// Key names are load-bearing: manteion handlers and the SDK client meet
-	// only at this JSON.
-	for _, key := range []string{`"version"`, `"etag"`, `"rules"`, `"active_faults"`, `"freeze_cfg"`,
-		`"replay_set"`, `"experiment_id"`, `"phase_id"`, `"key_strategy"`, `"size_bytes"`,
-		`"fault_type"`, `"params"`} {
+	// only at this JSON. The replay set is pinned as one object, in contract
+	// order, so a tag typo in any of its eight keys fails here.
+	for _, key := range []string{`"version"`, `"etag"`, `"rules"`, `"active_faults"`, `"freeze_cfg"`, `"fault_type"`, `"params"`} {
 		if !strings.Contains(string(raw), key) {
 			t.Errorf("wire payload missing %s: %s", key, raw)
 		}
+	}
+	wantRef := `"replay_set":{"id":"sha256:abc","experiment_id":"exp-1","phase_id":"phase-1","key_strategy":"canonical_v2","count":2,"sha256":"deadbeef","size_bytes":128,"url":"/api/v1/cache/artifacts/sha256:abc"}`
+	if !strings.Contains(string(raw), wantRef) {
+		t.Errorf("replay_set not pinned in contract order\nwant: %s\ngot:  %s", wantRef, raw)
 	}
 	var decoded wire.RuleSync
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if decoded.Etag != "7-9f1c0e3a7b2d4f60" || decoded.ReplaySet == nil || decoded.ReplaySet.Count != 2 ||
-		decoded.ReplaySet.ExperimentID != "exp-1" || decoded.ReplaySet.PhaseID != "phase-1" {
+	if decoded.Etag != sync.Etag || decoded.ReplaySet == nil || *decoded.ReplaySet != *sync.ReplaySet {
 		t.Fatalf("etag/replay_set did not round-trip: %+v", decoded)
+	}
+
+	// omitempty contract: an unset etag and an absent replay set stay off the wire.
+	emptyRaw, err := json.Marshal(wire.RuleSync{Version: 8})
+	if err != nil {
+		t.Fatalf("marshal empty: %v", err)
+	}
+	for _, key := range []string{`"etag"`, `"replay_set"`} {
+		if strings.Contains(string(emptyRaw), key) {
+			t.Errorf("empty RuleSync must omit %s: %s", key, emptyRaw)
+		}
 	}
 
 	// Apply the decoded payload into fresh targets.
