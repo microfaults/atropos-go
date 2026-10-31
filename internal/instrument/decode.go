@@ -28,6 +28,7 @@ type decodeConfig struct {
 	inlineToxic  InlineToxicHost
 	resourceHost ResourceHost
 	capabilities map[string]bool // nil = everything
+	logger       *slog.Logger    // where decodeRuleSet reports the rules it skips; nil = slog.Default()
 }
 
 // ResourceHost builds the fault that executes a resource-category fault on
@@ -82,6 +83,13 @@ func withNetworkResolver(r wire.NetworkResolver) decodeOption {
 	return func(c *decodeConfig) { c.resolve = r }
 }
 
+// withLogger sets the logger decodeRuleSet reports the rules it skips to: the
+// host's, so the line reaches wherever the host's logs go. Without one the
+// warnings go to slog.Default().
+func withLogger(l *slog.Logger) decodeOption {
+	return func(c *decodeConfig) { c.logger = l }
+}
+
 func buildDecodeConfig(opts []decodeOption) *decodeConfig {
 	cfg := &decodeConfig{}
 	for _, o := range opts {
@@ -115,6 +123,7 @@ type ruleSetDecode struct {
 // (see ruleSetDecode): one rule this host cannot execute, or cannot decode,
 // must not wedge the whole desired state (D7: counted, logged and reported).
 func decodeRuleSet(compiled []wire.CompiledRule, opts ...decodeOption) ruleSetDecode {
+	logger := orDefault(buildDecodeConfig(opts).logger)
 	sorted := make([]wire.CompiledRule, len(compiled))
 	copy(sorted, compiled)
 	sort.SliceStable(sorted, func(i, j int) bool {
@@ -132,12 +141,12 @@ func decodeRuleSet(compiled []wire.CompiledRule, opts ...decodeOption) ruleSetDe
 			var unsup *UnsupportedFaultError
 			if errors.As(err, &unsup) {
 				metrics.RulesUnsupportedTotal.WithLabelValues(unsup.Category).Inc()
-				slog.Default().Warn("rule skipped: not executable by this host",
+				logger.Warn("rule skipped: not executable by this host",
 					"rule", cr.Name, "category", unsup.Category, "fault_type", unsup.FaultType)
 				out.Unsupported = append(out.Unsupported, wire.UnsupportedRule{Rule: cr.Name, Category: unsup.Category})
 				continue
 			}
-			slog.Default().Warn("rule skipped: decode error", "rule", cr.Name, "error", err)
+			logger.Warn("rule skipped: decode error", "rule", cr.Name, "error", err)
 			out.Errors = append(out.Errors, fmt.Sprintf("rule %s: decode: %v", cr.Name, err))
 			continue
 		}

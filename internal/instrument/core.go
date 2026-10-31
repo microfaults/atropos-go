@@ -163,6 +163,7 @@ func (c *Core) targets(resolver wire.NetworkResolver) applyTargets {
 		DecodeOpts:      c.decodeOpts,
 		Arm:             c.armFn(),
 		ApplyMu:         &c.applyMu,
+		Logger:          c.logger,
 	}
 }
 

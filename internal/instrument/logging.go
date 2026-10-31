@@ -26,6 +26,15 @@ func NewLogger(w io.Writer, lp otellog.LoggerProvider) *slog.Logger {
 	))
 }
 
+// orDefault returns l, or slog.Default() when l is nil: the logger of code that
+// has none handed in, such as the tests that build the apply path by hand.
+func orDefault(l *slog.Logger) *slog.Logger {
+	if l == nil {
+		return slog.Default()
+	}
+	return l
+}
+
 // teeHandler sends each record to every handler behind it that is enabled at
 // the record's level. It stands in for slog.NewMultiHandler, which arrives in
 // Go 1.26, above this module's Go 1.25 floor.

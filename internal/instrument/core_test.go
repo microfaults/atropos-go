@@ -80,6 +80,31 @@ func TestCore_HostRulesWinOverAdminSlot(t *testing.T) {
 	}
 }
 
+// The targets a core hands out carry the core's logger: an /admin/rules push,
+// which has no client behind it offline, reports the rules it skips to the
+// host's logger.
+func TestCore_PushedRulesWarnThroughTheCoresLogger(t *testing.T) {
+	capture := &logCapture{}
+	c := NewCore(CoreConfig{Service: "svc", Instance: "pod-1", Logger: capture.logger(), Capabilities: []string{CapInline}})
+	t.Cleanup(c.Stop)
+
+	body, err := json.Marshal(skippedRules())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	rulesAdminHandler(c.targets(nil), nil).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/rules", bytes.NewReader(body)))
+	if rec.Code != http.StatusUnprocessableEntity { // the malformed rule makes the push a 422; the rest applies
+		t.Fatalf("push: %d %s", rec.Code, rec.Body.String())
+	}
+	if e, ok := capture.find("rule skipped: not executable by this host"); !ok || e.attrs["rule"] != "cpu" {
+		t.Fatalf("core logger got %q, want the unsupported-rule warning for rule cpu", capture.messages())
+	}
+	if e, ok := capture.find("rule skipped: decode error"); !ok || e.attrs["rule"] != "bad" {
+		t.Fatalf("core logger got %q, want the decode-error warning for rule bad", capture.messages())
+	}
+}
+
 // TestApply_PollAndPushSerializeOnTheCoreMutex: every targets() of one core
 // carries the same apply mutex, so the manteion client's apply (poll and
 // register) and the /admin/rules push never interleave. Interleaved, one

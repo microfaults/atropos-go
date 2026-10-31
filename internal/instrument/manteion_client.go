@@ -643,7 +643,11 @@ func (c *ManteionClient) applyAndRecord(doc wire.RuleSync, etag, source string) 
 		c.confirmSlots()
 		return nil
 	}
-	report, ended, err := reconcile(doc, c.targets, scopeAll)
+	// The warnings apply raises for what it skips go where the client's own log
+	// lines do.
+	targets := c.targets
+	targets.Logger = c.logger
+	report, ended, err := reconcile(doc, targets, scopeAll)
 	if err != nil {
 		c.logger.Error("apply failed, keeping stale state", "source", source, "generation", doc.Version, "error", err)
 		c.syncMu.Lock()

@@ -782,3 +782,80 @@ func TestReapStaleSlots_WaitsForAnApplyInProgress(t *testing.T) {
 		t.Fatalf("slots = %v, want slot-a kept: it was refreshed before the reap looked", ids)
 	}
 }
+
+// cpuSlotDocument names a resource slot an inline-only host cannot hold, beside
+// the rule set of skippedRules: one malformed rule, one resource rule it cannot
+// hold, one that applies.
+func cpuSlotDocument() wire.RuleSync {
+	return wire.RuleSync{
+		Etag:  "1-a",
+		Rules: skippedRules(),
+		ActiveFaults: []wire.FaultRequest{
+			{ID: "slot-cpu", Category: "resource", FaultType: "cpu", DurationMs: 1000, Params: json.RawMessage(`{"target_load":0.1}`)},
+		},
+	}
+}
+
+func inlineOnlyTargets() applyTargets {
+	return applyTargets{
+		Evaluator:  newTestEvaluator(),
+		DemoEval:   &demoEvaluator{},
+		DecodeOpts: []decodeOption{WithCapabilities(CapInline)},
+	}
+}
+
+// Every warning apply raises -- an empty document under scopeAll, the rules it
+// skips (decodeRuleSet), a slot this host cannot execute -- goes to the logger
+// the targets carry, with the rule or slot named.
+func TestApply_WarningsGoToTheTargetsLogger(t *testing.T) {
+	capture := &logCapture{}
+	targets := inlineOnlyTargets()
+	targets.Logger = capture.logger()
+
+	if _, err := apply(wire.RuleSync{}, targets, scopeAll); err != nil {
+		t.Fatalf("apply of an empty document: %v", err)
+	}
+	if e, ok := capture.find("desired state: manteion sent no document"); !ok || e.level != slog.LevelWarn {
+		t.Fatalf("logger got %q, want the no-document warning", capture.messages())
+	}
+
+	if _, err := apply(cpuSlotDocument(), targets, scopeAll); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	e, ok := capture.find("active fault skipped: not executable by this host")
+	if !ok {
+		t.Fatalf("logger got %q, want the skipped-slot warning", capture.messages())
+	}
+	if e.level != slog.LevelWarn || e.attrs["slot"] != "slot-cpu" || e.attrs["category"] != "resource" || e.attrs["fault_type"] != "cpu" {
+		t.Fatalf("skipped-slot record = %v %v, want a Warn for slot slot-cpu, category resource, fault_type cpu", e.level, e.attrs)
+	}
+	// The rule set rides the same targets: decodeRuleSet reports to that logger too.
+	for _, prefix := range []string{"rule skipped: decode error", "rule skipped: not executable by this host"} {
+		if _, ok := capture.find(prefix); !ok {
+			t.Fatalf("logger got %q, want the rule set's %q warning", capture.messages(), prefix)
+		}
+	}
+}
+
+// Targets built without a logger -- tests, and anything that assembles them by
+// hand -- keep warning through slog.Default().
+func TestApply_WithoutALoggerFallsBackToSlogDefault(t *testing.T) {
+	out := captureDefaultSlog(t)
+	targets := inlineOnlyTargets()
+	if _, err := apply(wire.RuleSync{}, targets, scopeAll); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := apply(cpuSlotDocument(), targets, scopeAll); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"desired state: manteion sent no document",
+		"active fault skipped: not executable by this host",
+		"rule skipped: decode error",
+		"rule skipped: not executable by this host",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("the default logger wrote %q, want it to carry %q", out.String(), want)
+		}
+	}
+}

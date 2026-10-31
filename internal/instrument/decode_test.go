@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"strings"
 	"testing"
@@ -556,6 +557,57 @@ func TestDecodeRuleSet_MixedSetReportsEachRuleOnItsOwn(t *testing.T) {
 	}
 	if got := unsupportedCount(t, "composition") - compositionBefore; got != 1 {
 		t.Fatalf("atropos_rules_unsupported_total{composition} += %v, want 1", got)
+	}
+}
+
+// skippedRules is one rule that does not decode, one this host cannot execute
+// (a resource fault under inline-only capabilities) and one that applies.
+func skippedRules() []wire.CompiledRule {
+	return []wire.CompiledRule{
+		{Name: "bad", Mode: "inline", Fault: &wire.CompiledFault{
+			Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"bogus"}`)}},
+		{Name: "cpu", Mode: "background", Fault: &wire.CompiledFault{
+			Category: "resource", FaultType: "cpu", DurationMs: 1000, Params: json.RawMessage(`{"target_load":0.1}`)}},
+		{Name: "good", Mode: "inline", Fault: &wire.CompiledFault{
+			Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"1ms"}`)}},
+	}
+}
+
+// The warnings decodeRuleSet raises for the rules it skips go to the logger its
+// options carry -- the host's, not the process default -- with the rule named
+// and, for an unsupported one, its category and fault type.
+func TestDecodeRuleSet_SkippedRulesAreLoggedThroughTheGivenLogger(t *testing.T) {
+	capture := &logCapture{}
+	decodeRuleSet(skippedRules(), WithCapabilities(CapInline), withLogger(capture.logger()))
+
+	e, ok := capture.find("rule skipped: decode error")
+	if !ok {
+		t.Fatalf("logger got %q, want the decode-error warning", capture.messages())
+	}
+	if e.level != slog.LevelWarn || e.attrs["rule"] != "bad" || !strings.Contains(fmt.Sprint(e.attrs["error"]), "bogus") {
+		t.Fatalf("decode-error record = %v %v, want a Warn for rule bad naming the bogus value", e.level, e.attrs)
+	}
+	e, ok = capture.find("rule skipped: not executable by this host")
+	if !ok {
+		t.Fatalf("logger got %q, want the unsupported-rule warning", capture.messages())
+	}
+	if e.level != slog.LevelWarn || e.attrs["rule"] != "cpu" || e.attrs["category"] != "resource" || e.attrs["fault_type"] != "cpu" {
+		t.Fatalf("unsupported record = %v %v, want a Warn for rule cpu, category resource, fault_type cpu", e.level, e.attrs)
+	}
+	if got := capture.messages(); len(got) != 2 {
+		t.Fatalf("logger got %q, want exactly the two warnings", got)
+	}
+}
+
+// With no logger option -- tests, and anything that builds the decode by hand --
+// the same warnings keep going to slog.Default().
+func TestDecodeRuleSet_WithoutALoggerFallsBackToSlogDefault(t *testing.T) {
+	out := captureDefaultSlog(t)
+	decodeRuleSet(skippedRules(), WithCapabilities(CapInline))
+	for _, want := range []string{"rule skipped: decode error", "rule skipped: not executable by this host"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("the default logger wrote %q, want it to carry %q", out.String(), want)
+		}
 	}
 }
 

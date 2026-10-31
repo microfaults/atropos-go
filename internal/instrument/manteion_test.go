@@ -173,6 +173,32 @@ func TestManteionClient_PollLoop_RuleUpdate(t *testing.T) {
 	}
 }
 
+// The warnings a client's apply raises for what it skips -- a rule that does
+// not decode, a rule or slot this host cannot execute -- go to the client's own
+// logger (the one the host gave it), not to the process default.
+func TestManteionClient_ApplyWarningsGoToTheClientsLogger(t *testing.T) {
+	capture := &logCapture{}
+	c := &ManteionClient{
+		cfg:     manteionConfig{serviceName: "svc"},
+		targets: inlineOnlyTargets(),
+		logger:  capture.logger(),
+	}
+	c.applyAndRecord(cpuSlotDocument(), "1-a", "poll")
+
+	e, ok := capture.find("rule skipped: decode error")
+	if !ok || e.attrs["rule"] != "bad" {
+		t.Fatalf("client logger got %q, want the decode-error warning for rule bad", capture.messages())
+	}
+	e, ok = capture.find("rule skipped: not executable by this host")
+	if !ok || e.attrs["rule"] != "cpu" || e.attrs["category"] != "resource" {
+		t.Fatalf("client logger got %q, want the unsupported-rule warning for rule cpu", capture.messages())
+	}
+	e, ok = capture.find("active fault skipped: not executable by this host")
+	if !ok || e.attrs["slot"] != "slot-cpu" {
+		t.Fatalf("client logger got %q, want the skipped-slot warning for slot-cpu", capture.messages())
+	}
+}
+
 func TestManteionClient_PollLoop_Recovery(t *testing.T) {
 	var calls atomic.Int32
 

@@ -105,6 +105,11 @@ type applyTargets struct {
 	// manteion client's applies and the /admin/rules push never interleave.
 	// Nil (targets built by hand) means no locking.
 	ApplyMu *sync.Mutex
+	// Logger receives the warnings an apply raises for what it skips: a rule
+	// or active-fault slot this host cannot execute or build, and an empty
+	// document. Core.targets sets the core's logger and the manteion client
+	// applies with its own. Nil (targets built by hand) means slog.Default().
+	Logger *slog.Logger
 }
 
 // decodeOpts is the option set every decode under these targets uses.
@@ -112,6 +117,9 @@ func (t applyTargets) decodeOpts() []decodeOption {
 	opts := append([]decodeOption(nil), t.DecodeOpts...)
 	if t.NetworkResolver != nil {
 		opts = append(opts, withNetworkResolver(t.NetworkResolver))
+	}
+	if t.Logger != nil {
+		opts = append(opts, withLogger(t.Logger))
 	}
 	return opts
 }
@@ -224,7 +232,7 @@ func reconcile(sync wire.RuleSync, targets applyTargets, scope applyScope) (repo
 	report = applyReport{Unsupported: []wire.UnsupportedRule{}, Errors: []string{}}
 
 	if scope == scopeAll && sync.Etag == "" && sync.Rules == nil {
-		slog.Default().Warn("desired state: manteion sent no document; keeping the current state")
+		orDefault(targets.Logger).Warn("desired state: manteion sent no document; keeping the current state")
 		return report, nil, nil
 	}
 
@@ -377,7 +385,7 @@ func applyActiveFault(req wire.FaultRequest, targets applyTargets) error {
 		var unsup *UnsupportedFaultError
 		if errors.As(err, &unsup) {
 			metrics.RulesUnsupportedTotal.WithLabelValues(unsup.Category).Inc()
-			slog.Default().Warn("active fault skipped: not executable by this host",
+			orDefault(targets.Logger).Warn("active fault skipped: not executable by this host",
 				"slot", id, "category", unsup.Category, "fault_type", unsup.FaultType)
 		}
 		return err
