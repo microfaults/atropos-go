@@ -20,7 +20,9 @@ import (
 // request span too). Control paths are mounted beside it, never inside it.
 func IngressMiddleware(next http.Handler, serviceName string, i *interceptor.Interceptor) http.Handler {
 	faulted := i.IngressMiddleware(next)
-	traced := otelhttp.NewHandler(faulted, serviceName)
+	// The service-named span is kept on purpose until Task 9 adopts the semconv "METHOD /route" name.
+	traced := otelhttp.NewHandler(faulted, serviceName,
+		otelhttp.WithSpanNameFormatter(func(operation string, _ *http.Request) string { return operation }))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rec := interceptor.NewStatusRecorder(w)
 		start := time.Now()
