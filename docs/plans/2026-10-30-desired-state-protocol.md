@@ -10,12 +10,18 @@
   gated by running phases (as `ForService` does today), active fault configs, the synthesized cache-box rule
   for the service's current cache-box role, the freeze delay config of a frozen phase, the replay-set
   artifact of a frozen phase, all **filtered by the instance's capabilities** (`inline|network|resource|
-  cachebox`; a cache-box rule needs `cachebox`; absent capabilities = all). Compositions are shipped as today.
+  cachebox`; a cache-box rule needs `cachebox`; absent capabilities = all). Compositions are filtered leaf by
+  leaf: an instance missing any leaf's category never receives the composition and never reports it as
+  unsupported (one that has every leaf's category receives it and handles it as §3 says).
 - Each service has a **generation** (`service_generations(service TEXT PRIMARY KEY, generation BIGINT NOT NULL
-  DEFAULT 1, updated_at TIMESTAMPTZ)`), bumped in the same transaction as any input change: rule CRUD, fault
-  config fire/cancel/reap, phase enter/exit/drain/teardown for every service in the phase, freeze/thaw,
-  artifact assignment, an instance registering with different capabilities, kill switch. The in-memory
-  `IntentTracker` is deleted; a manteion restart changes nothing.
+  DEFAULT 1, updated_at TIMESTAMPTZ)`), bumped on the input changes below: in the same transaction where the
+  input is a transactional write, otherwise right after commit, with the content hash as backstop. Bumped
+  inputs: rule CRUD, fault config fire/cancel/reap, phase enter/exit/drain/teardown for every service in the
+  phase, freeze/thaw, artifact assignment, an instance registering with different capabilities, kill switch.
+  Some document changes are not bumped: attaching or detaching a phase's rules, and phase or experiment
+  deletion. They reach instances through the content hash within one `wait` (the held request re-materializes
+  when it elapses, and a different hash answers `200`). The in-memory `IntentTracker` is deleted; a manteion
+  restart changes nothing.
 - The **ETag** of a materialized document is `"<sha256 hex[:16] of the canonical JSON>"` — the content hash
   alone, never the generation (amended 2026-10-30: the first draft prefixed the generation, which made every
   bump a new ETag and the 304 path unreachable). The generation travels in `X-Atropos-Generation` and in the
@@ -31,18 +37,24 @@
   is how convergence is observed; no extra round trip in the common case).
 - Request header `If-None-Match: "<etag>"` (the ETag of the last 200 the instance applied, or of the last
   304 it confirmed).
-- `wait` (seconds, default 0, max 60): long-poll. manteion holds the request until the service's generation
-  changes or `wait` elapses, re-materializes, and compares ETags.
+- `wait` (seconds, default 0, max 60): long-poll. manteion holds the request only when `version` equals the
+  service's current generation AND the ETag matches the materialized document; it then holds until the
+  service's generation changes or `wait` elapses, re-materializes, and compares ETags again. A matching ETag
+  with an older (or absent/zero) `version` is answered `304` at once, with the current generation in
+  `X-Atropos-Generation` and the ETag in `ETag`. Without a matching ETag (a mismatch, or no `If-None-Match`)
+  the request is answered `200` at once.
 - `200` with body `RuleSync` and headers `ETag`, `X-Atropos-Generation: <G>`.
-- `304` with headers `ETag`, `X-Atropos-Generation: <G>` when the ETag matches after the hold. On 304 the
-  instance sets its observed generation to `G` without re-applying (its document is provably unchanged).
-- Errors as today (`application/problem+json` on the branch's error envelope).
+- `304` with headers `ETag`, `X-Atropos-Generation: <G>` when the ETag matches (at once when `version` is
+  behind the generation, otherwise after the hold). On 304 the instance sets its observed generation to `G`
+  without re-applying (its document is provably unchanged).
+- Errors as today, in manteion's `{"error": "..."}` envelope served as `application/json` (not
+  `application/problem+json`).
 
 `RuleSync` (wire, atropos-go `internal/wire/sync.go`):
 ```json
 {
   "version": 42,                       // the generation (kept under the old name)
-  "etag": "42-9f1c0e3a7b2d4f60",
+  "etag": "9f1c0e3a7b2d4f60",
   "rules": [ /* CompiledRule, never null */ ],
   "active_faults": [ /* FaultRequest, never null */ ],
   "freeze_cfg": { "mu": 0.0, "sigma": 0.0, "seed": 7, "context": { "experiment_id": "...", "phase_id": "..." } },
@@ -59,7 +71,7 @@ source / replay set if it holds one from an earlier state.
 ### `POST /api/v1/sdk/status`
 Body:
 ```json
-{ "instance_id": "I", "service": "S", "applied_generation": 42, "etag": "42-...",
+{ "instance_id": "I", "service": "S", "applied_generation": 42, "etag": "...",
   "unsupported": [ { "rule": "cpu-quota", "category": "resource" } ],
   "errors": [ "rule x: decode: ..." ],
   "replay_set": { "id": "sha256:...", "state": "committed" } }
