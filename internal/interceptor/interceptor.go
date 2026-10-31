@@ -114,9 +114,11 @@ func (i *Interceptor) Logger() *slog.Logger {
 
 // CheckResult holds the outcome of a fault-injection check. RunID is the id
 // of the fault run the request started or joined (atropos.fault.id). Joined
-// reports that the request joined a background run already in progress
-// instead of starting one: Handle is then nil, so no caller waits on a run
-// it did not start, while Decision still describes the fault.
+// reports that the call joined a background run already in progress instead
+// of starting one: Handle is then nil, so no caller waits on a run it did
+// not start, while Decision still describes the fault. A join is reported
+// whatever made it; the run counts it only when a request did (see
+// startRegistered).
 type CheckResult struct {
 	Handle   *fault.Handle
 	Decision *evaluator.Decision
@@ -267,7 +269,9 @@ func (i *Interceptor) startDirect(ctx context.Context, req evaluator.Request, de
 // request's server span) -- and links the request (trigger) and the
 // requests this interceptor saw before it (recent). Started or joined, the
 // request's span carries the run id; a joiner's span also links the run's
-// fault span, and the run counts the join.
+// fault span, and the run counts the join. A join with no request span
+// (Core.Arm re-arming from context.Background() on every rule delivery) is
+// reported to the caller but not counted: no request made it.
 func (i *Interceptor) startRegistered(ctx, spanParent context.Context, req evaluator.Request, decision *evaluator.Decision, faultType string, mode evaluator.Mode) (CheckResult, error) {
 	key := decision.Name
 	if key == "" {
@@ -301,20 +305,26 @@ func (i *Interceptor) startRegistered(ctx, spanParent context.Context, req evalu
 	}
 
 	reqSpan := oteltrace.SpanFromContext(ctx)
-	reqSpan.SetAttributes(attribute.String(trace.AttrFaultID, run.ID))
 	d := *decision
 	d.Mode = mode
 	if joined {
-		if run.Span != nil {
-			if sc := run.Span.SpanContext(); linkable(sc) {
-				reqSpan.AddLink(oteltrace.Link{SpanContext: sc, Attributes: []attribute.KeyValue{
-					attribute.String(trace.AttrLinkKind, trace.LinkKindFault),
-				}})
+		// Only a request joins: an eager re-arm meeting its own running
+		// fault carries no span context and must not inflate
+		// atropos.fault.joined. An unsampled request still counts.
+		if trigger.IsValid() {
+			reqSpan.SetAttributes(attribute.String(trace.AttrFaultID, run.ID))
+			if run.Span != nil {
+				if sc := run.Span.SpanContext(); linkable(sc) {
+					reqSpan.AddLink(oteltrace.Link{SpanContext: sc, Attributes: []attribute.KeyValue{
+						attribute.String(trace.AttrLinkKind, trace.LinkKindFault),
+					}})
+				}
 			}
+			run.Join()
 		}
-		run.Join()
 		return CheckResult{Decision: &d, RunID: run.ID, Joined: true}, nil
 	}
+	reqSpan.SetAttributes(attribute.String(trace.AttrFaultID, run.ID))
 	if i.onInject != nil {
 		i.onInject(faultType, req.Point.String())
 	}

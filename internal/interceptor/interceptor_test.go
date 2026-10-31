@@ -892,3 +892,83 @@ func TestStartFault_FailedStartLeavesNoRunIDOnTheRequest(t *testing.T) {
 		})
 	}
 }
+
+// faultSpanOf finds the exported fault span of the run with the given id.
+func faultSpanOf(t *testing.T, spans tracetest.SpanStubs, runID string) tracetest.SpanStub {
+	t.Helper()
+	for _, s := range spans {
+		if s.Name == trace.SpanFaultInject && hasAttr(s.Attributes, trace.AttrFaultID, runID) {
+			return s
+		}
+	}
+	t.Fatalf("no fault span with %s=%s in %d spans", trace.AttrFaultID, runID, len(spans))
+	return tracetest.SpanStub{}
+}
+
+// Eager arming (Core.Arm, from context.Background()) re-arms every
+// background rule on each delivery. A re-arm that meets the running fault is
+// reported to the caller as a join (no handle, the running run's id), but no
+// request made it, so it is not counted on the fault span. A request that
+// joins an armed fault is counted, and its span gets the run id and the link;
+// so is an unsampled request, whose span is merely not stored.
+func TestStartFault_RearmsAreNotCountedAsJoins(t *testing.T) {
+	exp := installRecordingProvider(t)
+	reg := NewFaultRegistry()
+	defer reg.Close()
+	i := New(nil, trace.NewOTelTracer(), WithRegistry(reg))
+	arm := func(name string) CheckResult {
+		t.Helper()
+		cr, err := i.StartFault(context.Background(), evaluator.Request{Point: evaluator.Ingress, Labels: map[string]string{}}, heldDecision(name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cr
+	}
+
+	rearmed := arm("rearmed")
+	if rearmed.Handle == nil || rearmed.Joined {
+		t.Fatalf("first arm = %+v, want a start", rearmed)
+	}
+	for range 2 {
+		if again := arm("rearmed"); !again.Joined || again.Handle != nil || again.RunID != rearmed.RunID {
+			t.Fatalf("re-arm = %+v, want a join on run %s with no handle", again, rearmed.RunID)
+		}
+	}
+
+	joined := arm("joined")
+	ctx, req := otel.Tracer("test").Start(context.Background(), "request")
+	cr, err := i.StartFault(ctx, evaluator.Request{Point: evaluator.Ingress}, heldDecision("joined"))
+	if err != nil || !cr.Joined || cr.RunID != joined.RunID {
+		t.Fatalf("request join = %+v %v, want a join on run %s", cr, err, joined.RunID)
+	}
+	req.End()
+
+	unsampledJoin := arm("unsampled-join")
+	unsampled := oteltrace.ContextWithRemoteSpanContext(context.Background(), sampledSC(9).WithTraceFlags(0))
+	if cr, err := i.StartFault(unsampled, evaluator.Request{Point: evaluator.Ingress}, heldDecision("unsampled-join")); err != nil || !cr.Joined {
+		t.Fatalf("unsampled request join = %+v %v", cr, err)
+	}
+
+	for _, run := range []CheckResult{rearmed, joined, unsampledJoin} {
+		reg.Stop(run.Decision.Name)
+		<-run.Handle.Done()
+	}
+
+	spans := exp.GetSpans()
+	for _, a := range faultSpanOf(t, spans, rearmed.RunID).Attributes {
+		if a.Key == trace.AttrFaultJoined {
+			t.Fatalf("re-armed fault span carries %s=%s, want none: no request joined it", a.Key, a.Value.Emit())
+		}
+	}
+	fs := faultSpanOf(t, spans, joined.RunID)
+	if !hasAttr(fs.Attributes, trace.AttrFaultJoined, "1") {
+		t.Fatalf("fault span attrs = %v, want %s=1 (the one request)", fs.Attributes, trace.AttrFaultJoined)
+	}
+	rs := findSpan(t, spans, "request")
+	if fl := linksOfKind(rs.Links, trace.LinkKindFault); len(fl) != 1 || fl[0].SpanContext.SpanID() != fs.SpanContext.SpanID() || !hasAttr(rs.Attributes, trace.AttrFaultID, joined.RunID) {
+		t.Fatalf("request span links %+v attrs %v, want the fault link and %s=%s", rs.Links, rs.Attributes, trace.AttrFaultID, joined.RunID)
+	}
+	if us := faultSpanOf(t, spans, unsampledJoin.RunID); !hasAttr(us.Attributes, trace.AttrFaultJoined, "1") {
+		t.Fatalf("fault span attrs = %v, want %s=1: an unsampled request is still a request", us.Attributes, trace.AttrFaultJoined)
+	}
+}

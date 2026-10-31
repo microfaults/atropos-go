@@ -26,7 +26,9 @@ var errRegistryClosed = errors.New("interceptor: fault registry is closed")
 // when it started (atropos.fault.id), the registry key it runs under, its
 // handle, and the span recording it -- nil when the starter has none, as
 // through StartOrJoin. A request that joins the run instead of starting
-// another is counted on that span as atropos.fault.joined.
+// another is counted on that span as atropos.fault.joined; the caller
+// decides what is a request (the interceptor calls Join only for a joiner
+// with a span context, so an eager re-arm is not counted).
 type FaultRun struct {
 	ID     string
 	Key    string
