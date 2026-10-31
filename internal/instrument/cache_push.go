@@ -20,6 +20,7 @@ type cachePushConfig struct {
 	BaseURL  string
 	Service  string
 	Instance string
+	Epoch    int64         // instance start time, unix nanos; dedupe key (instance, epoch, batch_seq)
 	MaxBatch int           // default 100
 	MaxWait  time.Duration // default 5s
 	Client   *http.Client  // default http.DefaultClient
@@ -80,6 +81,7 @@ type cachePushClient struct {
 	baseURL  string
 	service  string
 	instance string
+	epoch    int64
 	client   *http.Client
 	logger   *slog.Logger
 	maxBatch int
@@ -134,6 +136,7 @@ func newCachePushClient(cfg cachePushConfig) *cachePushClient {
 		baseURL:  cfg.BaseURL,
 		service:  cfg.Service,
 		instance: cfg.Instance,
+		epoch:    cfg.Epoch,
 		client:   cfg.Client,
 		logger:   cfg.Logger,
 		maxBatch: cfg.MaxBatch,
@@ -277,13 +280,15 @@ func (c *cachePushClient) Flush() {
 
 // ingestEnvelope is the POST body for /api/v1/cache/ingest (wire spec §W2).
 // BatchSeq is 1-based and monotonic per (experiment_id, phase_id, instance)
-// so manteion can dedupe retried batches.
+// so manteion can dedupe retried batches. Epoch (the instance start time, unix
+// nanoseconds) extends that key so it stays unique across restarts, when batch_seq starts over.
 type ingestEnvelope struct {
 	Service      string               `json:"service"`
 	Instance     string               `json:"instance"`
 	PhaseID      string               `json:"phase_id"`
 	ExperimentID string               `json:"experiment_id,omitempty"`
 	BatchSeq     int                  `json:"batch_seq,omitempty"`
+	Epoch        int64                `json:"epoch"`
 	Entries      []cachebox.WireEntry `json:"entries"`
 }
 
@@ -303,6 +308,7 @@ func (c *cachePushClient) post(entries []cachebox.WireEntry, experimentID, phase
 		PhaseID:      phaseID,
 		ExperimentID: experimentID,
 		BatchSeq:     batchSeq,
+		Epoch:        c.epoch,
 		Entries:      entries,
 	})
 	if err != nil {

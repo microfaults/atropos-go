@@ -43,6 +43,9 @@ func TestNewCore_ConnectedBuildsPushAndDrainAndAdoptsRegistry(t *testing.T) {
 	if c.push == nil {
 		t.Fatal("connected core must build a push client")
 	}
+	if c.push.epoch <= 0 {
+		t.Fatalf("push client epoch = %d, want the instance start time", c.push.epoch)
+	}
 	if c.registry != reg {
 		t.Fatal("core must adopt the supplied registry, not replace it")
 	}

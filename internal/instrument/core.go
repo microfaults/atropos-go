@@ -3,6 +3,7 @@ package instrument
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
@@ -99,6 +100,7 @@ func NewCore(cfg CoreConfig) *Core {
 			BaseURL:  cfg.ManteionURL,
 			Service:  cfg.Service,
 			Instance: cfg.Instance,
+			Epoch:    time.Now().UnixNano(),
 			Logger:   logger,
 			Fidelity: fidelity,
 		})

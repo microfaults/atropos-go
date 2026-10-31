@@ -405,3 +405,38 @@ func TestPush_DrainReportIsPerPhase(t *testing.T) {
 		}
 	}
 }
+
+// TestPush_EnvelopeCarriesEpoch pins the (instance, epoch, batch_seq) dedupe key
+// (spec §2, ingest): every batch from one process carries the same epoch.
+func TestPush_EnvelopeCarriesEpoch(t *testing.T) {
+	var mu sync.Mutex
+	var epochs []int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var env struct {
+			Epoch int64 `json:"epoch"`
+		}
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &env)
+		mu.Lock()
+		epochs = append(epochs, env.Epoch)
+		mu.Unlock()
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	client := newCachePushClient(cachePushConfig{
+		BaseURL: server.URL, Service: "cart", Instance: "pod-1", Epoch: 1700000000000000001,
+		MaxBatch: 1, MaxWait: 10 * time.Second,
+	})
+	defer client.Stop()
+	for i := 0; i < 2; i++ {
+		client.PushFunc()("k", &cachebox.Entry{Key: "k", StatusCode: 200, Body: []byte("x"), ExperimentID: "exp-1", PhaseID: "phase-1"})
+		want := int64(i + 1)
+		waitFor(t, 5*time.Second, func() bool { return client.Stats().Pushed == want })
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(epochs) != 2 || epochs[0] != 1700000000000000001 || epochs[1] != 1700000000000000001 {
+		t.Fatalf("epochs = %v, want the configured epoch on every batch", epochs)
+	}
+}
