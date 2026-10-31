@@ -1770,12 +1770,25 @@ func TestClose_EndsTheStatusRetry(t *testing.T) {
 	// The register's report, the loop's resend before its held poll, the
 	// first retry; the next retry is 200 ms away.
 	f.waitStatuses(t, 3)
-	if err := c.Close(context.Background()); err != nil {
-		t.Fatal(err)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = c.Close(context.Background())
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return: the retry does not end with the poll context")
 	}
-	_, statuses := f.snapshot()
-	time.Sleep(700 * time.Millisecond) // the next two backoffs
-	if _, after := f.snapshot(); len(after) != len(statuses) {
-		t.Fatalf("%d reports before Close returned, %d after: the retry outlived Close", len(statuses), len(after))
+	closed := time.Now()
+	time.Sleep(time.Second) // past the next two backoffs, 200 ms and 400 ms
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// A report Close cut short may still be recorded just after it returns;
+	// one the retry sent after Close would arrive a backoff later.
+	for i, at := range f.statusAt {
+		if late := at.Sub(closed); late > 150*time.Millisecond {
+			t.Fatalf("report %d of %d arrived %v after Close returned: the retry outlived Close", i+1, len(f.statusAt), late)
+		}
 	}
 }
