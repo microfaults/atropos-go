@@ -938,6 +938,89 @@ func TestConnectManteion_WiresTheReplaySetPuller(t *testing.T) {
 	}
 }
 
+// replaySetStates lists the replay-set state of each status report, a run of
+// equal states collapsed into one ("" for a report without a replay set).
+func replaySetStates(statuses []wire.StatusReport) []string {
+	var states []string
+	for _, s := range statuses {
+		state := ""
+		if s.ReplaySet != nil {
+			state = s.ReplaySet.State
+		}
+		if len(states) == 0 || states[len(states)-1] != state {
+			states = append(states, state)
+		}
+	}
+	return states
+}
+
+// TestConnectManteion_RetriesAFailedReplaySetPullWhileDesired: the register
+// answer names a replay set whose first artifact request is answered 404, and
+// manteion answers every poll 304 -- the document is unchanged -- so no 200
+// ever re-applies it. The puller pulls the set again on its own retry while
+// it stays desired: the status reports walk failed → fetching → committed.
+func TestConnectManteion_RetriesAFailedReplaySetPullWhileDesired(t *testing.T) {
+	// The retry waits long enough for the failed report to go out before it.
+	withReplayRetry(t, 200*time.Millisecond, time.Second)
+	entries := replayEntries(3)
+	art := newFakeArtifact(t, entries)
+	art.failAt[0], art.codeAt[0] = 1, http.StatusNotFound // the first request only, answered at once
+	release := art.hold(t)                                // the retried pull waits until its fetching report is in
+	ref := refFor(art, entries)
+	ref.URL = art.srv.URL + ref.URL
+	ref.ExperimentID, ref.PhaseID = "exp-1", "phase-1"
+	doc := wire.RuleSync{Version: 3, Etag: "3-a", Rules: []wire.CompiledRule{}, ActiveFaults: []wire.FaultRequest{}, ReplaySet: &ref}
+	reg, err := json.Marshal(wire.RegisterResponse{Status: "registered", RuleSync: doc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newFakeManteion(t)
+	f.register = string(reg)
+	f.setRules(respond304("3", "3-a")) // the document never changes: no poll is ever answered 200
+	cb := newTestCacheBox(t)
+	c, err := connectManteion(t.Context(), manteionConfig{
+		url: f.srv.URL, serviceName: "svc", instanceID: "pod-1",
+		initTimeout: 5 * time.Second, pollInterval: 10 * time.Second, pollWait: 30 * time.Second,
+		targets:    applyTargets{Evaluator: newTestEvaluator(), CacheBox: cb},
+		httpClient: &http.Client{Timeout: 5 * time.Second},
+		logger:     slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+
+	// endsWith reports whether the collapsed report states end with want.
+	endsWith := func(want ...string) bool {
+		_, statuses := f.snapshot()
+		states := replaySetStates(statuses)
+		return len(states) >= len(want) && slices.Equal(states[len(states)-len(want):], want)
+	}
+	waitFor(t, 5*time.Second, func() bool { return endsWith(wire.ReplaySetFailed, wire.ReplaySetFetching) })
+	release()
+	waitFor(t, 5*time.Second, func() bool {
+		return endsWith(wire.ReplaySetFailed, wire.ReplaySetFetching, wire.ReplaySetCommitted)
+	})
+
+	if got := art.requests(); len(got) != 2 {
+		t.Fatalf("artifact requests = %q, want the 404 and the retried pull", got)
+	}
+	if cb.ReplaySetLen() != 3 || cb.ReplaySetPhaseKey() != cachebox.PhaseKey("exp-1", "phase-1") {
+		t.Fatalf("installed %d entries under %q, want the set committed under (exp-1, phase-1)", cb.ReplaySetLen(), cb.ReplaySetPhaseKey())
+	}
+	polls, statuses := f.snapshot()
+	for _, p := range polls {
+		if p.IfNoneMatch != `"3-a"` {
+			t.Fatalf("polls = %+v, want every one conditional on 3-a (each answered 304)", polls)
+		}
+	}
+	for _, s := range statuses {
+		if s.AppliedGeneration != 3 || s.Etag != "3-a" {
+			t.Fatalf("status reports = %+v, want generation 3 throughout: nothing but the register applied a document", statuses)
+		}
+	}
+}
+
 // TestClose_CancelsThenClosesThePullerThenWaits: Close cancels the poll
 // context, closes the replay-set puller (ending its fetch and the status
 // reports it would send), and only then waits for the client's goroutines --

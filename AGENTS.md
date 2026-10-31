@@ -167,6 +167,13 @@ sync loop, the status report and the replay-set pull are internal to `Serve`
   chunks of at most 4 MiB, staged through the preload path, committed when the
   entry count and the W5 digest match) and its state is reported
   (`fetching|committed|failed`); an absent `replay_set` clears the installed one.
+  A chunk whose request cannot be built or sent, or is answered 5xx, 408 or 429,
+  is retried from its offset (five requests per chunk at most). A failed pull is
+  pulled again on the instance's own timer while the set stays desired (5 s,
+  doubling up to 60 s, each wait ±20 %), reported `failed` → `fetching` → ...;
+  a document naming another set or none drops the retry, one still naming it
+  leaves it on its schedule. A set no pull can fetch (no pair scopes it, an
+  unsupported key strategy, no artifact `url`) is not retried.
 - **Ingest `epoch`.** Cache-push batches (`POST /api/v1/cache/ingest`) carry the
   instance's start time in unix nanoseconds as `epoch`, extending manteion's
   dedupe key across restarts.

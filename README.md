@@ -447,13 +447,18 @@ The fidelity pipeline around a recording phase:
    `(experiment_id, phase_id)` pair it is installed under, entry `count`, W5 `sha256`, `size_bytes`,
    `url`). When its `id` differs from the committed one the instance fetches
    `GET /api/v1/cache/artifacts/{id}` (NDJSON, one entry per line) in `Range` chunks of at most
-   4 MiB, retrying a failed chunk from the same offset, stages the entries through the preload path
-   and commits only when the entry count and the W5 checksum match, which atomically installs the
-   ReplaySet. A mismatch or any fetch failure leaves the prior set untouched and reports `failed`
-   (the reason lands in the status report's `errors`). Each state (`fetching` → `committed` |
-   `failed`) is reported as it is reached; a newer `id` supersedes a fetch in flight, and a
-   restarted instance converges on its own. `POST /cachebox/preload/{begin,chunk,commit}` stays
-   mounted for manual use.
+   4 MiB, retrying a chunk from the same offset when its request cannot be built or sent or is
+   answered 5xx, 408 or 429 (five requests per chunk at most), stages the entries through the
+   preload path and commits only when the entry count and the W5 checksum match, which atomically
+   installs the ReplaySet. A mismatch or any fetch failure leaves the prior set untouched and
+   reports `failed` (the reason lands in the status report's `errors`). Each state (`fetching` →
+   `committed` | `failed`) is reported as it is reached; a newer `id` supersedes a fetch in flight.
+   A failed pull is pulled again on the instance's own timer while the set stays desired (5 s,
+   doubling up to 60 s, each wait ±20 %), so manteion sees `failed` → `fetching` → `committed`
+   even while it answers every poll `304`, and a restarted instance converges on its own; only a
+   set no pull can fetch (no `(experiment_id, phase_id)` scopes it, an unsupported key strategy, no
+   artifact `url`) waits for a document naming another. `POST /cachebox/preload/{begin,chunk,commit}`
+   stays mounted for manual use.
 4. **Freeze/replay** — the synthesized replay rule + a delay source (`freeze_cfg` in the desired
    state, installed scoped to its `context`'s `(experiment_id, phase_id)`;
    `POST /admin/cachebox/delay` remains for manual use, and a source pushed that way lasts until
