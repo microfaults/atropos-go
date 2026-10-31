@@ -77,7 +77,8 @@ type ManteionClient struct {
 	// has lost the registration (recoverRegistration). The one write of
 	// etag alone is reapSlots clearing it when the watchdog drops a slot the
 	// last apply confirmed: the next poll is then unconditional, while the
-	// generation stays the one held.
+	// generation stays the one held. Every writer but adoptGeneration also
+	// bumps applySeq.
 	ruleVersion atomic.Uint64
 	lastPollAt  atomic.Int64 // unix nanos; 0 = never polled
 	status      atomic.Int32
@@ -94,11 +95,17 @@ type ManteionClient struct {
 	// by applyMu.
 	confirmed []string
 
-	// syncMu guards what the status report snapshots, and the recovery state.
+	// syncMu guards what the status report snapshots, the apply sequence and
+	// the recovery state.
 	syncMu        sync.Mutex
 	etag          string      // ETag of the document held, sent as If-None-Match; "" = none (writers: see ruleVersion)
 	lastReport    applyReport // what the last apply could not hold
 	statusPending bool        // the last status report failed; retryStatus re-sends it, and so does the poll loop before its next poll
+	// applySeq counts the changes to the record of the document held: every
+	// applyDesired, forgetDocument and reapSlots' ETag clear bumps it. A poll
+	// snapshots it with the generation and ETag it sends, and its 304 is
+	// adopted only while applySeq is unchanged (adoptGeneration).
+	applySeq uint64
 	// recovery is the recovery of a lost registration (claimRecovery). It
 	// stays active from the re-register until a status report lands, so a
 	// manteion that goes on answering 404 is registered with once per loss,
@@ -418,14 +425,15 @@ func (c *ManteionClient) fetchRules(ctx context.Context) error {
 // timeout outlasts the hold; one without a hold through httpClient.
 //
 // 304: the document is provably unchanged; the generation and ETag manteion
-// confirmed are adopted without applying (unless the 304 is late: see
-// adoptGeneration), and the held slots re-confirmed. 200: the body is the
+// confirmed are adopted without applying (unless the 304 is late: an apply,
+// forget or reap ran while the poll was out; see adoptGeneration), and the
+// held slots re-confirmed. 200: the body is the
 // desired state (1 MiB cap); its etag, falling back to the ETag header, is
 // what applyDesired records. Other statuses are errors, for the poll loop's
 // backoff.
 func (c *ManteionClient) fetchRulesWait(ctx context.Context, wait time.Duration) error {
 	c.syncMu.Lock()
-	gen, etag := c.ruleVersion.Load(), c.etag
+	gen, etag, seq := c.ruleVersion.Load(), c.etag, c.applySeq
 	c.syncMu.Unlock()
 
 	q := url.Values{
@@ -459,7 +467,7 @@ func (c *ManteionClient) fetchRulesWait(ctx context.Context, wait time.Duration)
 	case http.StatusNotModified:
 		c.applyMu.Lock()
 		defer c.applyMu.Unlock()
-		c.adoptGeneration(resp.Header, etag)
+		c.adoptGeneration(resp.Header, seq)
 		c.confirmSlots()
 		return nil
 
@@ -495,16 +503,18 @@ func (c *ManteionClient) fetchRulesWait(ctx context.Context, wait time.Duration)
 // the generation held (ruleVersion and atropos_sync_generation), ETag the
 // ETag held. An absent or unparsable header leaves the current value.
 //
-// sent is the ETag the poll was conditional on ("" = none), and the 304
-// vouches only for that document. When the ETag held is no longer sent -- a
-// register applied a newer document, or the watchdog dropped a confirmed
-// slot and cleared the ETag, while the poll was out -- the 304 is late and
-// adopts nothing: the next poll stays conditional on what the instance holds
-// now. Called with applyMu held.
-func (c *ManteionClient) adoptGeneration(h http.Header, sent string) {
+// sent is the apply sequence the poll snapshotted with the generation and
+// ETag it was conditional on, and the 304 vouches only for that record. When
+// the record changed while the poll was out -- a register applied a document
+// (a newer generation of the same content keeps the ETag), the record was
+// forgotten, or the watchdog dropped a confirmed slot and cleared the ETag --
+// the 304 is late and adopts nothing: the generation never goes back, and the
+// next poll is conditional on what the instance holds now. Called with
+// applyMu held.
+func (c *ManteionClient) adoptGeneration(h http.Header, sent uint64) {
 	c.syncMu.Lock()
 	defer c.syncMu.Unlock()
-	if c.etag != sent {
+	if c.applySeq != sent {
 		return
 	}
 	if gen, err := strconv.ParseUint(h.Get("X-Atropos-Generation"), 10, 64); err == nil {
@@ -519,11 +529,13 @@ func (c *ManteionClient) adoptGeneration(h http.Header, sent string) {
 // forgetDocument drops the record of the document the instance holds -- the
 // generation, the ETag and the atropos_sync_generation gauge, together under
 // syncMu, never one without the others -- so the next poll is unconditional
-// and its 200 is applied in full. The targets keep what they hold; only the
-// record of which document that is goes.
+// and its 200 is applied in full; a poll already out comes back late
+// (applySeq). The targets keep what they hold; only the record of which
+// document that is goes.
 func (c *ManteionClient) forgetDocument() {
 	c.syncMu.Lock()
 	defer c.syncMu.Unlock()
+	c.applySeq++
 	c.ruleVersion.Store(0)
 	c.etag = ""
 	metrics.SyncGeneration.Set(0)
@@ -546,11 +558,15 @@ func (c *ManteionClient) forgetDocument() {
 // re-confirm the held slots (confirmSlots), as a 304 does; a hard error does
 // not: a document the instance cannot hold vouches for nothing, so the held
 // slots age out under the watchdog unless a later answer confirms them.
-// Every outcome sends the status report; a failed report is marked pending
-// by sendStatus, never returned: applyDesired returns nil.
+// Every outcome bumps applySeq, so a poll out meanwhile comes back late, and
+// sends the status report; a failed report is marked pending by sendStatus,
+// never returned: applyDesired returns nil.
 func (c *ManteionClient) applyDesired(ctx context.Context, doc wire.RuleSync, etag, source string) error {
 	c.applyMu.Lock()
 	defer c.applyMu.Unlock()
+	c.syncMu.Lock()
+	c.applySeq++
+	c.syncMu.Unlock()
 
 	// The predicate apply guards with, checked here first so the bookkeeping
 	// never records the empty body as the state held.
@@ -642,11 +658,11 @@ func (c *ManteionClient) watchSlots(ctx context.Context, grace time.Duration) {
 // reapSlots is one watchdog pass, under applyMu: reapStaleSlots drops the
 // slots not confirmed within grace. Dropping a slot the last apply confirmed
 // means the instance no longer holds the document its ETag names, so the slot
-// leaves the confirmed set and the ETag is cleared: the next poll is
-// unconditional (manteion answers it at once, without a hold) and its 200
-// re-applies the slot if it is still desired. A poll already out comes back
-// as a late 304, which adopts nothing (adoptGeneration). Dropping a slot the
-// document never named (an /admin/fault slot) changes neither.
+// leaves the confirmed set and the ETag is cleared (bumping applySeq): the
+// next poll is unconditional (manteion answers it at once, without a hold)
+// and its 200 re-applies the slot if it is still desired. A poll already out
+// comes back as a late 304, which adopts nothing (adoptGeneration). Dropping
+// a slot the document never named (an /admin/fault slot) changes neither.
 func (c *ManteionClient) reapSlots(grace time.Duration) {
 	c.applyMu.Lock()
 	defer c.applyMu.Unlock()
@@ -662,6 +678,7 @@ func (c *ManteionClient) reapSlots(grace time.Duration) {
 	}
 	c.confirmed = kept
 	c.syncMu.Lock()
+	c.applySeq++
 	c.etag = ""
 	c.syncMu.Unlock()
 	c.logger.Warn("watchdog: dropped a slot of the desired state; the next poll fetches the desired state in full")

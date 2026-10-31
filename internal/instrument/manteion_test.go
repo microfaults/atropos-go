@@ -1422,6 +1422,58 @@ func TestFetchRules_Late304AdoptsNothing(t *testing.T) {
 	}
 }
 
+// TestFetchRules_Late304WithTheSameEtagKeepsTheNewerGeneration: the ETag is
+// the content hash alone, so a register applying generation 2 of an unchanged
+// document leaves in place the ETag a poll still out was conditional on. That
+// poll's 304 for generation 1 is late all the same -- an apply ran since it
+// was sent -- and adopts nothing: the generation stays 2, and the gauge too.
+func TestFetchRules_Late304WithTheSameEtagKeepsTheNewerGeneration(t *testing.T) {
+	f := newFakeManteion(t)
+	f.register = `{"status":"registered","version":2,"etag":"same","rules":[],"active_faults":[]}`
+	f.setRules(respond200(wire.RuleSync{Version: 1, Etag: "same", Rules: []wire.CompiledRule{}, ActiveFaults: []wire.FaultRequest{}}))
+	c := f.client(applyTargets{Evaluator: newTestEvaluator()})
+	if err := c.fetchRules(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	f.setRules(func(w http.ResponseWriter, r *http.Request) {
+		if err := c.register(r.Context()); err != nil { // lands while the poll is out
+			t.Error(err)
+		}
+		respond304("1", "same")(w, r)
+	})
+	if err := c.fetchRules(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if c.ruleVersion.Load() != 2 || c.currentEtag() != "same" || syncGeneration(t) != 2 {
+		t.Fatalf("gen=%d etag=%q gauge=%v, want the register's generation 2 kept: the late 304 for 1 adopts nothing",
+			c.ruleVersion.Load(), c.currentEtag(), syncGeneration(t))
+	}
+}
+
+// TestFetchRules_Late304AfterAForgetAdoptsNothing: forgetting the document
+// held (a recovery) while a poll is out makes that poll's 304 late, so it
+// cannot restore the generation and ETag just dropped: the next poll stays
+// unconditional.
+func TestFetchRules_Late304AfterAForgetAdoptsNothing(t *testing.T) {
+	f := newFakeManteion(t)
+	f.setRules(respond200(wire.RuleSync{Version: 1, Etag: "1-a", Rules: []wire.CompiledRule{}, ActiveFaults: []wire.FaultRequest{}}))
+	c := f.client(applyTargets{Evaluator: newTestEvaluator()})
+	if err := c.fetchRules(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	f.setRules(func(w http.ResponseWriter, r *http.Request) {
+		c.forgetDocument() // while the poll is out
+		respond304("1", "1-a")(w, r)
+	})
+	if err := c.fetchRules(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if c.ruleVersion.Load() != 0 || c.currentEtag() != "" || syncGeneration(t) != 0 {
+		t.Fatalf("gen=%d etag=%q gauge=%v, want the forgotten record kept: the late 304 adopts nothing",
+			c.ruleVersion.Load(), c.currentEtag(), syncGeneration(t))
+	}
+}
+
 // backdateSlot sets one slot's last confirmation d in the past.
 func backdateSlot(demo *demoEvaluator, id string, d time.Duration) {
 	demo.mu.Lock()
