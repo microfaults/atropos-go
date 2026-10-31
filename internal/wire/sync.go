@@ -57,7 +57,9 @@ type UnsupportedRule struct {
 	Category string `json:"category"`
 } //@name atropos.UnsupportedRule
 
-// ReplaySetStatus reports the state of the replay set the instance holds for ID.
+// ReplaySetStatus names the desired replay set (ID) and its pull state. Only
+// committed means the instance holds it: fetching and failed name a set not yet
+// held, while an earlier committed set may still be installed.
 type ReplaySetStatus struct {
 	ID    string `json:"id"`
 	State string `json:"state"` // fetching | committed | failed
@@ -66,7 +68,8 @@ type ReplaySetStatus struct {
 // StatusReport is the instance's full snapshot of what it holds, sent after
 // every apply and whenever the replay-set state changes. Unsupported and Errors
 // replace the previous report, so they are never omitted: an empty list clears
-// it. An absent ReplaySet means the instance holds no replay set.
+// it. ReplaySet is the desired replay set and its pull state; absent means
+// none is desired.
 type StatusReport struct {
 	InstanceID        string            `json:"instance_id"`
 	Service           string            `json:"service"`

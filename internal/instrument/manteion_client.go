@@ -282,10 +282,13 @@ var pollFloor = time.Second
 
 // pollLoopWithTrigger runs until ctx is cancelled, keeping the instance on
 // manteion's desired state (spec §3). With a long-poll hold (pollWait > 0)
-// the instance is always in a poll: manteion holds each until the desired
-// state changes or the hold elapses, and the next poll goes out as soon as
-// the answer is handled -- at once, or once pollFloor has passed since the
-// last one started. Without a hold the loop polls every pollInterval, the
+// the instance is always in a poll: manteion holds one whose version is the
+// current generation and whose ETag matches until the generation changes or
+// the hold elapses, answers a matching ETag with any other version (older,
+// absent or zero, or ahead after a database reset) 304 at once with the
+// generation to adopt, and anything else 200 at once; the next poll goes out
+// as soon as the answer is handled -- at once, or once pollFloor has passed
+// since the last one started. Without a hold the loop polls every pollInterval, the
 // first time one interval after it starts (connectManteion's startup fetch
 // has just run). A trigger (an SSE rules_changed nudge) ends any wait.
 //
@@ -299,8 +302,9 @@ var pollFloor = time.Second
 // upsert on the instance id -- and later failures do not, so a struggling
 // server is not hammered. The first poll that succeeds after failures
 // forgets the document held (forgetDocument) and only then re-registers:
-// manteion may have restarted or moved on meanwhile, so the next poll is a
-// full pull. A poll cut short by ctx is not a failure.
+// manteion may have restarted or moved on meanwhile, so the instance
+// re-converges on a full document through the register answer. A poll cut
+// short by ctx is not a failure.
 //
 // A poll answered 404 means manteion no longer knows this instance: the loop
 // takes the recovery path at once (recoverRegistration: forget the document

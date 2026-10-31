@@ -1249,7 +1249,7 @@
         },
         "/api/v1/sdk/rules": {
             "get": {
-                "description": "Served by manteion, not by Serve: the SDK is the client. version is the generation the instance holds, If-None-Match the ETag of the document it holds (sent only when it holds one), and wait (seconds) asks manteion to hold the request (the SDK sends 30): manteion holds it only when version is the service's current generation and the ETag matches, until the generation changes or the wait elapses, and answers a matching ETag with an older (or absent/zero) version 304 at once, carrying the current generation. The ETag is a content hash alone; the generation travels in X-Atropos-Generation and in the body's version. The SDK treats the ETag as opaque. 200 is applied through the single apply path and reported with POST /api/v1/sdk/status; 304 means the document is unchanged and the instance adopts the generation without applying.",
+                "description": "Served by manteion, not by Serve: the SDK is the client. version is the generation the instance holds, If-None-Match the ETag of the document it holds (sent only when it holds one), and wait (seconds) asks manteion to hold the request (the SDK sends 30): manteion holds it only when version is the service's current generation and the ETag matches, until the generation changes or the wait elapses, and answers a matching ETag with any other version (older, absent or zero, or ahead after a manteion database reset) 304 at once, carrying the current generation. The ETag is a content hash alone; the generation travels in X-Atropos-Generation and in the body's version. The SDK treats the ETag as opaque. 200 is applied through the single apply path and reported with POST /api/v1/sdk/status; 304 means the document is unchanged and the instance adopts the generation without applying.",
                 "parameters": [
                     {
                         "description": "service name",
@@ -1345,7 +1345,7 @@
         },
         "/api/v1/sdk/status": {
             "post": {
-                "description": "Served by manteion, not by Serve: the SDK is the client. Sent after every apply and whenever the replay-set state changes. The report is a full snapshot of what the instance holds: unsupported and errors replace the previous report (an empty list clears it), and an absent replay_set means the instance holds none. Any 2xx counts as delivered (manteion answers 204); a report that fails to send is re-sent.",
+                "description": "Served by manteion, not by Serve: the SDK is the client. Sent after every apply and whenever the replay-set state changes. The report is a full snapshot of what the instance holds: unsupported and errors replace the previous report (an empty list clears it), and replay_set names the desired replay set and its pull state (fetching and failed name a set not yet held, while an earlier committed set may still be installed): an absent replay_set means none is desired. Any 2xx counts as delivered (manteion answers 204); a report that fails to send is re-sent.",
                 "requestBody": {
                     "content": {
                         "application/json": {

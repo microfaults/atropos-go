@@ -396,8 +396,9 @@ it:
 - **Long-poll.** `GET /api/v1/sdk/rules?...&version=<generation held>&wait=30`
   with `If-None-Match: "<etag held>"`. For a current instance (its `version` is
   the service's generation and its ETag matches) manteion holds the request until
-  the generation changes or 30 s pass; a matching ETag with an older `version`
-  is answered `304` at once, carrying the current generation. The ETag is the
+  the generation changes or 30 s pass; a matching ETag with any other `version`
+  (older, absent or zero, or ahead after a manteion database reset) is answered
+  `304` at once, carrying the current generation. The ETag is the
   document's content hash alone and opaque to the SDK; the generation travels in
   `X-Atropos-Generation` and the body's `version`.
 - **`200`** — the body is the **full desired state** (`RuleSync`: `rules`,
@@ -421,8 +422,10 @@ it:
   `(experiment_id, phase_id)`: replays under another pair keep the entry's
   observed latency, and the `/admin/cachebox` stats show the source and its scope.
 - **Status report.** A full snapshot of what the instance holds: applied
-  generation, ETag, `unsupported` rules, `errors` and the replay-set state
-  (`fetching|committed|failed`; absent = none held). It goes out after every
+  generation, ETag, `unsupported` rules, `errors`, and the desired replay set
+  with its pull state (`fetching|committed|failed`: `fetching` and `failed` name
+  a set not held yet, while an earlier committed set may still be installed;
+  absent = none desired). It goes out after every
   apply and on every replay-set transition. One that fails to send is re-sent
   before the next poll and by its own retry (2 s, doubling up to the poll wait),
   so manteion's convergence barrier does not starve on one lost report.

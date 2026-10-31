@@ -40,12 +40,12 @@
 - `wait` (seconds, default 0, max 60): long-poll. manteion holds the request only when `version` equals the
   service's current generation AND the ETag matches the materialized document; it then holds until the
   service's generation changes or `wait` elapses, re-materializes, and compares ETags again. A matching ETag
-  with an older (or absent/zero) `version` is answered `304` at once, with the current generation in
-  `X-Atropos-Generation` and the ETag in `ETag`. Without a matching ETag (a mismatch, or no `If-None-Match`)
-  the request is answered `200` at once.
+  with any other `version` (older, absent or zero, or ahead after a manteion database reset) is answered `304`
+  at once, with the current generation in `X-Atropos-Generation` and the ETag in `ETag`. Without a matching
+  ETag (a mismatch, or no `If-None-Match`) the request is answered `200` at once.
 - `200` with body `RuleSync` and headers `ETag`, `X-Atropos-Generation: <G>`.
-- `304` with headers `ETag`, `X-Atropos-Generation: <G>` when the ETag matches (at once when `version` is
-  behind the generation, otherwise after the hold). On 304 the instance sets its observed generation to `G`
+- `304` with headers `ETag`, `X-Atropos-Generation: <G>` when the ETag matches (at once when `version` is not
+  the current generation, otherwise after the hold). On 304 the instance sets its observed generation to `G`
   without re-applying (its document is provably unchanged).
 - Errors as today, in manteion's `{"error": "..."}` envelope served as `application/json` (not
   `application/problem+json`).
@@ -78,8 +78,9 @@ Body:
 ```
 `204`. Sent by the instance after every apply (200 path) and whenever `replay_set.state` changes
 (`fetching|committed|failed`). The report is a **full snapshot** of what the instance holds: `unsupported`
-and `errors` replace the previous report (empty list clears), and `replay_set` names the set the instance
-currently holds, so an absent `replay_set` means "none" and clears the stored id and state.
+and `errors` replace the previous report (empty list clears), and `replay_set` names the desired set and its
+pull state (`fetching` and `failed` name a set not yet held; an earlier committed set may still be installed),
+so an absent `replay_set` means none is desired and clears the stored id and state.
 manteion stores them on `sdk_instances` (`observed_unsupported JSONB`, `observed_errors JSONB`,
 `replay_set_id TEXT`, `replay_set_state TEXT`, `observed_at`).
 
