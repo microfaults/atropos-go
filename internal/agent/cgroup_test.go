@@ -54,3 +54,16 @@ func TestAttachWritesPid(t *testing.T) {
 		t.Fatal("attach without cgroup.procs must fail")
 	}
 }
+
+func TestFirstPID(t *testing.T) {
+	dir := cgroupDir(t, map[string]string{"cgroup.procs": "4242\n4243\n"})
+	if pid, err := FirstPID(dir); err != nil || pid != 4242 {
+		t.Fatalf("FirstPID = %d, %v", pid, err)
+	}
+	if _, err := FirstPID(cgroupDir(t, map[string]string{"cgroup.procs": "\n"})); err == nil {
+		t.Fatal("an empty cgroup must not yield a pid")
+	}
+	if _, err := FirstPID(t.TempDir()); err == nil {
+		t.Fatal("a missing cgroup.procs must be an error")
+	}
+}

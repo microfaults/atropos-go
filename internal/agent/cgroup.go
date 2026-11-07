@@ -75,3 +75,22 @@ func Attach(dir string, pid int) error {
 	}
 	return nil
 }
+
+// FirstPID is the first pid listed in <dir>/cgroup.procs; an error when the
+// file is missing or lists no process.
+func FirstPID(dir string) (int, error) {
+	b, err := os.ReadFile(filepath.Join(dir, "cgroup.procs"))
+	if err != nil {
+		return 0, fmt.Errorf("agent: no process in cgroup %s: %w", dir, err)
+	}
+	line, _, _ := strings.Cut(string(b), "\n")
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return 0, fmt.Errorf("agent: no process in cgroup %s", dir)
+	}
+	pid, err := strconv.Atoi(line)
+	if err != nil {
+		return 0, fmt.Errorf("agent: malformed cgroup.procs in %s: %w", dir, err)
+	}
+	return pid, nil
+}
