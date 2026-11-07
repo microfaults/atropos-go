@@ -261,3 +261,35 @@ func TestExecRunner_ErrorCarriesTheCommandAndItsOutput(t *testing.T) {
 		t.Fatalf("err = %v, want the command line and exit status", err)
 	}
 }
+
+func TestNetem_FailedRootAddRunsNoDel(t *testing.T) {
+	n, r, _, tg := newTestNetem(t)
+	r.fail["root handle 1: prio"] = errors.New("exit status 2")
+	if _, err := n.Apply(context.Background(), "f1", tg, lossSpec); err == nil || !strings.Contains(err.Error(), "exit status 2") {
+		t.Fatalf("err = %v, want the root add failure", err)
+	}
+	if r.has("qdisc del") {
+		t.Fatalf("a failed root add must not delete the root qdisc it did not install: %q", r.lines())
+	}
+	if es, _ := n.Journal.Load(); len(es) != 0 {
+		t.Fatal("journal must be empty after a failed root add")
+	}
+	delete(r.fail, "root handle 1: prio")
+	if _, err := n.Apply(context.Background(), "f2", tg, lossSpec); err != nil {
+		t.Fatalf("the namespace must be released after a failed root add: %v", err)
+	}
+}
+
+func TestNetem_FailedLaterLineDeletesTheRootQdisc(t *testing.T) {
+	n, r, _, tg := newTestNetem(t)
+	r.fail["parent 1:4 handle 40: netem"] = errors.New("exit status 2")
+	if _, err := n.Apply(context.Background(), "f1", tg, lossSpec); err == nil || !strings.Contains(err.Error(), "exit status 2") {
+		t.Fatalf("err = %v, want the netem add failure", err)
+	}
+	if !r.has("tc qdisc del dev eth0 root") {
+		t.Fatal("a failure after the root add must delete the root qdisc again")
+	}
+	if es, _ := n.Journal.Load(); len(es) != 0 {
+		t.Fatal("journal must be empty after a rolled-back apply")
+	}
+}

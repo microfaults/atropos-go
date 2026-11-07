@@ -145,8 +145,10 @@ func (n *Netem) release(netnsID, id string) {
 // interface (eth0 when the listing fails or names none); build the plan and
 // journal the entry BEFORE the first tc command, so a crash mid-apply is
 // restorable; run the plan's lines in order. On the first failing line the
-// root qdisc is deleted again (best effort, on a fresh context), the entry
-// removed, the namespace released, and the runner's error returned.
+// entry is removed, the namespace released, and the runner's error
+// returned; when that line is a later one (our root qdisc exists), the root
+// qdisc is first deleted again (best effort, on a fresh context). A failing
+// root add runs no del: the root qdisc there is not ours.
 func (n *Netem) Apply(ctx context.Context, id string, t Target, spec NetemSpec) (*NetemEntry, error) {
 	pid, err := FirstPID(t.CgroupDir)
 	if err != nil {
@@ -186,11 +188,16 @@ func (n *Netem) Apply(ctx context.Context, id string, t Target, spec NetemSpec) 
 		return nil, fmt.Errorf("agent: journal netem: %w", err)
 	}
 
-	for _, line := range plan {
+	for i, line := range plan {
 		if _, err := n.Runner.Run(ctx, "nsenter", append([]string{nsArg}, line...)...); err != nil {
-			rctx, cancel := context.WithTimeout(context.Background(), netemRollbackTimeout)
-			_, _ = n.Runner.Run(rctx, "nsenter", nsArg, "tc", "qdisc", "del", "dev", dev, "root")
-			cancel()
+			// Only once our root qdisc exists is there anything of ours to
+			// delete: when the root add itself failed, the root qdisc (if
+			// any) belongs to someone else, e.g. the CNI, and is left alone.
+			if i > 0 {
+				rctx, cancel := context.WithTimeout(context.Background(), netemRollbackTimeout)
+				_, _ = n.Runner.Run(rctx, "nsenter", nsArg, "tc", "qdisc", "del", "dev", dev, "root")
+				cancel()
+			}
 			_ = n.Journal.Remove(id)
 			n.release(netnsID, id)
 			return nil, err
