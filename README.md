@@ -199,9 +199,9 @@ Telemetry follows the standard OTel environment:
   the pattern that matched, and `http.route` holds the route (`/product/{id}`).
   Any other handler (a plain `http.Handler`, gorilla, chi) gets the method
   alone (`GET`) and no `http.route`, as does the atroposd listener (a reverse
-  proxy). `Serve`'s own control mux, which mounts
-  the handler at `/`, never shows up in either. The span used to carry the
-  service name; select it by `service.name` and `span.kind = server` instead.
+  proxy). `Serve`'s own control mux, which mounts the handler at `/`, never
+  shows up in either. The span used to carry the service name; select it by
+  `service.name` and `span.kind = server` instead.
 - **Logs** are a signal: the default `Config.Logger` writes JSON lines to
   stdout at Info and above and tees every record, at every level (Debug
   included), into the OTel slog bridge, so the SDK's `*Context` log calls carry
@@ -214,7 +214,10 @@ Telemetry follows the standard OTel environment:
   adds nothing to the file's resource, so `service.name`,
   `service.instance.id`, `service.version`, `k8s.pod.name` and `atropos.host`
   are there only if the file sets them; its `propagator` section is ignored
-  (logged at WARN) and the propagators above stay.
+  (logged at WARN) and the propagators above stay. Its `meter_provider`
+  section is ignored too (logged at WARN): metrics stay on client_golang and
+  `/metrics`, so the readers it configures export nothing the SDK records.
+  The path is read with surrounding whitespace trimmed.
 
 A BYO `TracerProvider` makes the shutdown a no-op: it turns all of the above
 off except the propagators (the SDK builds no exporter, for traces or logs,
@@ -305,8 +308,10 @@ curl localhost:8080/metrics
 
 POST `/admin/fault` body fields by `fault_type`: `latency` requires
 `params.delay` (e.g. `"500ms"`, optional `jitter`); `error` defaults to
-status 500, `"injected fault"`; `hang` requires `params.duration`. The
-admin slot composes AFTER the host evaluator, so an armed admin fault can
+status 500, `"injected fault"`; `hang` requires `params.duration`. A fault
+that decodes but could never start (a latency with neither delay nor jitter,
+such as `delay: "0s"`, or ramps that do not fit the duration) is refused with
+`400` and arms nothing. The admin slot composes AFTER the host evaluator, so an armed admin fault can
 never shadow the rules of a running experiment. When connected, manteion stays
 authoritative over slots: the next `200` desired-state document that does not
 name a slot drops (and stops) it, and the fault watchdog drops one that stays
@@ -335,7 +340,7 @@ The store is split so record traffic can never evict replay data: an immutable, 
 
 Response headers on replay: `X-Atropos-Cache-Key`, `X-Atropos-Cache-Mode`, `X-Atropos-Cache-Latency-Us`; fail-closed misses carry `X-Atropos-Cache-Miss`. Oversize responses (> 1 MiB by default) stream through unchanged and are **counted as drops** under a recording rule.
 
-Cache-box covers **egress HTTP only**. Ingress and gRPC are tracked in Ongoing Development.
+Cache-box covers **egress HTTP only**. Ingress and gRPC are tracked under "Not Yet Implemented → Cache-box on ingress + gRPC".
 
 ### 6. Decision events and correlation
 
@@ -374,7 +379,19 @@ member is removed when the context names none), and from there they travel on
 every further hop through the downstream services' inbound baggage. They ride
 on the call whatever its destination, third-party APIs included: they are
 opaque ids, so strip them at an egress gateway if that matters. Every other
-baggage member is forwarded unchanged.
+baggage member is forwarded unchanged, including the members of a `baggage`
+header the application set on the outgoing request itself.
+
+The four signals join on `trace_id`. A request's server or client span, the
+exemplar its duration histogram sample and fault or cache-box counter
+increment carry (section 7), its `atropos.decision` event and the SDK's own
+`*Context` log lines (the default `Config.Logger`, through the OTel bridge) all
+name the same trace and span, so a fault found in one store is found in the
+others; `atropos.fault.id` joins a fault span to every request that met it.
+What does not join: decisions made by the control plane rather than for a
+request (a rule set or fault slot applied from manteion or `/admin/*`, a
+sidecar's eager re-arm) emit no decision event, and a `Config.Logger` the host
+brings bypasses the bridge.
 
 ### 7. Prometheus Metrics
 
@@ -656,10 +673,6 @@ A schema pushed by manteion that defines allowed attribute keys, cardinality bou
 ### Configuration version correlation
 
 Services report their current config version / feature-flag state as a resource attribute; manteion tracks version transitions and timestamps them; a Grafana annotation query overlays these on trace latency panels so "config rolled at 14:32" lines up visually with "p99 doubled at 14:33."
-
-### Cross-layer event correlation
-
-Atropos spans carry a correlation ID that links to metrics exemplars and structured log entries. When a fault fires, it records the correlation ID in the span, emits a metric exemplar with the same ID, and writes a structured log line with the ID — so a query engine can join across all three stores for a single incident.
 
 ### eBPF probes for non-Go services
 
