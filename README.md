@@ -521,9 +521,10 @@ pod's egress, the sidecar's own control-plane and OTel traffic included.
 `network.scope` multiplies `loss` and must lie in (0,1] (0 means 1); netem
 latency needs scope 1. Netem shapes egress only (`direction` empty or
 `upstream`). A pod network namespace carries one netem fault at a time (a
-second one gets `409` from the agent and fails to start). The agent
+second one gets `409` from the agent and fails to start); a `hostNetwork`
+pod is refused (`400`), and netem faults take no ramps. The agent
 journals each fault before its first `tc` command and removes it on stop,
-when the sidecar disconnects, and at agent boot. The in-process host, and a
+when the sidecar disconnects, at agent shutdown and at agent boot. The in-process host, and a
 sidecar whose agent does not list `netem`, skip such rules per rule
 (logged, counted in `atropos_rules_unsupported_total{category="network"}`,
 reported under `unsupported`); on a netem-capable sidecar a netem rule

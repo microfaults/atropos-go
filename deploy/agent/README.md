@@ -39,13 +39,17 @@ Three mechanisms; the resource ones are selected per rule with
   agent pod's namespace (use the FQDN otherwise), and only IPv4 addresses
   are used. `network.scope` multiplies `loss` and must lie in (0,1] (0
   means 1); latency needs scope 1. Egress only: `direction` must be empty
-  or `upstream` (ingress would need an ifb device). One netem fault per pod
-  network namespace at a time: a second gets `409`; an invalid spec gets
-  `400`. Each fault is journaled under `-netem-journal` (default
+  or `upstream` (ingress would need an ifb device). Ramps are not
+  supported: a non-zero `ramp_up_ms`/`ramp_down_ms` is refused. One netem
+  fault per pod network namespace at a time: a second gets `409`; an
+  invalid spec (a malformed target port or an IPv6 literal included) gets
+  `400`; so does a `hostNetwork: true` pod, whose namespace is the node's
+  (the fault would shape the whole node). Each fault is journaled under `-netem-journal` (default
   `/var/lib/atropos-agent/netem`, one `<id>.json`) before its first `tc`
   command, re-saved after each command that succeeds, and removed
   (`tc qdisc del dev <dev> root`) on stop, when the sidecar disconnects,
-  and at agent boot. The agent offers `netem` only when `tc` and `nsenter`
+  at agent shutdown (SIGTERM: the agent releases every running fault before
+  it exits) and at agent boot. The agent offers `netem` only when `tc` and `nsenter`
   are on its PATH (the image installs `iproute2` and `util-linux`).
 
 `GET /v1/capabilities` answers `{"mechanisms": ["burn", "quota", "netem"]}`
@@ -95,34 +99,46 @@ modinfo sch_netem sch_prio cls_u32 | grep -c ^filename   # 3
   naming another pod is refused (403).
 - Quota journal: `kill -9` of the agent leaves the journal; the next start
   restores every entry before serving.
-- Netem journal: the same, for netem faults; an entry is dropped without
-  running `tc` when its namespace is gone or names another namespace, or
-  when none of its `tc` commands succeeded. When removing a fault fails
-  (the rollback of a failed apply, or a stop), the entry is kept and the
-  namespace stays reserved, so a later stop (`DELETE /v1/faults/<id>`
-  consults the journal) or the next agent boot retries the removal.
-- Known residual: an agent crash between a successful root `qdisc add` and
-  the journal re-save that follows it leaves the qdisc applied behind an
-  entry with no applied command, which the boot restore drops. Remove it by
-  hand: `sudo nsenter --net=/proc/<pid>/ns/net tc qdisc del dev <dev> root`
-  (a later plan makes the boot restore look for the agent's handle `1:` in
-  `tc qdisc show`).
+- Netem journal: the same, for netem faults. A restore enters the pod's
+  namespace by its identity (the `net:[inode]` journaled at apply), not by
+  the app container's pid: when that pid is gone (the container restarted)
+  it uses any live process holding the same namespace, the pod's pause
+  process included; the entry is dropped without running `tc` only when no
+  process holds it. Before deleting, a restore probes
+  `tc qdisc show dev <dev> root` and runs `tc qdisc del dev <dev> root`
+  only when the root is the agent's (`prio` or `netem`, handle `1:`); a
+  root that is not (the default `noqueue`, a qdisc removed by hand, a
+  device that is gone) means the fault is already removed, and the entry
+  is dropped. The probe decides every entry, one whose journal re-save
+  never happened included, so an agent crash between the root
+  `qdisc add` and that re-save is restored at the next boot (there is no
+  manual-removal residual). When removing a fault fails (the rollback of a
+  failed apply, a stop, or the boot restore), the entry is kept and the
+  namespace stays reserved (a new netem fault there gets `409`), so a later
+  stop (`DELETE /v1/faults/<id>` consults the journal) or the next agent
+  boot retries the removal. A restore is single-flight per fault id (a
+  concurrent `DELETE` of the same id answers `200` without running `tc`)
+  and never touches a namespace a newer fault holds: such a stale entry is
+  dropped without `tc`.
 - A fault lives as long as the sidecar's streaming request: sidecar gone,
   fault stopped / quota restored / netem removed.
 
 ## Verify netem on a k3s node
 
 Unit tests stub `nsenter`/`tc`; this is the real check, on VM1 after the
-agent DaemonSet and a sidecar-instrumented service are up. This recipe was
-last verified by reading it against the code, not by running it on a
-cluster (the service-beds runbook execution is outstanding).
+agent DaemonSet and a sidecar-instrumented service are up. This recipe has
+not been executed on a cluster: it was checked by reading it against the
+code (the service-beds runbook execution is outstanding).
 
 ```bash
 POD=$(sudo k3s kubectl get pod -l app=recommendationservice -o jsonpath='{.items[0].metadata.name}')
+BEDS=$(sudo k3s kubectl get pod $POD -o jsonpath='{.metadata.namespace}')
 PODIP=$(sudo k3s kubectl get pod $POD -o jsonpath='{.status.podIP}')
 CID=$(sudo k3s crictl ps --name '^server$' --pod $(sudo k3s crictl pods --name $POD -q) -q)
 PID=$(sudo k3s crictl inspect $CID | jq .info.pid)
-CATALOG=$(sudo k3s kubectl get svc productcatalogservice -o jsonpath='{.spec.clusterIP}')
+CATALOG=$(sudo k3s kubectl get svc productcatalogservice -n $BEDS -o jsonpath='{.spec.clusterIP}')
+CATALOG_EP=$(sudo k3s kubectl get endpoints productcatalogservice -n $BEDS -o jsonpath='{.subsets[0].addresses[0].ip}')
+FQDN=productcatalogservice.$BEDS.svc.cluster.local   # the agent resolves names in its own pod's DNS namespace
 NS="sudo nsenter --net=/proc/$PID/ns/net"
 
 $NS tc qdisc show dev eth0                          # before: "qdisc noqueue 0: root"
@@ -130,7 +146,7 @@ $NS tc qdisc show dev eth0                          # before: "qdisc noqueue 0: 
 # 1. Targeted loss (30% toward productcatalogservice:3550) through the sidecar's admin slot.
 curl -s -XPOST http://$PODIP:16020/admin/fault -H 'content-type: application/json' -d '{
   "category":"network","fault_type":"packet_loss","duration_ms":120000,
-  "network":{"target":"productcatalogservice:3550","direction":"upstream"},
+  "network":{"target":"'$FQDN':3550","direction":"upstream"},
   "params":{"loss":30,"correlation":25}}'
 $NS tc -s qdisc show dev eth0                       # prio 1: root, netem 40: parent 1:4 "loss 30% 25%"; its "dropped" counter rises under load
 $NS tc filter show dev eth0                         # u32, flowid 1:4: match <CATALOG in hex>/ffffffff at 16 and 00000dde/0000ffff at 20 (dport 3550)
@@ -138,18 +154,23 @@ sudo ls /var/lib/atropos-agent/netem                # one <id>.json
 curl -s -XDELETE http://$PODIP:16020/admin/fault
 $NS tc qdisc show dev eth0                          # back to noqueue; journal dir empty
 
-# 2. Loss visible to ping: ICMP has no dport, so target the service without a port.
+# 2. Loss visible to ping. A ClusterIP answers no ICMP under kube-proxy's
+#    iptables mode (the k3s default: it is DNAT'd only for its service ports),
+#    so target an endpoint pod IP, without a port (ICMP has no dport).
 curl -s -XPOST http://$PODIP:16020/admin/fault -H 'content-type: application/json' -d '{
   "category":"network","fault_type":"packet_loss","duration_ms":120000,
-  "network":{"target":"productcatalogservice","direction":"upstream"},"params":{"loss":30}}'
-$NS ping -c 50 -i 0.2 -W 1 $CATALOG | tail -2      # ~30% packet loss
+  "network":{"target":"'$CATALOG_EP'","direction":"upstream"},"params":{"loss":30}}'
+$NS ping -c 50 -i 0.2 -W 1 $CATALOG_EP | tail -2   # ~30% packet loss
 curl -s -XDELETE http://$PODIP:16020/admin/fault
 
-# 3. Kernel latency, whole pod.
+# 3. Kernel latency, whole pod: measured over TCP to the service port (the
+#    ClusterIP answers TCP on 3550, not ICMP), or ping the endpoint pod IP.
+for i in 1 2 3 4 5; do $NS curl -o /dev/null -s -w '%{time_connect}\n' http://$CATALOG:3550/; done   # before: well under 0.01 s
 curl -s -XPOST http://$PODIP:16020/admin/fault -H 'content-type: application/json' -d '{
   "category":"network","fault_type":"latency","duration_ms":60000,
   "network":{"direction":"upstream"},"params":{"delay":"200ms","jitter":"50ms","mechanism":"netem"}}'
-$NS ping -c 5 $CATALOG | tail -1                    # rtt avg ≈ 200 ms (± jitter)
+for i in 1 2 3 4 5; do $NS curl -o /dev/null -s -w '%{time_connect}\n' http://$CATALOG:3550/; done   # ≈ 0.2 s each (± jitter): the SYN is delayed
+$NS ping -c 5 $CATALOG_EP | tail -1                 # rtt avg ≈ 200 ms (± jitter)
 curl -s -XDELETE http://$PODIP:16020/admin/fault
 
 # 4. Crash restore: arm 1 again, then SIGKILL the agent (crictl stop with no grace period).
@@ -162,9 +183,12 @@ curl -s -XDELETE http://$PODIP:16020/admin/fault    # the slot is still armed: c
 Step 4 kills the agent with SIGKILL, so nothing of the agent runs at exit
 and the qdisc and its journal entry are left for the restarted container's
 boot restore, which removes the qdisc and logs one `restored journaled
-netem` line per entry. The `ping`s run from the node's own `ping` inside
-the pod's namespace, so they do not depend on the app image shipping one;
-`tc` shapes the namespace's egress whichever process sends.
+netem` line per entry. The `ping`s and `curl`s run from the node's own
+binaries inside the pod's namespace, so they do not depend on the app image
+shipping them; `tc` shapes the namespace's egress whichever process sends.
+Targets use the FQDN (or an IP): the agent resolves a target name with the
+resolver of its own pod, so a short service name resolves only when the
+agent DaemonSet runs in the beds' namespace.
 
 Transparent capture: the app's connections are REDIRECTed to the sidecar on
 loopback and the sidecar dials the ClusterIP from the same namespace, so the

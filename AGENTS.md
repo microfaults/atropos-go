@@ -281,7 +281,8 @@ from an older agent means `burn` and `quota` only), the sidecar advertises the
 `netem` capability and routes `network/packet_loss` and netem `latency` to the
 agent (`internal/agent.NetworkFactory` via `instrument.WithNetworkHost`), which
 applies `tc netem` on the pod's egress, one netem fault per pod network
-namespace at a time (`409` from the agent for a second). Without that (and
+namespace at a time (`409` from the agent for a second; a `hostNetwork` pod
+and non-zero ramps are refused). Without that (and
 always in-process) netem rules are skipped per rule and counted under
 `atropos_rules_unsupported_total{category="network"}`; on a netem-capable
 sidecar an invalid netem spec is a decode error (`422` on `/admin/rules`).
