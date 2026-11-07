@@ -72,7 +72,12 @@ whose schema per `(category, fault_type)` is defined by the exported
 `network` is required for (and exclusive to) the `network` category.
 Common `params` examples: inline latency `{"delay","jitter"}`; inline error
 `{"status_code","message"}` (defaults 500 / `"injected fault"`); inline hang
-`{"duration"}`; resource cpu `{"target_load","window","mechanism"}`. On
+`{"duration"}`; resource cpu `{"target_load","window","mechanism"}`; network
+packet_loss `{"loss","correlation"}` (percent; `tc netem` through the node
+agent, sidecar only); network latency `{"delay","jitter","mechanism"}`, where
+`mechanism: "netem"` moves the delay from the proxy toxic to `tc netem` in the
+pod's network namespace. `network.scope` multiplies `loss` and must be 0 or 1
+on netem latency; netem shapes pod egress only (`direction: upstream`). On
 resource faults `mechanism` is `burn` (default: the stress code runs in the
 target's cgroup, via the node agent in sidecar mode) or `quota` (the node
 agent lowers the target cgroup's `cpu.max`/`memory.high` instead); the
@@ -249,7 +254,7 @@ and the fidelity endpoint alike.
 
 ### Limitations (current)
 
-- The rule decoder supports all three fault categories: inline (latency, error, hang), network (latency, retransmit_delay, blackhole, drip, rst, throttle), and resource (cpu, disk, io, memory). Network `host=proxy` faults (the in-process default) need `Config.NetworkResolver`. A host executes only the categories in its capability set; a rule outside it, an unknown category included, is skipped per rule and counted (see `/admin/rules`).
+- The rule decoder supports all three fault categories: inline (latency, error, hang), network (latency, retransmit_delay, blackhole, drip, rst, throttle; packet_loss and latency with mechanism netem only via the atroposd sidecar with the node agent), and resource (cpu, disk, io, memory). Network `host=proxy` faults (the in-process default) need `Config.NetworkResolver`. A host executes only the categories in its capability set; a rule outside it, an unknown category included, is skipped per rule and counted (see `/admin/rules`).
 - Network faults with `host=inline` run in the atroposd sidecar, which executes them as armed proxy policies through `ToxicTransport` (see below). The in-process host has no proxied connection to shape, so it skips such rules per rule (logged at WARN, counted under `atropos_rules_unsupported_total{category="network"}`) and rejects a single `/admin/fault` slot with 400; `host=proxy` without a `NetworkResolver` is handled the same way. An empty `network.host` means `inline` in the sidecar (design §5.6) and `proxy` in-process.
 - Resource faults with `mechanism: quota` need the node agent's cgroup authority. The in-process host has none, so it skips such rules per rule (logged at WARN, counted under `atropos_rules_unsupported_total{category="resource"}`) and rejects a single `/admin/fault` slot with 400; the sidecar delegates resource faults to the node agent when its socket answers at start.
 - Composition rules are skipped per rule on decode (logged at WARN, counted under `atropos_rules_unsupported_total{category="composition"}` and listed under `unsupported` in the status report) — the SDK has no composition evaluator yet (parallel/sequential fault dispatch with direction inheritance is future work).

@@ -11,7 +11,7 @@ import (
 func TestRegistryCoverage(t *testing.T) {
 	want := map[string][]string{
 		"inline":   {"error", "hang", "latency"},
-		"network":  {"blackhole", "drip", "latency", "retransmit_delay", "rst", "throttle"},
+		"network":  {"blackhole", "drip", "latency", "packet_loss", "retransmit_delay", "rst", "throttle"},
 		"resource": {"cpu", "disk", "io", "memory"},
 	}
 	got := map[string][]string{}
@@ -56,6 +56,10 @@ func TestValidateRaw_GoldenFixtures(t *testing.T) {
 		{"resource", "memory", `{"target_load":0.5,"chunk_size":1048576,"thrashing":true,"thrash_workers":2}`},
 		{"resource", "disk", `{"write_rate":1048576,"max_disk_usage":10485760,"chunk_size":4096,"path":"/tmp"}`},
 		{"resource", "io", `{"read_rate":102400,"file_size":4096,"file_count":16,"workers":4,"mode":"read_write"}`},
+		{"network", "latency", `{"delay":"100ms","mechanism":"netem"}`},
+		{"network", "packet_loss", `{"loss":10}`},
+		{"network", "packet_loss", `{"loss":12.5,"correlation":25,"mechanism":"netem"}`},
+		{"network", "packet_loss", `{"loss":100}`},
 	}
 	for _, c := range good {
 		if err := ValidateRaw(c.cat, c.typ, json.RawMessage(c.raw)); err != nil {
@@ -75,6 +79,12 @@ func TestValidateRaw_GoldenFixtures(t *testing.T) {
 		{"resource", "cpu", `{"target_load":1.2}`, "target_load > 1"},
 		{"resource", "io", `{"mode":"sideways"}`, "unknown io mode"},
 		{"inline", "explode", `{}`, "unknown fault type"},
+		{"network", "packet_loss", `{"loss":0}`, "loss 0"},
+		{"network", "packet_loss", `{"loss":101}`, "loss > 100"},
+		{"network", "packet_loss", `{"loss":10,"correlation":-1}`, "negative correlation"},
+		{"network", "packet_loss", `{"loss":10,"mechanism":"toxic"}`, "unknown network mechanism"},
+		{"network", "latency", `{"delay":"100ms","mechanism":"quota"}`, "quota is a resource mechanism"},
+		{"network", "rst", `{"mechanism":"netem"}`, "rst has no mechanism field"},
 	}
 	for _, c := range bad {
 		if err := ValidateRaw(c.cat, c.typ, json.RawMessage(c.raw)); err == nil {
@@ -97,5 +107,26 @@ func TestResourceMechanism(t *testing.T) {
 	}
 	if err := (ResourceCPU{TargetLoad: 0.5, Mechanism: "steal"}).Validate(); err == nil {
 		t.Error("unknown mechanism must be rejected")
+	}
+}
+
+func TestNetworkMechanism(t *testing.T) {
+	cases := []struct {
+		typ, raw, want string
+	}{
+		{"packet_loss", ``, "netem"},
+		{"packet_loss", `{"loss":10}`, "netem"},
+		{"latency", `{"delay":"1ms","mechanism":"netem"}`, "netem"},
+		{"latency", `{"delay":"1ms"}`, ""},
+		{"latency", `not json`, ""},
+		{"rst", `{"mechanism":"netem"}`, "netem"}, // read, not validated: the decoder rejects it later
+	}
+	for _, c := range cases {
+		if got := NetworkMechanism(c.typ, json.RawMessage(c.raw)); got != c.want {
+			t.Errorf("NetworkMechanism(%s, %s) = %q, want %q", c.typ, c.raw, got, c.want)
+		}
+	}
+	if err := ValidateNetworkMechanism("latency", "burn"); err == nil {
+		t.Error("burn is not a network mechanism")
 	}
 }

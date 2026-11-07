@@ -13,6 +13,7 @@
 package faultparams
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -185,10 +186,42 @@ func (p ResourceIO) Validate() error {
 // network (toxics — run inside the TCP proxy; the envelope lives outside)
 // ---------------------------------------------------------------------------
 
-// NetworkLatency delays piped bytes by delay + rand(jitter).
+// MechanismNetem moves a network fault from the proxy toxic to tc netem in
+// the target pod's network namespace; only the node agent (through the
+// atroposd sidecar) can execute it.
+const MechanismNetem = "netem"
+
+// ValidateNetworkMechanism accepts "" or "netem".
+func ValidateNetworkMechanism(faultType, m string) error {
+	switch m {
+	case "", MechanismNetem:
+		return nil
+	default:
+		return fmt.Errorf("network %s: unknown mechanism %q (want netem)", faultType, m)
+	}
+}
+
+// NetworkMechanism reports the mechanism a network fault's raw params ask
+// for: always "netem" for packet_loss, otherwise the params' mechanism field
+// ("" when absent or unparseable). It reads, it does not validate.
+func NetworkMechanism(faultType string, raw json.RawMessage) string {
+	if faultType == "packet_loss" {
+		return MechanismNetem
+	}
+	var p struct {
+		Mechanism string `json:"mechanism"`
+	}
+	_ = json.Unmarshal(raw, &p)
+	return p.Mechanism
+}
+
+// NetworkLatency delays piped bytes by delay + rand(jitter). The proxy toxic
+// applies the delay by default; with mechanism "netem" it is applied by tc
+// netem in the pod's network namespace instead (node agent, sidecar only).
 type NetworkLatency struct {
-	Delay  string `json:"delay"`            // required, e.g. "100ms"
-	Jitter string `json:"jitter,omitempty"` // optional uniform jitter
+	Delay     string `json:"delay"`               // required, e.g. "100ms"
+	Jitter    string `json:"jitter,omitempty"`    // optional uniform jitter
+	Mechanism string `json:"mechanism,omitempty"` // "" | "netem" (node agent only)
 }
 
 func (p NetworkLatency) Validate() error {
@@ -200,7 +233,25 @@ func (p NetworkLatency) Validate() error {
 			return fmt.Errorf("network latency: invalid jitter %q: %w", p.Jitter, err)
 		}
 	}
-	return nil
+	return ValidateNetworkMechanism("latency", p.Mechanism)
+}
+
+// NetworkPacketLoss drops a percentage of packets toward the target with tc
+// netem (node agent, sidecar only).
+type NetworkPacketLoss struct {
+	Loss        float64 `json:"loss"`                  // required, percent in (0,100]
+	Correlation float64 `json:"correlation,omitempty"` // percent in [0,100]
+	Mechanism   string  `json:"mechanism,omitempty"`   // "" | "netem"
+}
+
+func (p NetworkPacketLoss) Validate() error {
+	if p.Loss <= 0 || p.Loss > 100 {
+		return fmt.Errorf("network packet_loss: loss %v outside (0,100]", p.Loss)
+	}
+	if p.Correlation < 0 || p.Correlation > 100 {
+		return fmt.Errorf("network packet_loss: correlation %v outside [0,100]", p.Correlation)
+	}
+	return ValidateNetworkMechanism("packet_loss", p.Mechanism)
 }
 
 // NetworkRetransmitDelay simulates TCP retransmission stalls: a fraction of

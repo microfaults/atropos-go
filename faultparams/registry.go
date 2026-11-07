@@ -25,6 +25,7 @@ var specs = []Spec{
 	{"network", "blackhole", "Consume client bytes and never respond", func() Param { return &NetworkBlackhole{} }},
 	{"network", "drip", "Trickle the stream out in tiny chunks", func() Param { return &NetworkDrip{} }},
 	{"network", "latency", "Delay piped bytes by delay + rand(jitter)", func() Param { return &NetworkLatency{} }},
+	{"network", "packet_loss", "Drop a percentage of packets toward the target with tc netem (node agent)", func() Param { return &NetworkPacketLoss{} }},
 	{"network", "retransmit_delay", "Stall a fraction of reads to mimic TCP retransmissions", func() Param { return &NetworkRetransmitDelay{} }},
 	{"network", "rst", "Force-close the connection with a TCP RST", func() Param { return &NetworkRST{} }},
 	{"network", "throttle", "Cap stream bandwidth with token pacing", func() Param { return &NetworkThrottle{} }},
