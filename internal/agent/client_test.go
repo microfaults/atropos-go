@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"net/http"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,5 +52,50 @@ func TestAgentFault_RejectedStartIsAnError(t *testing.T) {
 	}
 	if Reachable(shortSocket(t)) {
 		t.Fatal("a missing socket must not be reachable")
+	}
+}
+
+func TestCapabilities_ReportsTheAgentsMechanisms(t *testing.T) {
+	a := startTestAgent(t, "pod-a")
+	ac, err := Capabilities(a.sock)
+	if err != nil || strings.Join(ac.Mechanisms, ",") != "burn,quota,netem" {
+		t.Fatalf("capabilities = %v, %v", ac, err)
+	}
+	if _, err := Capabilities(shortSocket(t)); err == nil {
+		t.Fatal("a missing socket must be an error")
+	}
+}
+
+func TestCapabilities_LegacyAgentReportsBurnAndQuota(t *testing.T) {
+	sock := shortSocket(t)
+	ln, err := Listen(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/faults", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("[]")) })
+	srv := &http.Server{Handler: mux}
+	go srv.Serve(ln)
+	t.Cleanup(func() { srv.Close() })
+	ac, err := Capabilities(sock)
+	if err != nil || strings.Join(ac.Mechanisms, ",") != "burn,quota" {
+		t.Fatalf("legacy agent: %v, %v (a 404 means burn and quota)", ac, err)
+	}
+}
+
+func TestNetworkFactory_ValidatesAtDecodeAndBuildsAnAgentFault(t *testing.T) {
+	h := NetworkFactory("/tmp/x.sock", "pod-a", "server")
+	req := netReq("packet_loss", "productcatalogservice:3550", "upstream", 0, `{"loss":10}`)
+	f, err := h("drop-catalog", &req, fault.FaultConfig{Duration: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	af, ok := f.(*AgentFault)
+	if !ok || af.Name != "drop-catalog" || af.PodUID != "pod-a" || af.Container != "server" || af.Req.FaultType != "packet_loss" || af.Req.Network.Target != "productcatalogservice:3550" {
+		t.Fatalf("fault = %#v", f)
+	}
+	bad := netReq("latency", "", "", 0, `{"delay":"1ms"}`)
+	if _, err := h("toxic", &bad, fault.FaultConfig{Duration: time.Second}); err == nil || !strings.Contains(err.Error(), "toxic") {
+		t.Fatalf("a non-netem latency must fail decode through the factory, got %v", err)
 	}
 }

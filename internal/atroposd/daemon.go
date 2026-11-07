@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"slices"
 	"time"
 
+	"git.ucsc.edu/microfaults/atropos-go/faultparams"
 	"git.ucsc.edu/microfaults/atropos-go/internal/agent"
 	"git.ucsc.edu/microfaults/atropos-go/internal/instrument"
 	"git.ucsc.edu/microfaults/atropos-go/internal/proxy"
@@ -96,12 +98,22 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	// Resource faults are never executed in the sidecar (design §5.6). When
 	// the node agent answers on its socket, the sidecar advertises the
 	// capability and delegates every resource rule to it, for this pod's
-	// app container (design §5.14). An agent that appears later is picked
-	// up on the next sidecar start, never silently mid-experiment.
-	if cfg.AgentSocket != "" && agent.Reachable(cfg.AgentSocket) {
-		caps = append(caps, instrument.CapResource)
-		decodeOpts = append(decodeOpts, instrument.WithResourceHost(agent.ResourceFactory(cfg.AgentSocket, cfg.PodUID, cfg.AppContainer)))
-		logger.Info("atroposd: node agent reachable; resource faults delegated", "socket", cfg.AgentSocket, "container", cfg.AppContainer, "pod_uid", cfg.PodUID)
+	// app container (design §5.14); when the agent also lists netem, netem
+	// network rules go to it the same way and the sidecar advertises
+	// CapNetem. One capabilities probe decides both (an agent predating the
+	// endpoint answers 404, read as burn and quota only); an agent that does
+	// not answer is not advertised at all. An agent that appears later is
+	// picked up on the next sidecar start, never silently mid-experiment.
+	if cfg.AgentSocket != "" {
+		if ac, err := agent.Capabilities(cfg.AgentSocket); err == nil {
+			caps = append(caps, instrument.CapResource)
+			decodeOpts = append(decodeOpts, instrument.WithResourceHost(agent.ResourceFactory(cfg.AgentSocket, cfg.PodUID, cfg.AppContainer)))
+			if slices.Contains(ac.Mechanisms, faultparams.MechanismNetem) {
+				caps = append(caps, instrument.CapNetem)
+				decodeOpts = append(decodeOpts, instrument.WithNetworkHost(agent.NetworkFactory(cfg.AgentSocket, cfg.PodUID, cfg.AppContainer)))
+			}
+			logger.Info("atroposd: node agent reachable; resource faults delegated", "socket", cfg.AgentSocket, "container", cfg.AppContainer, "pod_uid", cfg.PodUID, "mechanisms", ac.Mechanisms)
+		}
 	}
 	core := instrument.NewCore(instrument.CoreConfig{
 		Service:       cfg.Service,

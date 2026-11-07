@@ -398,22 +398,27 @@ func TestRun_TransparentRecordThenReplay(t *testing.T) {
 	}
 }
 
-// TestRun_DelegatesResourceFaultsToAgent: with the node agent reachable, a
-// resource rule applied to the sidecar arms eagerly through the agent —
-// here a cpu quota on the app container's cgroup — and rule removal
-// restores it.
-func TestRun_DelegatesResourceFaultsToAgent(t *testing.T) {
-	cg := t.TempDir()
+// startFakeAgent serves a node agent on a fresh Unix socket until cleanup:
+// it resolves pod-x's "server" container to the cgroup dir cg (seeded with
+// cpu.max, memory.max, memory.high and cgroup.procs, a file already there
+// kept as it is), executes netem through nt (nil: netem not offered) and
+// returns the socket path.
+func startFakeAgent(t *testing.T, cg string, nt *agent.Netem) (sock string, srv *agent.Server) {
+	t.Helper()
 	for name, content := range map[string]string{"cpu.max": "max 100000\n", "memory.max": "max\n", "memory.high": "max\n", "cgroup.procs": ""} {
-		if err := os.WriteFile(filepath.Join(cg, name), []byte(content), 0o644); err != nil {
+		path := filepath.Join(cg, name)
+		if _, err := os.Stat(path); err == nil {
+			continue
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
 	var sb [4]byte
 	rand.Read(sb[:])
-	sock := filepath.Join(os.TempDir(), "atropos-agent-"+hex.EncodeToString(sb[:])+".sock")
+	sock = filepath.Join(os.TempDir(), "atropos-agent-"+hex.EncodeToString(sb[:])+".sock")
 	t.Cleanup(func() { os.Remove(sock) })
-	srv := &agent.Server{
+	srv = &agent.Server{
 		Resolver: agent.ResolverFunc(func(podUID, container string) (agent.Target, error) {
 			if podUID != "pod-x" || container != "server" {
 				return agent.Target{}, os.ErrNotExist
@@ -425,6 +430,7 @@ func TestRun_DelegatesResourceFaultsToAgent(t *testing.T) {
 		Peer:    func(net.Conn) (string, error) { return "pod-x", nil },
 		Host:    agent.Capacity{CPUs: 1, MemoryBytes: 1 << 30},
 		Logger:  slog.New(slog.DiscardHandler),
+		Netem:   nt,
 	}
 	ln, err := agent.Listen(sock)
 	if err != nil {
@@ -433,7 +439,24 @@ func TestRun_DelegatesResourceFaultsToAgent(t *testing.T) {
 	actx, acancel := context.WithCancel(context.Background())
 	agentDone := make(chan struct{})
 	go func() { defer close(agentDone); _ = srv.Serve(actx, ln) }()
-	t.Cleanup(func() { acancel(); <-agentDone })
+	t.Cleanup(func() {
+		acancel()
+		select {
+		case <-agentDone:
+		case <-time.After(10 * time.Second):
+			t.Error("agent server did not stop")
+		}
+	})
+	return sock, srv
+}
+
+// TestRun_DelegatesResourceFaultsToAgent: with the node agent reachable, a
+// resource rule applied to the sidecar arms eagerly through the agent —
+// here a cpu quota on the app container's cgroup — and rule removal
+// restores it.
+func TestRun_DelegatesResourceFaultsToAgent(t *testing.T) {
+	cg := t.TempDir()
+	sock, _ := startFakeAgent(t, cg, nil)
 
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	t.Cleanup(up.Close)
@@ -466,6 +489,166 @@ func TestRun_DelegatesResourceFaultsToAgent(t *testing.T) {
 	}
 	if got := read(); got != "max 100000" {
 		t.Fatalf("cpu.max after rule removal = %q, want restored", got)
+	}
+}
+
+// podNetem is a Netem over a fake /proc whose pid 4242 lives in one namespace;
+// cg's cgroup.procs names that pid.
+func podNetem(t *testing.T, cg string, rec *[]string, mu *sync.Mutex) *agent.Netem {
+	t.Helper()
+	proc := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(proc, "4242", "ns"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("net:[4026532412]", filepath.Join(proc, "4242", "ns", "net")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cg, "cgroup.procs"), []byte("4242\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return &agent.Netem{
+		Runner: agent.RunnerFunc(func(_ context.Context, name string, args ...string) ([]byte, error) {
+			mu.Lock()
+			*rec = append(*rec, strings.Join(append([]string{name}, args...), " "))
+			mu.Unlock()
+			return nil, nil // ip -json link show yields nothing → eth0
+		}),
+		Journal:  agent.NetemJournal{Dir: filepath.Join(t.TempDir(), "netem")},
+		ProcRoot: proc,
+		LookupIP: func(context.Context, string) ([]net.IPAddr, error) {
+			return []net.IPAddr{{IP: net.ParseIP("10.43.0.5")}}, nil
+		},
+	}
+}
+
+// TestRun_NetemThroughTheAgent: with an agent that offers netem, a netem
+// packet_loss rule applied to the sidecar arms eagerly through the agent (the
+// targeted filter lands in the pod's namespace) and rule removal restores
+// the pod's qdisc.
+func TestRun_NetemThroughTheAgent(t *testing.T) {
+	cg := t.TempDir()
+	var rec []string
+	var mu sync.Mutex
+	sock, _ := startFakeAgent(t, cg, podNetem(t, cg, &rec, &mu))
+	has := func(sub string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, l := range rec {
+			if strings.Contains(l, sub) {
+				return true
+			}
+		}
+		return false
+	}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	t.Cleanup(up.Close)
+	addrs := runDaemon(t, Config{
+		Service: "recommendationservice", Egress: []EgressRoute{{Listen: "127.0.0.1:0", Upstream: strings.TrimPrefix(up.URL, "http://")}},
+		AgentSocket: sock, PodUID: "pod-x", AppContainer: "server",
+	})
+	control := "http://" + addrs.Control
+	rule := `[{"name":"drop-catalog","injection_point":"egress","mode":"background",
+		"fault":{"category":"network","fault_type":"packet_loss","duration_ms":10000,
+		"network":{"target":"productcatalogservice:3550","direction":"upstream"},"params":{"loss":10,"correlation":25}}}]`
+	if code, body := postJSON(t, control+"/admin/rules", rule); code != http.StatusNoContent {
+		t.Fatalf("install rule: code=%d body=%s", code, body)
+	}
+	want := "tc filter add dev eth0 parent 1: protocol ip prio 1 u32 match ip dst 10.43.0.5/32 match ip dport 3550 0xffff flowid 1:4"
+	deadline := time.Now().Add(5 * time.Second)
+	for !has(want) && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !has(want) {
+		mu.Lock()
+		defer mu.Unlock()
+		t.Fatalf("eager arming must apply netem through the agent, ran %q", rec)
+	}
+	if code, body := postJSON(t, control+"/admin/rules", `[]`); code != http.StatusNoContent {
+		t.Fatalf("clear rules: code=%d body=%s", code, body)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for !has("tc qdisc del dev eth0 root") && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !has("tc qdisc del dev eth0 root") {
+		t.Fatal("rule removal must restore the pod's qdisc")
+	}
+}
+
+// TestRun_AdvertisesNetemOnlyWhenTheAgentOffersIt pins the register body's
+// capabilities: resource with any live agent, netem only when the agent's
+// mechanism list names it.
+func TestRun_AdvertisesNetemOnlyWhenTheAgentOffersIt(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		netem    bool
+		wantCaps string
+	}{
+		{"agent with netem", true, "inline,network,cachebox,resource,netem"},
+		{"agent without netem", false, "inline,network,cachebox,resource"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cg := t.TempDir()
+			var rec []string
+			var mu sync.Mutex
+			var nt *agent.Netem
+			if tc.netem {
+				nt = podNetem(t, cg, &rec, &mu)
+			}
+			sock, _ := startFakeAgent(t, cg, nt)
+			m := newDesiredStateManteion(t, wire.RuleSync{Version: 1, Rules: []wire.CompiledRule{}, ActiveFaults: []wire.FaultRequest{}}, nil)
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+			t.Cleanup(up.Close)
+			runDaemon(t, Config{
+				Service: "recommendationservice", ManteionURL: m.srv.URL,
+				Egress:      []EgressRoute{{Listen: "127.0.0.1:0", Upstream: strings.TrimPrefix(up.URL, "http://")}},
+				AgentSocket: sock, PodUID: "pod-x", AppContainer: "server",
+			})
+			var registers []wire.RegisterRequest
+			deadline := time.Now().Add(10 * time.Second)
+			for len(registers) == 0 && time.Now().Before(deadline) {
+				_, _, registers, _ = m.snapshot()
+				if len(registers) == 0 {
+					time.Sleep(20 * time.Millisecond)
+				}
+			}
+			if len(registers) == 0 {
+				t.Fatal("no registration")
+			}
+			if got := strings.Join(registers[0].Capabilities, ","); got != tc.wantCaps {
+				t.Fatalf("register capabilities = %s, want %s", got, tc.wantCaps)
+			}
+		})
+	}
+}
+
+// TestRun_NoLiveAgentAdvertisesNeitherResourceNorNetem: a configured socket
+// nobody answers on delegates nothing.
+func TestRun_NoLiveAgentAdvertisesNeitherResourceNorNetem(t *testing.T) {
+	var sb [4]byte
+	rand.Read(sb[:])
+	sock := filepath.Join(os.TempDir(), "atropos-agent-"+hex.EncodeToString(sb[:])+".sock")
+	m := newDesiredStateManteion(t, wire.RuleSync{Version: 1, Rules: []wire.CompiledRule{}, ActiveFaults: []wire.FaultRequest{}}, nil)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	t.Cleanup(up.Close)
+	runDaemon(t, Config{
+		Service: "recommendationservice", ManteionURL: m.srv.URL,
+		Egress:      []EgressRoute{{Listen: "127.0.0.1:0", Upstream: strings.TrimPrefix(up.URL, "http://")}},
+		AgentSocket: sock, PodUID: "pod-x", AppContainer: "server",
+	})
+	var registers []wire.RegisterRequest
+	deadline := time.Now().Add(10 * time.Second)
+	for len(registers) == 0 && time.Now().Before(deadline) {
+		_, _, registers, _ = m.snapshot()
+		if len(registers) == 0 {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	if len(registers) == 0 {
+		t.Fatal("no registration")
+	}
+	if got := strings.Join(registers[0].Capabilities, ","); got != "inline,network,cachebox" {
+		t.Fatalf("register capabilities = %s, want inline,network,cachebox", got)
 	}
 }
 

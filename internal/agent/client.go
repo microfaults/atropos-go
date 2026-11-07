@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"time"
 
+	"git.ucsc.edu/microfaults/atropos-go/faultparams"
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
 	"git.ucsc.edu/microfaults/atropos-go/internal/instrument"
 	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
@@ -150,6 +151,53 @@ func Reachable(sock string) bool {
 	}
 	resp.Body.Close()
 	return resp.StatusCode == http.StatusOK
+}
+
+// NetworkFactory is the instrument.NetworkHost a sidecar installs when the
+// agent offers netem: every netem network rule becomes an AgentFault for this
+// pod's app container. It validates the request with NetemSpecFromRequest
+// first, the same check the agent runs at start, so a malformed netem rule
+// fails at decode with the agent's own message: a decode error (a bad rule,
+// like an unparseable delay), never an UnsupportedFaultError.
+func NetworkFactory(sock, podUID, container string) instrument.NetworkHost {
+	return func(name string, req *wire.FaultRequest, base fault.FaultConfig) (fault.Fault, error) {
+		if _, err := NetemSpecFromRequest(*req); err != nil {
+			return nil, err
+		}
+		return &AgentFault{FaultConfig: base, Sock: sock, PodUID: podUID, Container: container, Name: name, Req: *req}, nil
+	}
+}
+
+// Capabilities asks the agent on sock which mechanisms it executes (GET
+// /v1/capabilities, 2 s timeout). A 200 is the decoded body. A 404 is an
+// agent predating the endpoint, which executes burn and quota only: it
+// answers {burn, quota} and a nil error. A dial failure or any other status
+// is an error (no live agent: the sidecar delegates nothing to it).
+func Capabilities(sock string) (CapabilitiesResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://atropos-agent/v1/capabilities", nil)
+	if err != nil {
+		return CapabilitiesResponse{}, err
+	}
+	resp, err := socketClient(sock).Do(req)
+	if err != nil {
+		return CapabilitiesResponse{}, fmt.Errorf("agent: capabilities: %w", err)
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+		var ac CapabilitiesResponse
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&ac); err != nil {
+			return CapabilitiesResponse{}, fmt.Errorf("agent: capabilities: malformed body: %w", err)
+		}
+		return ac, nil
+	case http.StatusNotFound:
+		return CapabilitiesResponse{Mechanisms: []string{faultparams.MechanismBurn, faultparams.MechanismQuota}}, nil
+	default:
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return CapabilitiesResponse{}, fmt.Errorf("agent: capabilities (%d): %s", resp.StatusCode, bytes.TrimSpace(msg))
+	}
 }
 
 var _ fault.Fault = (*AgentFault)(nil)
