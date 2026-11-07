@@ -48,8 +48,11 @@ func (f RunnerFunc) Run(ctx context.Context, name string, args ...string) ([]byt
 // NetemEntry is one applied netem fault, journaled before its first tc
 // command runs so it can be removed after a stop, a crash or an agent
 // restart. Netns is <proc>/<pid>/ns/net of the process the agent entered;
-// NetnsID is that link's target at apply time (net:[inode]), which tells a
-// later restore whether the path still names the same namespace. Applied
+// NetnsID is that link's target at apply time (net:[inode]), the
+// namespace's identity. A later restore enters the namespace by that
+// identity, not by the path: Netns while it still links to NetnsID, else
+// any live process that holds the inode (see resolveNetns), so an app
+// container restart mid-fault does not strand the qdisc. Applied
 // holds the tc lines (space-joined argv) that succeeded, in the order they
 // ran: the entry is saved with none before the first tc line and re-saved
 // after each one, so an entry with no applied line installed nothing of
@@ -284,10 +287,10 @@ func (n *Netem) resolveTarget(ctx context.Context, target string) ([]net.IP, int
 	return ips, port, nil
 }
 
-// Restore removes e's root qdisc and its journal entry. It trusts the
-// journal only while e.Netns still links to e.NetnsID: a namespace that is
-// gone or whose path now names another namespace is never touched, its
-// entry is dropped and nil returned. An entry with no applied line (its
+// Restore removes e's root qdisc and its journal entry. It enters the
+// namespace named by e.NetnsID through resolveNetns (e.Netns, or another
+// live process holding the same inode); a namespace no process holds is
+// gone: it is never touched, its entry is dropped and nil returned. An entry with no applied line (its
 // root add never succeeded) installed nothing of ours: it is dropped the
 // same way, without tc (except after an agent crash between a successful
 // root add and its journal re-save, which leaves our root qdisc for manual
@@ -298,12 +301,40 @@ func (n *Netem) Restore(ctx context.Context, e NetemEntry) error {
 	return err
 }
 
+// resolveNetns finds a path that enters the network namespace netnsID
+// (net:[inode]) now. The journaled path (the app container's first pid) is
+// only a hint: the pod's namespace belongs to its sandbox and outlives that
+// process, so a container restart leaves the namespace without the pid. It
+// returns hint while hint still links to netnsID; otherwise the
+// <proc>/<pid>/ns/net of the first live process whose link equals netnsID
+// (the pause process always does while the pod lives). ok is false only
+// when no process holds the inode: the namespace is gone.
+func (n *Netem) resolveNetns(hint, netnsID string) (path string, ok bool) {
+	if cur, err := os.Readlink(hint); err == nil && cur == netnsID {
+		return hint, true
+	}
+	ents, err := os.ReadDir(n.procRoot())
+	if err != nil {
+		return "", false
+	}
+	for _, d := range ents {
+		if _, err := strconv.Atoi(d.Name()); err != nil {
+			continue
+		}
+		p := filepath.Join(n.procRoot(), d.Name(), "ns", "net")
+		if cur, err := os.Readlink(p); err == nil && cur == netnsID {
+			return p, true
+		}
+	}
+	return "", false
+}
+
 // restoreOutcome says what restore did with an entry.
 type restoreOutcome int
 
 const (
 	restoredNetem restoreOutcome = iota // tc qdisc del ran
-	netnsGone                           // namespace gone or reused: dropped
+	netnsGone                           // no process holds the namespace: dropped
 	neverApplied                        // no applied line: dropped
 )
 
@@ -317,10 +348,11 @@ func (n *Netem) restore(ctx context.Context, e NetemEntry) (restoreOutcome, erro
 	if len(e.Applied) == 0 {
 		return drop(neverApplied)
 	}
-	if cur, err := os.Readlink(e.Netns); err != nil || cur != e.NetnsID {
+	netns, ok := n.resolveNetns(e.Netns, e.NetnsID)
+	if !ok {
 		return drop(netnsGone)
 	}
-	if _, err := n.Runner.Run(ctx, "nsenter", "--net="+e.Netns, "tc", "qdisc", "del", "dev", e.Dev, "root"); err != nil {
+	if _, err := n.Runner.Run(ctx, "nsenter", "--net="+netns, "tc", "qdisc", "del", "dev", e.Dev, "root"); err != nil {
 		return restoredNetem, err
 	}
 	return drop(restoredNetem)

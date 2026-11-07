@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -58,20 +59,42 @@ func (r *recRunner) has(sub string) bool {
 	return false
 }
 
-// newTestNetem builds a Netem over a fake /proc (pid 4242 in net:[4026532412]),
-// a recording runner and a resolver answering 10.43.0.5. The target's
-// cgroup.procs names pid 4242.
+// fakeNetnsLink makes <proc>/<pid>/ns/net a link to id (net:[inode]), the
+// way the kernel shows a process's network namespace.
+func fakeNetnsLink(t *testing.T, proc string, pid int, id string) string {
+	t.Helper()
+	dir := filepath.Join(proc, strconv.Itoa(pid), "ns")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "net")
+	if err := os.Symlink(id, link); err != nil {
+		t.Fatal(err)
+	}
+	return link
+}
+
+const (
+	hostNetnsID = "net:[4026531840]" // pid 1's: the node's own network namespace
+	podNetnsID  = "net:[4026532412]"
+	// ourRootQdisc is what `tc qdisc show dev eth0 root` prints while a
+	// targeted fault of ours is applied.
+	ourRootQdisc = "qdisc prio 1: root refcnt 2 bands 4 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1\n"
+)
+
+// newTestNetem builds a Netem over a fake /proc (pid 1 in the host
+// namespace, pid 4242 in net:[4026532412]), a recording runner (the root
+// qdisc probe answers ours) and a resolver answering 10.43.0.5. The
+// target's cgroup.procs names pid 4242.
 func newTestNetem(t *testing.T) (*Netem, *recRunner, string, Target) {
 	t.Helper()
 	proc := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(proc, "4242", "ns"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	netns := filepath.Join(proc, "4242", "ns", "net")
-	if err := os.Symlink("net:[4026532412]", netns); err != nil {
-		t.Fatal(err)
-	}
-	r := &recRunner{out: map[string][]byte{"ip -json link show": []byte(ipLinkJSON)}, fail: map[string]error{}}
+	fakeNetnsLink(t, proc, 1, hostNetnsID)
+	netns := fakeNetnsLink(t, proc, 4242, podNetnsID)
+	r := &recRunner{out: map[string][]byte{
+		"ip -json link show": []byte(ipLinkJSON),
+		"tc qdisc show":      []byte(ourRootQdisc),
+	}, fail: map[string]error{}}
 	n := &Netem{Runner: r, Journal: NetemJournal{Dir: filepath.Join(t.TempDir(), "netem")}, ProcRoot: proc,
 		LookupIP: func(_ context.Context, host string) ([]net.IPAddr, error) {
 			return []net.IPAddr{{IP: net.ParseIP("10.43.0.5")}}, nil
@@ -328,5 +351,61 @@ func TestNetem_RestoreAllDropsAnEntryWithNoAppliedLine(t *testing.T) {
 	}
 	if es, _ := n.Journal.Load(); len(es) != 0 {
 		t.Fatal("the never-applied entry must be dropped")
+	}
+}
+
+// Critical 1: the journaled pid's link disappears (the app container
+// restarted) while pid 4343 (the pause sandbox) still holds the pod's
+// namespace: the restore enters the namespace through 4343 and removes the
+// qdisc.
+func TestNetem_RestoreFindsTheNamespaceThroughAnotherHolder(t *testing.T) {
+	n, r, netns, tg := newTestNetem(t)
+	e, err := n.Apply(context.Background(), "f1", tg, lossSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(netns); err != nil { // pid 4242 is gone
+		t.Fatal(err)
+	}
+	holder := fakeNetnsLink(t, n.ProcRoot, 4343, podNetnsID)
+	before := len(r.lines())
+	if err := n.Restore(context.Background(), *e); err != nil {
+		t.Fatal(err)
+	}
+	got := r.lines()[before:]
+	if len(got) == 0 || got[len(got)-1] != "nsenter --net="+holder+" tc qdisc del dev eth0 root" {
+		t.Fatalf("restore ran %q, want the root qdisc deleted through pid 4343", got)
+	}
+	for _, l := range got {
+		if strings.Contains(l, netns) {
+			t.Fatalf("restore must not use the vanished pid's path: %q", l)
+		}
+	}
+	if es, _ := n.Journal.Load(); len(es) != 0 {
+		t.Fatal("journal must be empty after the restore")
+	}
+	if _, err := n.Apply(context.Background(), "f2", Target{PodUID: "pod-a", CgroupDir: cgroupDir(t, map[string]string{"cgroup.procs": "4343\n"})}, lossSpec); err != nil {
+		t.Fatalf("the namespace must be free after the restore: %v", err)
+	}
+}
+
+// With no process holding the journaled inode the namespace is gone: the
+// entry is dropped without tc.
+func TestNetem_RestoreDropsAnEntryWhoseNamespaceNobodyHolds(t *testing.T) {
+	n, r, netns, tg := newTestNetem(t)
+	e, err := n.Apply(context.Background(), "f1", tg, lossSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(netns)
+	before := len(r.lines())
+	if err := n.Restore(context.Background(), *e); err != nil {
+		t.Fatalf("restore of a vanished namespace must succeed: %v", err)
+	}
+	if len(r.lines()) != before {
+		t.Fatalf("no tc may run for a namespace nobody holds, ran %q", r.lines()[before:])
+	}
+	if es, _ := n.Journal.Load(); len(es) != 0 {
+		t.Fatal("the stale entry must be dropped")
 	}
 }
