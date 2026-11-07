@@ -36,7 +36,7 @@ type NetemSpec struct {
 // turns it into a NetemSpec. It is the one validation the sidecar runs at
 // decode time and the agent at start time. Checks, in order: the category is
 // network; the envelope is present; the direction is "" or "upstream"
-// (egress only); the scope (0 means 1); then the params of packet_loss or
+// (egress only); the scope is in (0,1] (0 means 1); then the params of packet_loss or
 // latency (latency needs mechanism netem and scope 1); any other fault type
 // is rejected.
 func NetemSpecFromRequest(req wire.FaultRequest) (NetemSpec, error) {
@@ -54,6 +54,9 @@ func NetemSpecFromRequest(req wire.FaultRequest) (NetemSpec, error) {
 	scope := req.Network.Scope
 	if scope == 0 {
 		scope = 1
+	}
+	if scope < 0 || scope > 1 {
+		return NetemSpec{}, fmt.Errorf("network scope %v outside (0,1]", req.Network.Scope)
 	}
 	params := req.Params
 	if len(params) == 0 {

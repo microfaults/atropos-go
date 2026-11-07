@@ -103,3 +103,29 @@ func TestPickInterface(t *testing.T) {
 		t.Fatalf("loopback only must yield \"\", got %q", got)
 	}
 }
+
+func TestNetemSpecFromRequest_ScopeRange(t *testing.T) {
+	cases := []struct {
+		name     string
+		scope    float64
+		wantLoss float64
+		wantErr  string
+	}{
+		{"zero means one", 0, 10, ""},
+		{"half is applied", 0.5, 5, ""},
+		{"negative", -0.5, 0, "network scope -0.5 outside (0,1]"},
+		{"above one", 1.5, 0, "network scope 1.5 outside (0,1]"},
+	}
+	for _, c := range cases {
+		spec, err := NetemSpecFromRequest(netReq("packet_loss", "x", "", c.scope, `{"loss":10}`))
+		if c.wantErr != "" {
+			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+				t.Errorf("%s: err = %v, want one mentioning %q", c.name, err, c.wantErr)
+			}
+			continue
+		}
+		if err != nil || spec.Loss != c.wantLoss {
+			t.Errorf("%s: spec = %+v, err = %v, want loss %v", c.name, spec, err, c.wantLoss)
+		}
+	}
+}
