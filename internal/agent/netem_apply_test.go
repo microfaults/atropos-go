@@ -293,3 +293,40 @@ func TestNetem_FailedLaterLineDeletesTheRootQdisc(t *testing.T) {
 		t.Fatal("journal must be empty after a rolled-back apply")
 	}
 }
+
+func TestNetem_FailedRollbackKeepsTheEntryAndTheNamespace(t *testing.T) {
+	n, r, _, tg := newTestNetem(t)
+	n.Logger = slog.New(slog.DiscardHandler)
+	r.fail["tc filter add"] = errors.New("exit status 2")
+	r.fail["tc qdisc del"] = errors.New("exit status 3")
+	_, err := n.Apply(context.Background(), "f1", tg, lossSpec)
+	if err == nil || !strings.Contains(err.Error(), "exit status 2") || !strings.Contains(err.Error(), "rollback: exit status 3") {
+		t.Fatalf("err = %v, want the line failure joined with the rollback failure", err)
+	}
+	es, _ := n.Journal.Load()
+	if len(es) != 1 || es[0].ID != "f1" || len(es[0].Applied) != 2 {
+		t.Fatalf("journal = %+v, want f1 kept with its two applied lines", es)
+	}
+	delete(r.fail, "tc filter add")
+	delete(r.fail, "tc qdisc del")
+	if _, err := n.Apply(context.Background(), "f2", tg, lossSpec); !errors.Is(err, ErrNetemBusy) {
+		t.Fatalf("the namespace must stay busy after a failed rollback, got %v", err)
+	}
+}
+
+func TestNetem_RestoreAllDropsAnEntryWithNoAppliedLine(t *testing.T) {
+	n, r, netns, _ := newTestNetem(t)
+	// A crash after the pre-tc save, before the root add succeeded.
+	if err := n.Journal.Save(NetemEntry{ID: "half", PodUID: "pod-a", Netns: netns, NetnsID: "net:[4026532412]", Dev: "eth0"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := n.RestoreAll(context.Background(), slog.New(slog.DiscardHandler)); got != 1 {
+		t.Fatalf("RestoreAll = %d, want 1", got)
+	}
+	if len(r.lines()) != 0 {
+		t.Fatalf("an entry with no applied line must run no tc, ran %q", r.lines())
+	}
+	if es, _ := n.Journal.Load(); len(es) != 0 {
+		t.Fatal("the never-applied entry must be dropped")
+	}
+}

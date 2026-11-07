@@ -50,7 +50,10 @@ func (f RunnerFunc) Run(ctx context.Context, name string, args ...string) ([]byt
 // restart. Netns is <proc>/<pid>/ns/net of the process the agent entered;
 // NetnsID is that link's target at apply time (net:[inode]), which tells a
 // later restore whether the path still names the same namespace. Applied
-// holds the tc lines (space-joined argv) in the order they ran.
+// holds the tc lines (space-joined argv) that succeeded, in the order they
+// ran: the entry is saved with none before the first tc line and re-saved
+// after each one, so an entry with no applied line installed nothing of
+// ours and is dropped without a tc command.
 type NetemEntry struct {
 	ID        string    `json:"id"`
 	PodUID    string    `json:"pod_uid"`
@@ -104,6 +107,8 @@ type Netem struct {
 	ProcRoot string
 	// LookupIP resolves a target host (nil means net.DefaultResolver.LookupIPAddr).
 	LookupIP func(ctx context.Context, host string) ([]net.IPAddr, error)
+	// Logger receives Apply's rollback warnings (nil means slog.Default()).
+	Logger *slog.Logger
 
 	mu     sync.Mutex
 	active map[string]string // netns id → fault id
@@ -114,6 +119,13 @@ func (n *Netem) procRoot() string {
 		return "/proc"
 	}
 	return n.ProcRoot
+}
+
+func (n *Netem) logger() *slog.Logger {
+	if n.Logger == nil {
+		return slog.Default()
+	}
+	return n.Logger
 }
 
 func (n *Netem) reserve(netnsID, id string) error {
@@ -143,12 +155,21 @@ func (n *Netem) release(netnsID, id string) {
 // under mu (ErrNetemBusy when taken), released again on every failure
 // below; resolve the target to its IPv4 addresses; pick the egress
 // interface (eth0 when the listing fails or names none); build the plan and
-// journal the entry BEFORE the first tc command, so a crash mid-apply is
-// restorable; run the plan's lines in order. On the first failing line the
-// entry is removed, the namespace released, and the runner's error
-// returned; when that line is a later one (our root qdisc exists), the root
-// qdisc is first deleted again (best effort, on a fresh context). A failing
-// root add runs no del: the root qdisc there is not ours.
+// journal the entry (no applied line yet) BEFORE the first tc command, so a
+// crash mid-apply is restorable; run the plan's lines in order, re-saving
+// the entry with each line that succeeded. On the first failure (a line, or
+// the re-save after it):
+//   - nothing applied yet (the root add failed): no tc del runs, since the
+//     root qdisc there is not ours; the entry is removed, the namespace
+//     released and the error returned;
+//   - our root qdisc exists: tc qdisc del dev <dev> root runs on a fresh
+//     context. When it succeeds, the entry is removed, the namespace
+//     released and the error returned; when it fails, the qdisc may still
+//     be applied, so the entry is kept and the namespace stays busy (like a
+//     failed Restore: RestoreAll or a later stop retries), and the error
+//     returned is "<err>; rollback: <del err>" wrapping both.
+//
+// A failing journal removal is logged at Warn.
 func (n *Netem) Apply(ctx context.Context, id string, t Target, spec NetemSpec) (*NetemEntry, error) {
 	pid, err := FirstPID(t.CgroupDir)
 	if err != nil {
@@ -180,30 +201,42 @@ func (n *Netem) Apply(ctx context.Context, id string, t Target, spec NetemSpec) 
 
 	plan := netemPlan(dev, ips, port, spec)
 	e := &NetemEntry{ID: id, PodUID: t.PodUID, Netns: netns, NetnsID: netnsID, Dev: dev, AppliedAt: time.Now()}
-	for _, line := range plan {
-		e.Applied = append(e.Applied, strings.Join(line, " "))
-	}
 	if err := n.Journal.Save(*e); err != nil {
 		n.release(netnsID, id)
 		return nil, fmt.Errorf("agent: journal netem: %w", err)
 	}
 
-	for i, line := range plan {
+	for _, line := range plan {
 		if _, err := n.Runner.Run(ctx, "nsenter", append([]string{nsArg}, line...)...); err != nil {
-			// Only once our root qdisc exists is there anything of ours to
-			// delete: when the root add itself failed, the root qdisc (if
-			// any) belongs to someone else, e.g. the CNI, and is left alone.
-			if i > 0 {
-				rctx, cancel := context.WithTimeout(context.Background(), netemRollbackTimeout)
-				_, _ = n.Runner.Run(rctx, "nsenter", nsArg, "tc", "qdisc", "del", "dev", dev, "root")
-				cancel()
-			}
-			_ = n.Journal.Remove(id)
-			n.release(netnsID, id)
-			return nil, err
+			return nil, n.rollback(e, err)
+		}
+		e.Applied = append(e.Applied, strings.Join(line, " "))
+		if err := n.Journal.Save(*e); err != nil {
+			return nil, n.rollback(e, fmt.Errorf("agent: journal netem: %w", err))
 		}
 	}
 	return e, nil
+}
+
+// rollback undoes a failed Apply of e (see Apply) and returns the error to
+// report. Only once a line succeeded is there a root qdisc of ours to
+// delete: when the root add itself failed, the root qdisc (if any) belongs
+// to someone else, e.g. the CNI, and is left alone.
+func (n *Netem) rollback(e *NetemEntry, cause error) error {
+	if len(e.Applied) > 0 {
+		rctx, cancel := context.WithTimeout(context.Background(), netemRollbackTimeout)
+		_, delErr := n.Runner.Run(rctx, "nsenter", "--net="+e.Netns, "tc", "qdisc", "del", "dev", e.Dev, "root")
+		cancel()
+		if delErr != nil {
+			n.logger().Warn("agent: netem rollback failed; journal entry kept", "id", e.ID, "dev", e.Dev, "netns", e.Netns, "error", delErr)
+			return fmt.Errorf("%w; rollback: %w", cause, delErr)
+		}
+	}
+	if err := n.Journal.Remove(e.ID); err != nil {
+		n.logger().Warn("agent: remove netem journal entry", "id", e.ID, "dev", e.Dev, "netns", e.Netns, "error", err)
+	}
+	n.release(e.NetnsID, e.ID)
+	return cause
 }
 
 // resolveTarget turns a host[:port] target into its IPv4 addresses and the
@@ -251,31 +284,46 @@ func (n *Netem) resolveTarget(ctx context.Context, target string) ([]net.IP, int
 // Restore removes e's root qdisc and its journal entry. It trusts the
 // journal only while e.Netns still links to e.NetnsID: a namespace that is
 // gone or whose path now names another namespace is never touched, its
-// entry is dropped and nil returned. A failing tc keeps the entry (a later
-// restore can retry) and returns the error.
+// entry is dropped and nil returned. An entry with no applied line (its
+// root add never succeeded) installed nothing of ours: it is dropped the
+// same way, without tc. A failing tc keeps the entry (a later restore can
+// retry) and returns the error.
 func (n *Netem) Restore(ctx context.Context, e NetemEntry) error {
 	_, err := n.restore(ctx, e)
 	return err
 }
 
-// restore is Restore, also reporting whether the namespace was gone.
-func (n *Netem) restore(ctx context.Context, e NetemEntry) (gone bool, err error) {
-	if cur, err := os.Readlink(e.Netns); err != nil || cur != e.NetnsID {
+// restoreOutcome says what restore did with an entry.
+type restoreOutcome int
+
+const (
+	restoredNetem restoreOutcome = iota // tc qdisc del ran
+	netnsGone                           // namespace gone or reused: dropped
+	neverApplied                        // no applied line: dropped
+)
+
+// restore is Restore, also reporting what it did.
+func (n *Netem) restore(ctx context.Context, e NetemEntry) (restoreOutcome, error) {
+	drop := func(o restoreOutcome) (restoreOutcome, error) {
 		err := n.Journal.Remove(e.ID)
 		n.release(e.NetnsID, e.ID)
-		return true, err
+		return o, err
+	}
+	if len(e.Applied) == 0 {
+		return drop(neverApplied)
+	}
+	if cur, err := os.Readlink(e.Netns); err != nil || cur != e.NetnsID {
+		return drop(netnsGone)
 	}
 	if _, err := n.Runner.Run(ctx, "nsenter", "--net="+e.Netns, "tc", "qdisc", "del", "dev", e.Dev, "root"); err != nil {
-		return false, err
+		return restoredNetem, err
 	}
-	err = n.Journal.Remove(e.ID)
-	n.release(e.NetnsID, e.ID)
-	return false, err
+	return drop(restoredNetem)
 }
 
 // RestoreAll restores every journaled netem fault (agent boot): a netem
 // fault must never outlive the agent that applied it. Returns how many
-// entries were restored or discarded (namespace gone).
+// entries were restored or discarded (namespace gone, or never applied).
 func (n *Netem) RestoreAll(ctx context.Context, logger *slog.Logger) int {
 	es, err := n.Journal.Load()
 	if err != nil {
@@ -284,17 +332,20 @@ func (n *Netem) RestoreAll(ctx context.Context, logger *slog.Logger) int {
 	}
 	count := 0
 	for _, e := range es {
-		gone, err := n.restore(ctx, e)
+		outcome, err := n.restore(ctx, e)
 		if err != nil {
 			logger.Warn("agent: restore journaled netem", "id", e.ID, "netns", e.Netns, "dev", e.Dev, "error", err)
 			continue
 		}
 		count++
-		if gone {
+		switch outcome {
+		case netnsGone:
 			logger.Info("agent: journaled netem namespace gone", "id", e.ID, "netns", e.Netns, "netns_id", e.NetnsID)
-			continue
+		case neverApplied:
+			logger.Info("agent: journaled netem never applied", "id", e.ID, "netns", e.Netns)
+		default:
+			logger.Info("agent: restored journaled netem", "id", e.ID, "netns", e.Netns, "dev", e.Dev)
 		}
-		logger.Info("agent: restored journaled netem", "id", e.ID, "netns", e.Netns, "dev", e.Dev)
 	}
 	return count
 }
