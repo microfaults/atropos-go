@@ -38,6 +38,8 @@ type testAgent struct {
 	dir    string // target cgroup dir
 	runner *recRunner
 	netns  string // the fake /proc's netns path of pid 4242
+	cancel context.CancelFunc
+	served <-chan struct{} // closed when Serve has returned
 }
 
 func startTestAgent(t *testing.T, peer string) *testAgent {
@@ -75,7 +77,7 @@ func startTestAgent(t *testing.T, peer string) *testAgent {
 			t.Error("agent server did not stop")
 		}
 	})
-	return &testAgent{srv: srv, sock: sock, client: socketClient(sock), dir: dir, runner: rec, netns: netns}
+	return &testAgent{srv: srv, sock: sock, client: socketClient(sock), dir: dir, runner: rec, netns: netns, cancel: cancel, served: done}
 }
 
 func (a *testAgent) post(t *testing.T, ctx context.Context, req StartRequest) (*http.Response, string) {
@@ -451,8 +453,8 @@ func TestServer_NetemKeptEntryAfterFailedRollbackIsRestoredThroughTheJournal(t *
 		t.Fatalf("delete through the journal: %v %v", err, dresp)
 	}
 	dresp.Body.Close()
-	if l := a.runner.lines(); len(l) != before+1 || l[before] != "nsenter --net="+a.netns+" tc qdisc del dev eth0 root" {
-		t.Fatalf("commands after the delete = %q, want the root qdisc deleted", l[before:])
+	if l := a.runner.lines(); len(l) != before+2 || l[before] != "nsenter --net="+a.netns+" tc qdisc show dev eth0 root" || l[before+1] != "nsenter --net="+a.netns+" tc qdisc del dev eth0 root" {
+		t.Fatalf("commands after the delete = %q, want the probe, then the root qdisc deleted", l[before:])
 	}
 	if es, _ := a.srv.Netem.Journal.Load(); len(es) != 0 {
 		t.Fatalf("journal = %+v, want empty after the restore", es)
@@ -539,5 +541,50 @@ func TestServer_NetemConcurrentDeletesOfAKeptEntryRunOneDel(t *testing.T) {
 	}
 	if es, _ := a.srv.Netem.Journal.Load(); len(es) != 0 {
 		t.Fatalf("journal = %+v, want empty", es)
+	}
+}
+
+// Important 4: cancelling Serve's context (SIGTERM) releases every running
+// fault before Serve returns, so main cannot exit with a quota or a qdisc
+// applied.
+func TestServer_ShutdownReleasesRunningFaultsBeforeServeReturns(t *testing.T) {
+	a := startTestAgent(t, "pod-a")
+	a.seedPID(t)
+	qresp, _ := a.post(t, context.Background(), quotaReq("pod-a", 0.5, 60000))
+	defer qresp.Body.Close()
+	nresp, _ := a.post(t, context.Background(), netemReq("pod-a", "packet_loss", "", "", `{"loss":10}`, 60000))
+	defer nresp.Body.Close()
+	if got := readTrim(t, filepath.Join(a.dir, "cpu.max")); got != "50000 100000" {
+		t.Fatalf("cpu.max while armed = %q", got)
+	}
+	a.cancel()
+	select {
+	case <-a.served:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Serve did not return")
+	}
+	if got := readTrim(t, filepath.Join(a.dir, "cpu.max")); got != "max 100000" {
+		t.Fatalf("cpu.max when Serve returned = %q, want the quota restored", got)
+	}
+	if !a.runner.has("tc qdisc del dev eth0 root") {
+		t.Fatalf("the netem qdisc must be deleted before Serve returns, ran %q", a.runner.lines())
+	}
+	if es, _ := a.srv.Netem.Journal.Load(); len(es) != 0 {
+		t.Fatalf("netem journal = %+v, want empty", es)
+	}
+	if qs, _ := a.srv.Journal.Load(); len(qs) != 0 {
+		t.Fatalf("quota journal = %+v, want empty", qs)
+	}
+}
+
+func TestServer_NetemRefusesAHostNetworkPodWith400(t *testing.T) {
+	a := startTestAgent(t, "pod-a")
+	a.seedPID(t)
+	proc := a.srv.Netem.ProcRoot
+	os.Remove(filepath.Join(proc, "1", "ns", "net"))
+	fakeNetnsLink(t, proc, 1, podNetnsID)
+	resp, body := a.post(t, context.Background(), netemReq("pod-a", "packet_loss", "", "", `{"loss":10}`, 1000))
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(body, "host network namespace") {
+		t.Fatalf("status=%d body=%q, want 400 naming the host network namespace", resp.StatusCode, body)
 	}
 }

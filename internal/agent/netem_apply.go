@@ -55,11 +55,10 @@ func (f RunnerFunc) Run(ctx context.Context, name string, args ...string) ([]byt
 // container restart mid-fault does not strand the qdisc. Applied
 // holds the tc lines (space-joined argv) that succeeded, in the order they
 // ran: the entry is saved with none before the first tc line and re-saved
-// after each one, so an entry with no applied line installed nothing of
-// ours and is dropped without a tc command. The known exception: an agent
-// crash between a successful root add and that re-save leaves our root
-// qdisc behind an entry with no applied line; it is removed by hand (see
-// deploy/agent/README.md).
+// after each one. A restore does not trust Applied to decide whether our
+// root qdisc exists: it probes `tc qdisc show` for our handle 1:, so an
+// agent crash between a successful root add and that re-save (an entry
+// with no applied line over our root) is still restored.
 type NetemEntry struct {
 	ID        string    `json:"id"`
 	PodUID    string    `json:"pod_uid"`
@@ -99,6 +98,12 @@ func (j NetemJournal) Load() ([]NetemEntry, error) {
 // ErrNetemBusy refuses a second netem fault in a network namespace that
 // already carries one: each fault owns the interface's root qdisc.
 var ErrNetemBusy = errors.New("agent: a netem fault is already applied in this pod's network namespace")
+
+// ErrNetemHostNetwork refuses a netem fault on a pod that shares the host's
+// network namespace (hostNetwork: true): its egress interface is the
+// node's, so the fault would shape every pod on the node, kubelet and the
+// agent's own traffic included.
+var ErrNetemHostNetwork = errors.New("netem: target pod shares the host network namespace")
 
 // netemRollbackTimeout bounds the best-effort qdisc removal after a failed
 // apply; it runs on a fresh context so a cancelled caller still cleans up.
@@ -158,7 +163,9 @@ func (n *Netem) release(netnsID, id string) {
 }
 
 // Apply installs spec in the network namespace of t's first process. The
-// order is the contract: read the namespace link; reserve the namespace
+// order is the contract: read the namespace link; refuse a namespace that
+// is the host's (pid 1's: a hostNetwork pod) with ErrNetemHostNetwork, and
+// fail when pid 1's link cannot be read; reserve the namespace
 // under mu (ErrNetemBusy when taken), released again on every failure
 // below; resolve the target to its IPv4 addresses; pick the egress
 // interface (eth0 when the listing fails or names none); build the plan and
@@ -186,6 +193,13 @@ func (n *Netem) Apply(ctx context.Context, id string, t Target, spec NetemSpec) 
 	netnsID, err := os.Readlink(netns)
 	if err != nil {
 		return nil, fmt.Errorf("agent: network namespace of pid %d (does the agent run with hostPID?): %w", pid, err)
+	}
+	hostID, err := os.Readlink(filepath.Join(n.procRoot(), "1", "ns", "net"))
+	if err != nil {
+		return nil, fmt.Errorf("agent: host network namespace (pid 1; does the agent run with hostPID?): %w", err)
+	}
+	if hostID == netnsID {
+		return nil, ErrNetemHostNetwork
 	}
 	if err := n.reserve(netnsID, id); err != nil {
 		return nil, err
@@ -302,16 +316,23 @@ func (n *Netem) resolveTarget(ctx context.Context, target string) ([]net.IP, int
 // tc then runs with mu released. It enters the namespace named by
 // e.NetnsID through resolveNetns (e.Netns, or another live process holding
 // the same inode); a namespace no process holds is gone: it is never
-// touched and its entry is dropped. An entry with no applied line (its
-// root add never succeeded) installed nothing of ours: it is dropped the
-// same way, without tc (except after an agent crash between a successful
-// root add and its journal re-save, which leaves our root qdisc for manual
-// removal; see deploy/agent/README.md). Finally, under mu again: a
+// touched and its entry is dropped. Restore is idempotent: it probes the
+// root qdisc first (rootQdiscIsOurs) and runs tc qdisc del dev <dev> root
+// only when the root is ours (prio or netem, handle 1:). A root that is not
+// ours (already removed by an earlier restore that crashed before its
+// journal removal, or by hand; or the device is gone) means the entry is
+// already restored: it is dropped and logged at Info. The probe decides
+// for an entry with no applied line too, so a crash between a successful
+// root add and its journal re-save is restored, not left behind. A probe
+// that fails otherwise keeps the entry. Finally, under mu again: a
 // successful restore removes the entry and frees the namespace; a failing
 // tc keeps both (a later restore retries; a new Apply there gets
 // ErrNetemBusy) and returns the error.
 func (n *Netem) Restore(ctx context.Context, e NetemEntry) error {
-	_, err := n.restore(ctx, e)
+	o, err := n.restore(ctx, e)
+	if err == nil && o == alreadyRestored {
+		n.logger().Info("agent: netem root qdisc already removed; entry dropped", "id", e.ID, "dev", e.Dev, "netns_id", e.NetnsID)
+	}
 	return err
 }
 
@@ -349,7 +370,8 @@ type restoreOutcome int
 const (
 	restoredNetem   restoreOutcome = iota // tc qdisc del ran
 	netnsGone                             // no process holds the namespace: dropped
-	neverApplied                          // no applied line: dropped
+	neverApplied                          // no applied line and the root is not ours: dropped without a del
+	alreadyRestored                       // the root qdisc is not ours (already removed): dropped without a del
 	restoreInFlight                       // another restore of the id is running: nothing done
 	entryGone                             // the journal file is already removed: nothing done
 	superseded                            // another fault holds the namespace: dropped without tc
@@ -411,15 +433,23 @@ func (n *Netem) finishRestore(e NetemEntry, ok bool) error {
 	return err
 }
 
-// restoreTC is restore's part outside mu: the namespace lookup and tc.
-// A nil error means the entry is finished (restored, or dropped).
+// restoreTC is restore's part outside mu: the namespace lookup, the root
+// qdisc probe and the del. A nil error means the entry is finished
+// (restored, or dropped).
 func (n *Netem) restoreTC(ctx context.Context, e NetemEntry) (restoreOutcome, error) {
-	if len(e.Applied) == 0 {
-		return neverApplied, nil
-	}
 	netns, ok := n.resolveNetns(e.Netns, e.NetnsID)
 	if !ok {
 		return netnsGone, nil
+	}
+	ours, err := n.rootQdiscIsOurs(ctx, netns, e.Dev)
+	if err != nil {
+		return restoredNetem, err
+	}
+	if !ours {
+		if len(e.Applied) == 0 {
+			return neverApplied, nil
+		}
+		return alreadyRestored, nil
 	}
 	if _, err := n.Runner.Run(ctx, "nsenter", "--net="+netns, "tc", "qdisc", "del", "dev", e.Dev, "root"); err != nil {
 		return restoredNetem, err
@@ -427,10 +457,32 @@ func (n *Netem) restoreTC(ctx context.Context, e NetemEntry) (restoreOutcome, er
 	return restoredNetem, nil
 }
 
+// rootQdiscIsOurs probes `tc qdisc show dev <dev> root` inside netns and
+// reports whether the root qdisc is one an Apply installs: prio or netem
+// with handle 1:. The pod's default (noqueue, fq_codel, handle 0:), another
+// owner's qdisc, or a device that no longer exists ("Cannot find device")
+// is not ours. Any other probe failure is returned: nothing is known.
+func (n *Netem) rootQdiscIsOurs(ctx context.Context, netns, dev string) (bool, error) {
+	out, err := n.Runner.Run(ctx, "nsenter", "--net="+netns, "tc", "qdisc", "show", "dev", dev, "root")
+	if err != nil {
+		if strings.Contains(err.Error(), "Cannot find device") || bytes.Contains(out, []byte("Cannot find device")) {
+			return false, nil
+		}
+		return false, fmt.Errorf("agent: probe root qdisc of %s: %w", dev, err)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 3 && f[0] == "qdisc" && (f[1] == "prio" || f[1] == "netem") && f[2] == "1:" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // RestoreAll restores every journaled netem fault (agent boot): a netem
 // fault must never outlive the agent that applied it. Returns how many
-// entries were restored or discarded (namespace gone, never applied, or
-// superseded). An entry whose restore fails is kept and its namespace
+// entries were restored or discarded (namespace gone, root not ours, or
+// superseded); every entry, one with no applied line included, is probed. An entry whose restore fails is kept and its namespace
 // stays reserved, so an Apply there answers ErrNetemBusy until a DELETE of
 // the id retries the restore.
 func (n *Netem) RestoreAll(ctx context.Context, logger *slog.Logger) int {
@@ -452,6 +504,8 @@ func (n *Netem) RestoreAll(ctx context.Context, logger *slog.Logger) int {
 			logger.Info("agent: journaled netem namespace gone", "id", e.ID, "netns", e.Netns, "netns_id", e.NetnsID)
 		case neverApplied:
 			logger.Info("agent: journaled netem never applied", "id", e.ID, "netns", e.Netns)
+		case alreadyRestored:
+			logger.Info("agent: journaled netem already removed", "id", e.ID, "netns", e.Netns, "dev", e.Dev)
 		case superseded:
 			logger.Info("agent: journaled netem superseded by a newer fault in its namespace", "id", e.ID, "netns_id", e.NetnsID)
 		case entryGone, restoreInFlight:

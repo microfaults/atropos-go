@@ -492,8 +492,9 @@ func TestRun_DelegatesResourceFaultsToAgent(t *testing.T) {
 	}
 }
 
-// podNetem is a Netem over a fake /proc whose pid 4242 lives in one namespace;
-// cg's cgroup.procs names that pid.
+// podNetem is a Netem over a fake /proc whose pid 4242 lives in one namespace
+// (pid 1 in the host's); cg's cgroup.procs names pid 4242. The runner
+// answers the root qdisc probe with our prio 1:.
 func podNetem(t *testing.T, cg string, rec *[]string, mu *sync.Mutex) *agent.Netem {
 	t.Helper()
 	proc := t.TempDir()
@@ -501,6 +502,12 @@ func podNetem(t *testing.T, cg string, rec *[]string, mu *sync.Mutex) *agent.Net
 		t.Fatal(err)
 	}
 	if err := os.Symlink("net:[4026532412]", filepath.Join(proc, "4242", "ns", "net")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(proc, "1", "ns"), 0o755); err != nil { // pid 1: the host's namespace
+		t.Fatal(err)
+	}
+	if err := os.Symlink("net:[4026531840]", filepath.Join(proc, "1", "ns", "net")); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(cg, "cgroup.procs"), []byte("4242\n"), 0o644); err != nil {
@@ -511,6 +518,9 @@ func podNetem(t *testing.T, cg string, rec *[]string, mu *sync.Mutex) *agent.Net
 			mu.Lock()
 			*rec = append(*rec, strings.Join(append([]string{name}, args...), " "))
 			mu.Unlock()
+			if len(args) > 3 && strings.Join(args[1:4], " ") == "tc qdisc show" {
+				return []byte("qdisc prio 1: root refcnt 2 bands 4\n"), nil // the root probe: ours
+			}
 			return nil, nil // ip -json link show yields nothing → eth0
 		}),
 		Journal:  agent.NetemJournal{Dir: filepath.Join(t.TempDir(), "netem")},

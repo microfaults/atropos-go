@@ -95,17 +95,32 @@ func (s *Server) capabilities(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(CapabilitiesResponse{Mechanisms: s.Mechanisms()})
 }
 
-// Serve runs the API on ln until ctx ends.
+// Serve runs the API on ln until ctx ends (or the listener fails), then
+// drains before it returns, so a caller that exits after Serve never leaves
+// a fault applied. The shutdown order is the contract: stopAll first, which
+// releases every running fault synchronously (a quota written back, a
+// qdisc deleted, each bounded by its own context; a burn child signalled);
+// then srv.Shutdown (5 s), which the streaming start handlers can now
+// finish within; then stopAll again, for a fault whose start completed
+// while the first pass ran. Serve waits for all of it.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	srv := &http.Server{Handler: s.Handler(), ConnContext: s.ConnContext, ReadHeaderTimeout: 10 * time.Second}
+	serveDone, drained := make(chan struct{}), make(chan struct{})
 	go func() {
-		<-ctx.Done()
+		defer close(drained)
+		select {
+		case <-ctx.Done():
+		case <-serveDone:
+		}
+		s.stopAll()
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(sctx)
 		s.stopAll()
 	}()
 	err := srv.Serve(ln)
+	close(serveDone)
+	<-drained
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
@@ -226,8 +241,11 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 		entry, err = nt.Apply(r.Context(), id, t, spec)
 		if err != nil {
 			code := http.StatusInternalServerError
-			if errors.Is(err, ErrNetemBusy) {
+			switch {
+			case errors.Is(err, ErrNetemBusy):
 				code = http.StatusConflict
+			case errors.Is(err, ErrNetemHostNetwork):
+				code = http.StatusBadRequest
 			}
 			http.Error(w, err.Error(), code)
 			return

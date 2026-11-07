@@ -337,20 +337,38 @@ func TestNetem_FailedRollbackKeepsTheEntryAndTheNamespace(t *testing.T) {
 	}
 }
 
-func TestNetem_RestoreAllDropsAnEntryWithNoAppliedLine(t *testing.T) {
-	n, r, netns, _ := newTestNetem(t)
-	// A crash after the pre-tc save, before the root add succeeded.
-	if err := n.Journal.Save(NetemEntry{ID: "half", PodUID: "pod-a", Netns: netns, NetnsID: "net:[4026532412]", Dev: "eth0"}); err != nil {
-		t.Fatal(err)
-	}
-	if got := n.RestoreAll(context.Background(), slog.New(slog.DiscardHandler)); got != 1 {
-		t.Fatalf("RestoreAll = %d, want 1", got)
-	}
-	if len(r.lines()) != 0 {
-		t.Fatalf("an entry with no applied line must run no tc, ran %q", r.lines())
-	}
-	if es, _ := n.Journal.Load(); len(es) != 0 {
-		t.Fatal("the never-applied entry must be dropped")
+func TestNetem_RestoreAllProbesAnEntryWithNoAppliedLine(t *testing.T) {
+	for _, c := range []struct {
+		name, root string
+		wantDel    bool
+	}{
+		// A crash after the pre-tc save, before the root add ran: the root is the pod's default.
+		{"root is the default noqueue", "qdisc noqueue 0: root refcnt 2\n", false},
+		// A crash between a successful root add and its journal re-save (the former Ruling 8 residual).
+		{"root is our prio 1:", ourRootQdisc, true},
+		{"root is our whole-pod netem 1:", "qdisc netem 1: root refcnt 2 limit 1000 loss 10%\n", true},
+		{"root is someone else's htb 1:", "qdisc htb 1: root refcnt 2 r2q 10 default 0\n", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			n, r, netns, _ := newTestNetem(t)
+			r.out["tc qdisc show"] = []byte(c.root)
+			if err := n.Journal.Save(NetemEntry{ID: "half", PodUID: "pod-a", Netns: netns, NetnsID: podNetnsID, Dev: "eth0"}); err != nil {
+				t.Fatal(err)
+			}
+			if got := n.RestoreAll(context.Background(), slog.New(slog.DiscardHandler)); got != 1 {
+				t.Fatalf("RestoreAll = %d, want 1", got)
+			}
+			want := []string{"nsenter --net=" + netns + " tc qdisc show dev eth0 root"}
+			if c.wantDel {
+				want = append(want, "nsenter --net="+netns+" tc qdisc del dev eth0 root")
+			}
+			if got := r.lines(); strings.Join(got, "\n") != strings.Join(want, "\n") {
+				t.Fatalf("commands = %q, want %q", got, want)
+			}
+			if es, _ := n.Journal.Load(); len(es) != 0 {
+				t.Fatal("the entry must be removed")
+			}
+		})
 	}
 }
 
@@ -482,5 +500,77 @@ func TestNetem_RestoreAllReservesTheNamespaceOfAKeptEntry(t *testing.T) {
 	}
 	if len(r.lines()) != before {
 		t.Fatal("a refused apply must run no command")
+	}
+}
+
+// Important 3: a restore whose root qdisc is no longer ours (removed by
+// hand, or by a restore that crashed before its journal removal) is already
+// restored: no del runs, the entry is removed and the namespace freed.
+func TestNetem_RestoreIsIdempotent(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		set  func(r *recRunner)
+	}{
+		{"root is noqueue", func(r *recRunner) { r.out["tc qdisc show"] = []byte("qdisc noqueue 0: root refcnt 2\n") }},
+		{"device is gone", func(r *recRunner) { r.fail["tc qdisc show"] = errors.New(`exit status 1: Cannot find device "eth0"`) }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			n, r, netns, tg := newTestNetem(t)
+			e, err := n.Apply(context.Background(), "f1", tg, lossSpec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.set(r)
+			before := len(r.lines())
+			if err := n.Restore(context.Background(), *e); err != nil {
+				t.Fatal(err)
+			}
+			if got := r.lines()[before:]; len(got) != 1 || got[0] != "nsenter --net="+netns+" tc qdisc show dev eth0 root" {
+				t.Fatalf("commands = %q, want the probe only", got)
+			}
+			if es, _ := n.Journal.Load(); len(es) != 0 {
+				t.Fatal("the entry must be removed")
+			}
+			delete(r.fail, "tc qdisc show")
+			if _, err := n.Apply(context.Background(), "f2", tg, lossSpec); err != nil {
+				t.Fatalf("the namespace must be free: %v", err)
+			}
+		})
+	}
+}
+
+// A probe that fails for another reason keeps the entry: nothing is known.
+func TestNetem_RestoreKeepsTheEntryWhenTheProbeFails(t *testing.T) {
+	n, r, _, tg := newTestNetem(t)
+	e, err := n.Apply(context.Background(), "f1", tg, lossSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.fail["tc qdisc show"] = errors.New("exit status 1: nsenter: cannot open: Permission denied")
+	if err := n.Restore(context.Background(), *e); err == nil || !strings.Contains(err.Error(), "Permission denied") {
+		t.Fatalf("err = %v, want the probe's failure", err)
+	}
+	if r.has("qdisc del") {
+		t.Fatal("no del may run without a probe answer")
+	}
+	if es, _ := n.Journal.Load(); len(es) != 1 {
+		t.Fatal("the entry must be kept")
+	}
+}
+
+// Important 5: a target in the host's network namespace (hostNetwork: true)
+// is refused before any tc: the fault would shape the whole node.
+func TestNetem_RefusesAHostNetworkPod(t *testing.T) {
+	n, r, _, tg := newTestNetem(t)
+	os.Remove(filepath.Join(n.ProcRoot, "1", "ns", "net"))
+	fakeNetnsLink(t, n.ProcRoot, 1, podNetnsID) // pid 1 shares the target's namespace
+	if _, err := n.Apply(context.Background(), "f1", tg, lossSpec); !errors.Is(err, ErrNetemHostNetwork) {
+		t.Fatalf("err = %v, want ErrNetemHostNetwork", err)
+	}
+	if len(r.lines()) != 0 {
+		t.Fatalf("a refused apply must run nothing, ran %q", r.lines())
+	}
+	if es, _ := n.Journal.Load(); len(es) != 0 {
+		t.Fatal("a refused apply must journal nothing")
 	}
 }
