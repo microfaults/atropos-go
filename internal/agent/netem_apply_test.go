@@ -95,7 +95,7 @@ func newTestNetem(t *testing.T) (*Netem, *recRunner, string, Target) {
 		"ip -json link show": []byte(ipLinkJSON),
 		"tc qdisc show":      []byte(ourRootQdisc),
 	}, fail: map[string]error{}}
-	n := &Netem{Runner: r, Journal: NetemJournal{Dir: filepath.Join(t.TempDir(), "netem")}, ProcRoot: proc,
+	n := &Netem{Runner: r, Journal: NetemJournal{Dir: filepath.Join(t.TempDir(), "netem")}, ProcRoot: proc, Logger: slog.New(slog.DiscardHandler),
 		LookupIP: func(_ context.Context, host string) ([]net.IPAddr, error) {
 			return []net.IPAddr{{IP: net.ParseIP("10.43.0.5")}}, nil
 		}}
