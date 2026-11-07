@@ -219,7 +219,17 @@ func Serve(ctx context.Context, cfg Config) (http.Handler, ShutdownFunc, error) 
 		Host:            instrument.HostInProcess,
 	})
 	if cfg.Handler != nil {
-		mux.Handle("/", ingressMiddleware(cfg.Handler, cfg.Service, currentInterceptor()))
+		ingress := ingressMiddleware(cfg.Handler, cfg.Service, currentInterceptor())
+		// The control mux sets r.Pattern = "/" for every business request.
+		// otelhttp reads the pattern for http.route at span start and for the
+		// span name after the handler, so the ingress chain gets a shallow
+		// copy without it: the span starts without a route, and a business
+		// ServeMux sets its own pattern on the request otelhttp holds.
+		mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r2 := r.WithContext(r.Context())
+			r2.Pattern = ""
+			ingress.ServeHTTP(w, r2)
+		}))
 	}
 
 	var once sync.Once

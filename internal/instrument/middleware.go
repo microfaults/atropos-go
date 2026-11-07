@@ -3,6 +3,7 @@ package instrument
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
@@ -10,6 +11,8 @@ import (
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 // IngressMiddleware is the ingress composition every host wraps business
@@ -27,14 +30,28 @@ func IngressMiddleware(next http.Handler, serviceName string, i *interceptor.Int
 
 		faulted.ServeHTTP(rec, r)
 
+		// otelhttp reads http.route only at span start, before a ServeMux
+		// inside the chain has matched; the pattern that mux set on r is
+		// recorded here, as otelhttp derives the route ("GET /x" -> "/x").
+		if r.Pattern != "" {
+			if slash := strings.IndexByte(r.Pattern, '/'); slash >= 0 {
+				oteltrace.SpanFromContext(r.Context()).SetAttributes(semconv.HTTPRoute(r.Pattern[slash:]))
+			}
+		}
+
 		duration := time.Since(start).Seconds()
 		status := strconv.Itoa(rec.Status())
 		ex := metrics.Exemplar(r.Context())
 		metrics.ObserveWithExemplar(metrics.HTTPServerRequestDuration.WithLabelValues(r.Method, status, serviceName), duration, ex)
 		metrics.HTTPServerRequestsTotal.WithLabelValues(r.Method, status, serviceName).Inc()
 	})
-	// The server span takes otelhttp's semconv name, "METHOD" or "METHOD
-	// /route" when a ServeMux in front of it set the route pattern.
+	// The server span takes otelhttp's semconv name: "METHOD /route" when a
+	// ServeMux inside the chain (the host's business mux) matched the request
+	// and set r.Pattern, else the method alone. A pattern set by a mux in
+	// front of the chain would leak into both the name and http.route, so a
+	// host that mounts the chain on its own mux (Serve's control mux) clears
+	// r.Pattern before it; http.route is then set from the inner pattern by
+	// measured above.
 	return otelhttp.NewHandler(measured, serviceName)
 }
 

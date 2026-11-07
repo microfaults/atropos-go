@@ -319,6 +319,58 @@ func TestServe_CheckErrorLogCarriesTheRequestTrace(t *testing.T) {
 	}
 }
 
+// TestServe_ServerSpanNameAndRoute pins the ingress server span's name and
+// http.route through Serve's control mux, which mounts the business handler
+// at "/": that mount's pattern never reaches the span. A plain handler's span
+// is named by the method alone and has no http.route; a business ServeMux
+// names it "METHOD /route" and its route is the matched pattern's path.
+func TestServe_ServerSpanNameAndRoute(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /products", func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "catalog") })
+	for _, tc := range []struct {
+		name      string
+		handler   http.Handler
+		wantName  string
+		wantRoute string // "" = no http.route attribute
+	}{
+		{"plain handler", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "catalog") }), "GET", ""},
+		{"ServeMux", mux, "GET /products", "/products"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, spans := serveOffline(t, Config{Service: "span-name-test", Handler: tc.handler})
+			if code, body := mustGet(t, ts.URL+"/products"); code != 200 || body != "catalog" {
+				t.Fatalf("/products: code=%d body=%q", code, body)
+			}
+			var server *tracetest.SpanStub
+			got := spans.GetSpans()
+			for i := range got {
+				if got[i].SpanKind == oteltrace.SpanKindServer {
+					server = &got[i]
+				}
+			}
+			if server == nil {
+				t.Fatalf("no server span exported: %d spans", len(got))
+			}
+			if server.Name != tc.wantName {
+				t.Errorf("server span name = %q, want %q", server.Name, tc.wantName)
+			}
+			var route string
+			var hasRoute bool
+			for _, kv := range server.Attributes {
+				if kv.Key == "http.route" {
+					route, hasRoute = kv.Value.AsString(), true
+				}
+			}
+			switch {
+			case tc.wantRoute == "" && hasRoute:
+				t.Errorf("http.route = %q, want no http.route", route)
+			case tc.wantRoute != "" && route != tc.wantRoute:
+				t.Errorf("http.route = %q (present=%v), want %q", route, hasRoute, tc.wantRoute)
+			}
+		})
+	}
+}
+
 func TestServe_OfflineServesBusinessAndControlSurface(t *testing.T) {
 	biz := http.NewServeMux()
 	biz.HandleFunc("GET /products", func(w http.ResponseWriter, r *http.Request) {

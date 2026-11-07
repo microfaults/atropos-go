@@ -194,10 +194,14 @@ Telemetry follows the standard OTel environment:
   forwarded on its outbound calls (see "Decision events and correlation" for
   the two members the SDK adds).
 - **Server span**: the ingress server span (`Serve`, and the atroposd ingress
-  listener) takes the semconv name otelhttp gives it, `METHOD /route`
-  (`GET /product/{id}`) when a `ServeMux` set the request's route pattern, else
-  the method alone (`GET`). It used to carry the service name; select it by
-  `service.name` and `span.kind = server` instead.
+  listener) takes the semconv name otelhttp gives it. When `Config.Handler` is
+  a `ServeMux`, the span is named `METHOD /route` (`GET /product/{id}`) after
+  the pattern that matched, and `http.route` holds the route (`/product/{id}`).
+  Any other handler (a plain `http.Handler`, gorilla, chi) gets the method
+  alone (`GET`) and no `http.route`, as does the atroposd listener (a reverse
+  proxy). `Serve`'s own control mux, which mounts
+  the handler at `/`, never shows up in either. The span used to carry the
+  service name; select it by `service.name` and `span.kind = server` instead.
 - **Logs** are a signal: the default `Config.Logger` writes JSON lines to
   stdout at Info and above and tees every record, at every level (Debug
   included), into the OTel slog bridge, so the SDK's `*Context` log calls carry
