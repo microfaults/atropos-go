@@ -1,5 +1,6 @@
 // Package agent is the node agent (atropos-agent) that executes resource
 // faults for sidecar-instrumented pods inside the target container's cgroup
+// and netem network faults inside the target pod's network namespace
 // (design §5.14), and the client the sidecar delegates through.
 //
 // The agent has no manteion identity: the sidecar is the SDK instance,
@@ -7,7 +8,7 @@
 // the agent over a host Unix socket. A fault lives exactly as long as the
 // streaming request that started it: when the sidecar stops the fault (or
 // dies), the stream ends and the agent stops the burn or restores the
-// quota.
+// quota or the netem qdisc.
 package agent
 
 import (
@@ -51,7 +52,16 @@ type Status struct {
 	FaultType string    `json:"fault_type"`
 	Mechanism string    `json:"mechanism"`
 	CgroupDir string    `json:"cgroup_dir"`
+	Netns     string    `json:"netns,omitempty"` // netem only: the namespace path the agent entered
+	Dev       string    `json:"dev,omitempty"`   // netem only: the interface carrying the qdisc
 	StartedAt time.Time `json:"started_at"`
+}
+
+// CapabilitiesResponse is the body of GET /v1/capabilities: the mechanisms
+// this agent executes, in a fixed order ("burn", "quota", then "netem" when
+// tc and nsenter are available).
+type CapabilitiesResponse struct {
+	Mechanisms []string `json:"mechanisms"`
 }
 
 // Capacity is the node's capacity, the fallback when a cgroup's limit is

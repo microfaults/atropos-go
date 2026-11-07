@@ -53,7 +53,10 @@ func (f RunnerFunc) Run(ctx context.Context, name string, args ...string) ([]byt
 // holds the tc lines (space-joined argv) that succeeded, in the order they
 // ran: the entry is saved with none before the first tc line and re-saved
 // after each one, so an entry with no applied line installed nothing of
-// ours and is dropped without a tc command.
+// ours and is dropped without a tc command. The known exception: an agent
+// crash between a successful root add and that re-save leaves our root
+// qdisc behind an entry with no applied line; it is removed by hand (see
+// deploy/agent/README.md).
 type NetemEntry struct {
 	ID        string    `json:"id"`
 	PodUID    string    `json:"pod_uid"`
@@ -286,8 +289,10 @@ func (n *Netem) resolveTarget(ctx context.Context, target string) ([]net.IP, int
 // gone or whose path now names another namespace is never touched, its
 // entry is dropped and nil returned. An entry with no applied line (its
 // root add never succeeded) installed nothing of ours: it is dropped the
-// same way, without tc. A failing tc keeps the entry (a later restore can
-// retry) and returns the error.
+// same way, without tc (except after an agent crash between a successful
+// root add and its journal re-save, which leaves our root qdisc for manual
+// removal; see deploy/agent/README.md). A failing tc keeps the entry (a
+// later restore can retry) and returns the error.
 func (n *Netem) Restore(ctx context.Context, e NetemEntry) error {
 	_, err := n.restore(ctx, e)
 	return err

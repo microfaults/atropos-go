@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -34,6 +35,8 @@ type testAgent struct {
 	sock   string
 	client *http.Client
 	dir    string // target cgroup dir
+	runner *recRunner
+	netns  string // the fake /proc's netns path of pid 4242
 }
 
 func startTestAgent(t *testing.T, peer string) *testAgent {
@@ -52,6 +55,9 @@ func startTestAgent(t *testing.T, peer string) *testAgent {
 		Host:    Capacity{CPUs: 1, MemoryBytes: 1 << 30},
 		Logger:  slog.New(slog.DiscardHandler),
 	}
+	nt, rec, netns, _ := newTestNetem(t)
+	nt.Logger = srv.Logger
+	srv.Netem = nt
 	sock := shortSocket(t)
 	ln, err := Listen(sock)
 	if err != nil {
@@ -68,7 +74,7 @@ func startTestAgent(t *testing.T, peer string) *testAgent {
 			t.Error("agent server did not stop")
 		}
 	})
-	return &testAgent{srv: srv, sock: sock, client: socketClient(sock), dir: dir}
+	return &testAgent{srv: srv, sock: sock, client: socketClient(sock), dir: dir, runner: rec, netns: netns}
 }
 
 func (a *testAgent) post(t *testing.T, ctx context.Context, req StartRequest) (*http.Response, string) {
@@ -222,5 +228,244 @@ func TestServer_RejectsBadRequests(t *testing.T) {
 		if resp.StatusCode == http.StatusOK {
 			t.Fatalf("case %d must be rejected, got 200 (%s)", i, body)
 		}
+	}
+}
+
+// seedPID makes the target cgroup name pid 4242, the pid newTestNetem's fake /proc knows.
+func (a *testAgent) seedPID(t *testing.T) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(a.dir, "cgroup.procs"), []byte("4242\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func netemReq(pod, faultType, target, direction, params string, durationMs int64) StartRequest {
+	return StartRequest{PodUID: pod, Container: "server", Name: "netem-" + faultType, Fault: wire.FaultRequest{
+		Category: "network", FaultType: faultType, DurationMs: durationMs,
+		Network: &wire.NetworkEnvelope{Host: "inline", Target: target, Direction: direction},
+		Params:  json.RawMessage(params)}}
+}
+
+func TestServer_CapabilitiesEndpoint(t *testing.T) {
+	a := startTestAgent(t, "pod-a")
+	get := func() string {
+		r, _ := http.NewRequest(http.MethodGet, "http://agent/v1/capabilities", nil)
+		resp, err := a.client.Do(r)
+		if err != nil || resp.StatusCode != 200 {
+			t.Fatalf("GET /v1/capabilities: %v %v", err, resp)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return strings.TrimSpace(string(b))
+	}
+	if got := get(); got != `{"mechanisms":["burn","quota","netem"]}` {
+		t.Fatalf("capabilities = %s", got)
+	}
+	a.srv.Netem = nil
+	if got := get(); got != `{"mechanisms":["burn","quota"]}` {
+		t.Fatalf("capabilities without netem = %s", got)
+	}
+}
+
+func TestServer_NetemAppliesTargetedPlanAndRestoresOnDelete(t *testing.T) {
+	a := startTestAgent(t, "pod-a")
+	a.seedPID(t)
+	resp, id := a.post(t, context.Background(), netemReq("pod-a", "packet_loss", "productcatalogservice:3550", "upstream", `{"loss":10,"correlation":25}`, 10000))
+	defer resp.Body.Close()
+	if id == "" {
+		t.Fatal("no id")
+	}
+	ns := "--net=" + a.netns
+	want := []string{
+		"nsenter " + ns + " ip -json link show",
+		"nsenter " + ns + " tc qdisc add dev eth0 root handle 1: prio bands 4 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1",
+		"nsenter " + ns + " tc qdisc add dev eth0 parent 1:4 handle 40: netem loss 10% 25%",
+		"nsenter " + ns + " tc filter add dev eth0 parent 1: protocol ip prio 1 u32 match ip dst 10.43.0.5/32 match ip dport 3550 0xffff flowid 1:4",
+	}
+	if got := a.runner.lines(); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("commands:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	if es, _ := a.srv.Netem.Journal.Load(); len(es) != 1 || es[0].ID != id || es[0].PodUID != "pod-a" {
+		t.Fatalf("journal = %+v", es)
+	}
+	lr, _ := http.NewRequest(http.MethodGet, "http://agent/v1/faults", nil)
+	lresp, _ := a.client.Do(lr)
+	var st []Status
+	json.NewDecoder(lresp.Body).Decode(&st)
+	lresp.Body.Close()
+	if len(st) != 1 || st[0].ID != id || st[0].Category != "network" || st[0].FaultType != "packet_loss" || st[0].Mechanism != "netem" || st[0].Dev != "eth0" || st[0].Netns != a.netns {
+		t.Fatalf("list = %+v", st)
+	}
+	dr, _ := http.NewRequest(http.MethodDelete, "http://agent/v1/faults/"+id, nil)
+	dresp, err := a.client.Do(dr)
+	if err != nil || dresp.StatusCode != 200 {
+		t.Fatalf("delete: %v %v", err, dresp)
+	}
+	dresp.Body.Close()
+	sc := bufio.NewScanner(resp.Body)
+	if !sc.Scan() {
+		t.Fatal("no result line after stop")
+	}
+	var res Result
+	json.Unmarshal(sc.Bytes(), &res)
+	if res.Error != "" {
+		t.Fatalf("result = %+v", res)
+	}
+	if l := a.runner.lines(); l[len(l)-1] != "nsenter "+ns+" tc qdisc del dev eth0 root" {
+		t.Fatalf("last command = %q, want the root qdisc deleted", l[len(l)-1])
+	}
+	if es, _ := a.srv.Netem.Journal.Load(); len(es) != 0 {
+		t.Fatal("journal must be empty after restore")
+	}
+}
+
+func TestServer_NetemLatencyWholePodExpiresByDuration(t *testing.T) {
+	a := startTestAgent(t, "pod-a")
+	a.seedPID(t)
+	resp, _ := a.post(t, context.Background(), netemReq("pod-a", "latency", "", "", `{"delay":"100ms","jitter":"20ms","mechanism":"netem"}`, 200))
+	defer resp.Body.Close()
+	if !a.runner.has("tc qdisc add dev eth0 root handle 1: netem delay 100ms 20ms") {
+		t.Fatalf("commands = %q", a.runner.lines())
+	}
+	sc := bufio.NewScanner(resp.Body)
+	if !sc.Scan() {
+		t.Fatal("no result line")
+	}
+	if !a.runner.has("tc qdisc del dev eth0 root") {
+		t.Fatal("expiry must delete the qdisc")
+	}
+}
+
+func TestServer_NetemRestoresWhenTheSidecarDisconnects(t *testing.T) {
+	a := startTestAgent(t, "pod-a")
+	a.seedPID(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	resp, _ := a.post(t, ctx, netemReq("pod-a", "packet_loss", "", "", `{"loss":10}`, 10000))
+	cancel() // the sidecar is gone
+	resp.Body.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for !a.runner.has("tc qdisc del dev eth0 root") && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !a.runner.has("tc qdisc del dev eth0 root") {
+		t.Fatal("netem must be restored when the caller disappears")
+	}
+}
+
+func TestServer_NetemRefusesASecondFaultInTheSameNamespace(t *testing.T) {
+	a := startTestAgent(t, "pod-a")
+	a.seedPID(t)
+	resp, _ := a.post(t, context.Background(), netemReq("pod-a", "packet_loss", "", "", `{"loss":10}`, 10000))
+	defer resp.Body.Close()
+	before := len(a.runner.lines())
+	resp2, body := a.post(t, context.Background(), netemReq("pod-a", "latency", "", "", `{"delay":"1ms","mechanism":"netem"}`, 10000))
+	if resp2.StatusCode != http.StatusConflict || !strings.Contains(body, "already applied") {
+		t.Fatalf("second netem: status=%d body=%q", resp2.StatusCode, body)
+	}
+	if len(a.runner.lines()) != before {
+		t.Fatal("a refused request must not touch the namespace")
+	}
+}
+
+func TestServer_NetemRejectsBadRequests(t *testing.T) {
+	a := startTestAgent(t, "pod-a")
+	a.seedPID(t)
+	cases := []struct {
+		name string
+		req  StartRequest
+		code int
+	}{
+		{"latency without mechanism is a toxic, not an agent fault", netemReq("pod-a", "latency", "", "", `{"delay":"1ms"}`, 1000), http.StatusBadRequest},
+		{"downstream is ingress", netemReq("pod-a", "packet_loss", "x", "downstream", `{"loss":10}`, 1000), http.StatusBadRequest},
+		{"duration required", netemReq("pod-a", "packet_loss", "", "", `{"loss":10}`, 0), http.StatusBadRequest},
+		{"another pod", netemReq("pod-b", "packet_loss", "", "", `{"loss":10}`, 1000), http.StatusForbidden},
+	}
+	for _, c := range cases {
+		resp, body := a.post(t, context.Background(), c.req)
+		if resp.StatusCode != c.code {
+			t.Errorf("%s: status=%d body=%q, want %d", c.name, resp.StatusCode, body, c.code)
+		}
+	}
+	if len(a.runner.lines()) != 0 {
+		t.Fatalf("rejected requests must run nothing, ran %q", a.runner.lines())
+	}
+	a.srv.Netem = nil
+	if resp, body := a.post(t, context.Background(), netemReq("pod-a", "packet_loss", "", "", `{"loss":10}`, 1000)); resp.StatusCode != http.StatusBadRequest || !strings.Contains(body, "not available") {
+		t.Fatalf("netem without tc: status=%d body=%q", resp.StatusCode, body)
+	}
+}
+
+// A start whose rollback del fails keeps its journal entry and the namespace
+// reservation (the qdisc may still be applied): the fault is not listed, and
+// DELETE /v1/faults/{id} finds the entry through the journal and retries the
+// restore, which runs the del and frees the namespace.
+func TestServer_NetemKeptEntryAfterFailedRollbackIsRestoredThroughTheJournal(t *testing.T) {
+	a := startTestAgent(t, "pod-a")
+	a.seedPID(t)
+	a.runner.mu.Lock()
+	a.runner.fail["tc filter add"] = errors.New("exit status 2")
+	a.runner.fail["tc qdisc del"] = errors.New("exit status 3")
+	a.runner.mu.Unlock()
+	resp, body := a.post(t, context.Background(), netemReq("pod-a", "packet_loss", "productcatalogservice:3550", "upstream", `{"loss":10}`, 10000))
+	if resp.StatusCode != http.StatusInternalServerError || !strings.Contains(body, "rollback: exit status 3") {
+		t.Fatalf("start: status=%d body=%q, want 500 with the rollback failure", resp.StatusCode, body)
+	}
+	lr, _ := http.NewRequest(http.MethodGet, "http://agent/v1/faults", nil)
+	lresp, _ := a.client.Do(lr)
+	var st []Status
+	json.NewDecoder(lresp.Body).Decode(&st)
+	lresp.Body.Close()
+	if len(st) != 0 {
+		t.Fatalf("a failed start must not be listed: %+v", st)
+	}
+	es, _ := a.srv.Netem.Journal.Load()
+	if len(es) != 1 {
+		t.Fatalf("journal = %+v, want the kept entry", es)
+	}
+	id := es[0].ID
+	// The namespace stays reserved while the entry is kept.
+	if resp, body := a.post(t, context.Background(), netemReq("pod-a", "packet_loss", "", "", `{"loss":10}`, 10000)); resp.StatusCode != http.StatusConflict {
+		t.Fatalf("netem while the entry is kept: status=%d body=%q, want 409", resp.StatusCode, body)
+	}
+
+	// The del keeps failing: DELETE answers 500 and the entry stays.
+	dr, _ := http.NewRequest(http.MethodDelete, "http://agent/v1/faults/"+id, nil)
+	dresp, err := a.client.Do(dr)
+	if err != nil || dresp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("delete with a failing del: %v %v", err, dresp)
+	}
+	dresp.Body.Close()
+	if es, _ := a.srv.Netem.Journal.Load(); len(es) != 1 {
+		t.Fatalf("journal = %+v, want the entry kept after a failed restore", es)
+	}
+
+	a.runner.mu.Lock()
+	delete(a.runner.fail, "tc qdisc del")
+	delete(a.runner.fail, "tc filter add")
+	a.runner.mu.Unlock()
+	before := len(a.runner.lines())
+	dr, _ = http.NewRequest(http.MethodDelete, "http://agent/v1/faults/"+id, nil)
+	dresp, err = a.client.Do(dr)
+	if err != nil || dresp.StatusCode != http.StatusOK {
+		t.Fatalf("delete through the journal: %v %v", err, dresp)
+	}
+	dresp.Body.Close()
+	if l := a.runner.lines(); len(l) != before+1 || l[before] != "nsenter --net="+a.netns+" tc qdisc del dev eth0 root" {
+		t.Fatalf("commands after the delete = %q, want the root qdisc deleted", l[before:])
+	}
+	if es, _ := a.srv.Netem.Journal.Load(); len(es) != 0 {
+		t.Fatalf("journal = %+v, want empty after the restore", es)
+	}
+	resp, id2 := a.post(t, context.Background(), netemReq("pod-a", "packet_loss", "", "", `{"loss":10}`, 10000))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || id2 == "" {
+		t.Fatalf("netem after the restore: status=%d, want the namespace free", resp.StatusCode)
+	}
+	// An id neither running nor journaled is still unknown.
+	dr, _ = http.NewRequest(http.MethodDelete, "http://agent/v1/faults/nope", nil)
+	if dresp, err := a.client.Do(dr); err != nil || dresp.StatusCode != http.StatusNotFound {
+		t.Fatalf("delete of an unknown id: %v %v", err, dresp)
+	} else {
+		dresp.Body.Close()
 	}
 }
