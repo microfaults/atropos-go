@@ -39,55 +39,81 @@ type Quota struct {
 // Journal persists applied quotas as one JSON file each.
 type Journal struct{ Dir string }
 
-func (j Journal) path(id string) string { return filepath.Join(j.Dir, id+".json") }
+func (j Journal) path(id string) string { return journalPath(j.Dir, id) }
 
 // Save writes q atomically.
-func (j Journal) Save(q Quota) error {
-	if err := os.MkdirAll(j.Dir, 0o755); err != nil {
+func (j Journal) Save(q Quota) error { return writeJournalFile(j.Dir, q.ID, q) }
+
+// Remove deletes q's journal entry.
+func (j Journal) Remove(id string) error { return removeJournalFile(j.Dir, id) }
+
+// Load reads every journaled quota.
+func (j Journal) Load() ([]Quota, error) {
+	files, err := readJournalFiles(j.Dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []Quota
+	for _, b := range files {
+		var q Quota
+		if json.Unmarshal(b, &q) == nil && q.File != "" {
+			out = append(out, q)
+		}
+	}
+	return out, nil
+}
+
+// The journal-file helpers shared by Journal and NetemJournal: one JSON file
+// per entry, <dir>/<id>.json, written through a tmp file and a rename so a
+// crash never leaves a torn entry.
+
+func journalPath(dir, id string) string { return filepath.Join(dir, id+".json") }
+
+// writeJournalFile writes v as <dir>/<id>.json atomically, creating dir.
+func writeJournalFile(dir, id string, v any) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	b, err := json.Marshal(q)
+	b, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	tmp := j.path(q.ID) + ".tmp"
+	tmp := journalPath(dir, id) + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, j.path(q.ID))
+	return os.Rename(tmp, journalPath(dir, id))
 }
 
-// Remove deletes q's journal entry.
-func (j Journal) Remove(id string) error {
-	err := os.Remove(j.path(id))
+// removeJournalFile deletes <dir>/<id>.json; a missing entry is not an error.
+func removeJournalFile(dir, id string) error {
+	err := os.Remove(journalPath(dir, id))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	return err
 }
 
-// Load reads every journaled quota.
-func (j Journal) Load() ([]Quota, error) {
-	entries, err := os.ReadDir(j.Dir)
+// readJournalFiles returns the contents of every *.json file in dir (a
+// missing dir reads as empty; an unreadable file is skipped).
+func readJournalFiles(dir string) ([][]byte, error) {
+	entries, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	var out []Quota
+	var out [][]byte
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
 			continue
 		}
-		b, err := os.ReadFile(filepath.Join(j.Dir, e.Name()))
+		b, err := os.ReadFile(filepath.Join(dir, e.Name()))
 		if err != nil {
 			continue
 		}
-		var q Quota
-		if json.Unmarshal(b, &q) == nil && q.File != "" {
-			out = append(out, q)
-		}
+		out = append(out, b)
 	}
 	return out, nil
 }
