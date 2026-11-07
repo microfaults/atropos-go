@@ -27,6 +27,7 @@ spec:
             - -task-root=/host/run/containerd/io.containerd.runtime.v2.task
             - -task-root=/host/run/k3s/containerd/io.containerd.runtime.v2.task
             - -journal=/var/lib/atropos-agent/quotas
+            - -netem-journal=/var/lib/atropos-agent/netem
           securityContext:
             privileged: true
           volumeMounts:

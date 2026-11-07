@@ -1,11 +1,14 @@
 # atroposd sidecar image. Build from the repository root:
 #   docker build -f deploy/sidecar/Dockerfile -t atroposd:dev .
-FROM golang:1.25-alpine AS build
+# The build stage runs on the build host's platform and cross-compiles for
+# the target (emulating the Go compiler under another arch can segfault).
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
+ARG TARGETOS TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /atroposd ./cmd/atroposd
+RUN GOOS=$TARGETOS GOARCH=$TARGETARCH CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /atroposd ./cmd/atroposd
 
 FROM alpine:3.22
 # uid 1337 is what init.sh excludes from the REDIRECT: the sidecar's own
