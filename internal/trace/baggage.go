@@ -34,6 +34,9 @@ func WithExperimentBaggage(ctx context.Context, experimentID, phaseID string) co
 		return ctx
 	}
 	b := baggage.FromContext(ctx)
+	// The keys are valid constants, so NewMemberRaw fails only on a value
+	// that is not valid UTF-8 (that member is skipped), and SetMember fails
+	// only on a member NewMemberRaw rejected: its error is unreachable here.
 	if m, err := baggage.NewMemberRaw(BaggageExperimentID, experimentID); err == nil {
 		b, _ = b.SetMember(m)
 	}

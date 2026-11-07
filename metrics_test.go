@@ -10,8 +10,19 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 
+	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
 	"git.ucsc.edu/microfaults/atropos-go/internal/metrics"
 )
+
+// ownInterceptor is a private, rule-free interceptor for a metrics test. The
+// package interceptor is process-wide: another test that installed rules, an
+// armed slot or a cache-box on it would fault or classify this test's
+// requests (the order dependence -shuffle=on exposed), so each metrics test
+// owns its own.
+func ownInterceptor() func() *interceptor.Interceptor {
+	ic := interceptor.New(nil, nil)
+	return func() *interceptor.Interceptor { return ic }
+}
 
 func gatherCounter(name string, labels map[string]string) float64 {
 	families, _ := metrics.Registry.Gather()
@@ -75,7 +86,7 @@ func TestIngressMetrics(t *testing.T) {
 			beforeCount := gatherCounter("http_server_requests_total", labels)
 			beforeHist := gatherHistogramCount("http_server_request_duration_seconds", labels)
 
-			mw := ingressMiddleware(handler, tt.service, currentInterceptor())
+			mw := ingressMiddleware(handler, tt.service, ownInterceptor()())
 			mw.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(tt.method, "/test", nil))
 
 			if delta := gatherCounter("http_server_requests_total", labels) - beforeCount; delta != 1 {
@@ -111,7 +122,7 @@ func TestEgressMetrics(t *testing.T) {
 			beforeCount := gatherCounter("http_client_requests_total", labels)
 			beforeHist := gatherHistogramCount("http_client_request_duration_seconds", labels)
 
-			transport := EgressTransport(http.DefaultTransport)
+			transport := egressTransport(http.DefaultTransport, ownInterceptor())
 			client := &http.Client{Transport: transport}
 			resp, err := client.Get(ts.URL + "/test")
 			if err != nil {
@@ -135,7 +146,7 @@ func TestEgressMetrics_TransportError(t *testing.T) {
 	labels := map[string]string{"method": "GET", "status_code": "error", "target": "127.0.0.1:1"}
 	beforeCount := gatherCounter("http_client_requests_total", labels)
 
-	transport := EgressTransport(http.DefaultTransport)
+	transport := egressTransport(http.DefaultTransport, ownInterceptor())
 	client := &http.Client{Transport: transport}
 	resp, _ := client.Get("http://127.0.0.1:1/nope")
 	if resp != nil {
@@ -188,7 +199,7 @@ func TestEgressMetrics_CacheBoxClassification(t *testing.T) {
 			base := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
 				return synthetic(tc.header), nil
 			})
-			client := &http.Client{Transport: EgressTransport(base)}
+			client := &http.Client{Transport: egressTransport(base, ownInterceptor())}
 			resp, err := client.Get("http://cachebox.test/x")
 			if err != nil {
 				t.Fatal(err)
@@ -212,7 +223,7 @@ func TestMetricsHandler_ServesMetrics(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	mw := ingressMiddleware(handler, "handler-test", currentInterceptor())
+	mw := ingressMiddleware(handler, "handler-test", ownInterceptor()())
 	mw.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/", nil))
 
 	rec := httptest.NewRecorder()

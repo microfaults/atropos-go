@@ -33,8 +33,8 @@ type recentRequest struct {
 // requests only: an unsampled request's trace is never stored, and a link to
 // it would point at nothing. Record runs on the request path, so it takes one
 // mutex and allocates nothing beyond the label copy; Links, TraceIDs and
-// RecentTraceIDs copy
-// the ids out under the mutex and build their results after releasing it.
+// RecentTraceIDs copy the ids out under the mutex and build their results
+// after releasing it.
 type requestRing struct {
 	mu      sync.Mutex
 	buf     []recentRequest // fixed size; the oldest entry is overwritten first

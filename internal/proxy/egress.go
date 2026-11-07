@@ -69,7 +69,7 @@ func newErrorHandler(logger *slog.Logger) func(http.ResponseWriter, *http.Reques
 		if errors.Is(err, context.Canceled) {
 			return // the client went away; nothing to answer
 		}
-		logger.Warn("atroposd: upstream error", "method", r.Method, "host", r.URL.Host, "path", r.URL.Path, "error", err)
+		logger.WarnContext(r.Context(), "atroposd: upstream error", "method", r.Method, "host", r.URL.Host, "path", r.URL.Path, "error", err)
 		http.Error(w, "atroposd: upstream error: "+err.Error(), http.StatusBadGateway)
 	}
 }
