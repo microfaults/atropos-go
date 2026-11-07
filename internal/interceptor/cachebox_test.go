@@ -925,6 +925,30 @@ func TestEgressTransport_ForeignBaggagePreserved(t *testing.T) {
 	}
 }
 
+// A baggage header the application set on the request itself, with no
+// baggage in the request's context (otelhttp's inject then leaves the header
+// alone), survives the experiment re-injection: its members are merged into
+// the baggage the two atropos members are added to.
+func TestEgressTransport_HeaderOnlyBaggagePreserved(t *testing.T) {
+	installStandardPropagator(t)
+	i, _ := newTestInterceptor(t, cacheBoxRuleWithPhase("dep", evaluator.CacheBoxPassthrough, "exp-1", "ph-1"))
+	var seen http.Header
+	req := httptest.NewRequest("GET", "http://dep/x", nil).WithContext(spanIn(3, 4))
+	req.Header.Set("baggage", "tenant=acme")
+	resp, err := i.EgressTransport(headerRecorder(&seen)).RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	b := parseBaggage(t, seen.Get("baggage"))
+	if b.Member("tenant").Value() != "acme" || b.Member(trace.BaggageExperimentID).Value() != "exp-1" || b.Member(trace.BaggagePhaseID).Value() != "ph-1" || b.Len() != 3 {
+		t.Fatalf("upstream baggage = %q, want tenant=acme plus both atropos members", seen.Get("baggage"))
+	}
+	if got := req.Header.Get("baggage"); got != "tenant=acme" {
+		t.Fatalf("the caller's request was mutated: baggage = %q", got)
+	}
+}
+
 // Nothing is injected when no cache-box decision with an experiment applies:
 // a cache-box rule without a context, and an egress call no rule matches,
 // leave the request's headers as the caller built them.

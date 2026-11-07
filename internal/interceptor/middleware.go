@@ -148,6 +148,14 @@ func (i *Interceptor) EgressTransport(base http.RoundTripper) http.RoundTripper 
 // other member kept: the SDK never drops foreign baggage) and traceparent
 // with the same client span. Otherwise r itself.
 //
+// otelhttp injects baggage only when the context carries some, so a baggage
+// header the application set on the request itself survives it; before the
+// two members are added, every member of r's baggage header(s) that the
+// context baggage lacks is merged into it (the context's member wins a
+// conflict), so the re-injection keeps those too. A header value that does
+// not parse contributes nothing, as the W3C propagator would drop it on
+// extract.
+//
 // The members ride on the call whatever its destination, a third party's
 // API included: they are opaque ids, and an egress gateway is the place to
 // strip them where that matters.
@@ -156,10 +164,41 @@ func withExperimentBaggage(r *http.Request, decision *evaluator.Decision) *http.
 	if c == nil || c.ExperimentID == "" {
 		return r
 	}
-	ctx := trace.WithExperimentBaggage(r.Context(), c.ExperimentID, c.PhaseID)
+	ctx := withHeaderBaggage(r.Context(), r.Header)
+	ctx = trace.WithExperimentBaggage(ctx, c.ExperimentID, c.PhaseID)
 	r = r.Clone(ctx)
 	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(r.Header))
 	return r
+}
+
+// withHeaderBaggage returns ctx with every member of h's baggage header
+// values that ctx's baggage lacks added to it; ctx itself when there is none
+// to add.
+func withHeaderBaggage(ctx context.Context, h http.Header) context.Context {
+	values := h.Values("baggage")
+	if len(values) == 0 {
+		return ctx
+	}
+	b := baggage.FromContext(ctx)
+	added := false
+	for _, v := range values {
+		hb, err := baggage.Parse(v)
+		if err != nil {
+			continue
+		}
+		for _, m := range hb.Members() {
+			if b.Member(m.Key()).Key() != "" { // the context's member wins
+				continue
+			}
+			// m came out of Parse, so SetMember cannot reject it.
+			b, _ = b.SetMember(m)
+			added = true
+		}
+	}
+	if !added {
+		return ctx
+	}
+	return baggage.ContextWithBaggage(ctx, b)
 }
 
 // syntheticErrorResponse builds the response an inline error fault stands in
