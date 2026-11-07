@@ -1003,7 +1003,8 @@ func TestBuildStatus_IsAFullSnapshot(t *testing.T) {
 // builds the replay-set puller and hands it to apply before registering, so
 // the replay set the register answer names is fetched -- through newReq,
 // with the client's auth -- and its commit reaches manteion in a status
-// report (OnChange → sendStatus).
+// report (OnChange → sendStatus). The puller labels the
+// atropos_replay_set_state gauge with the client's service.
 func TestConnectManteion_WiresTheReplaySetPuller(t *testing.T) {
 	withReplayChunkBytes(t, 100)
 	entries := replayEntries(3)
@@ -1025,7 +1026,7 @@ func TestConnectManteion_WiresTheReplaySetPuller(t *testing.T) {
 	var authed []string
 	cb := newTestCacheBox(t)
 	c, err := connectManteion(t.Context(), manteionConfig{
-		url: f.srv.URL, serviceName: "svc", instanceID: "pod-1",
+		url: f.srv.URL, serviceName: "puller-wiring-svc", instanceID: "pod-1",
 		initTimeout: 5 * time.Second, pollInterval: 10 * time.Second,
 		targets:    applyTargets{Evaluator: newTestEvaluator(), CacheBox: cb},
 		httpClient: &http.Client{Timeout: 5 * time.Second},
@@ -1065,6 +1066,13 @@ func TestConnectManteion_WiresTheReplaySetPuller(t *testing.T) {
 	defer authMu.Unlock()
 	if !slices.Contains(authed, "/api/v1/cache/artifacts/x") {
 		t.Fatalf("artifact requests must be built through newReq (auth); auth saw %v", authed)
+	}
+	m := &dto.Metric{}
+	if err := metrics.ReplaySetState.WithLabelValues(wire.ReplaySetCommitted, "puller-wiring-svc").Write(m); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.GetGauge().GetValue(); got != 1 {
+		t.Fatalf(`atropos_replay_set_state{state="committed",service="puller-wiring-svc"} = %v, want 1 (the puller takes the client's service)`, got)
 	}
 }
 

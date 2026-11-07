@@ -105,8 +105,9 @@ type applyTargets struct {
 	// Nil (targets built by hand) means no locking.
 	ApplyMu *sync.Mutex
 	// Logger receives the warnings an apply raises for what it skips: a rule
-	// or active-fault slot this host cannot execute or build, and an empty
-	// document. Core.targets sets the core's logger and the manteion client
+	// this host cannot execute or decode, an active-fault slot it cannot
+	// execute (a slot that fails to build otherwise is only returned as an
+	// error, not warned), and an empty document. Core.targets sets the core's logger and the manteion client
 	// applies with its own. Nil (targets built by hand) means slog.Default().
 	Logger *slog.Logger
 }

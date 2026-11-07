@@ -57,6 +57,11 @@ func checkCapture(cfg Config) error {
 //
 // A nil logger means the SDK default from InitTelemetry: JSON on stdout teed
 // into the OTel logs bridge.
+//
+// When Run fails after OTel init, it shuts the tracer and logger providers it
+// built down, but they stay registered as the global providers: a caller that
+// keeps running after the error registers its own or its spans and log
+// records are silently dropped.
 func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 	cfg.applyDefaults()
 	if err := cfg.Validate(); err != nil {

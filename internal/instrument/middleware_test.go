@@ -389,11 +389,32 @@ func TestEgressTransport_ExemplarAndCacheBoxServiceLabel(t *testing.T) {
 	}
 }
 
+// The exemplars reach the OpenMetrics text of /metrics, on the duration
+// histogram and on the counters: a cache-box hit names the egress client
+// span's trace, a fault injection the trace of the context it was counted
+// under.
 func TestMetricsHandler_OpenMetricsExposesExemplars(t *testing.T) {
-	installSampledProvider(t)
-	ic := interceptor.New(nil, nil)
+	exp := installSampledProvider(t)
+	ic := interceptor.New(nil, nil, interceptor.WithService("om-svc"))
 	IngressMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), "om-svc", ic).
 		ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/x", nil))
+
+	exp.Reset()
+	base := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{interceptor.HeaderCacheMode: {"replay"}}, Body: http.NoBody, Request: r}, nil
+	})
+	resp, err := (&http.Client{Transport: EgressTransport(base, func() *interceptor.Interceptor { return ic })}).Get("http://om-egress.test/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	spans := exp.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("spans = %d, want the egress client span", len(spans))
+	}
+	hitTrace := spans[0].SpanContext.TraceID().String()
+	faultSC := oteltrace.NewSpanContext(oteltrace.SpanContextConfig{TraceID: oteltrace.TraceID{0x0e}, SpanID: oteltrace.SpanID{0x0e}, TraceFlags: oteltrace.FlagsSampled})
+	metrics.FaultInjectionHook("om-svc")(oteltrace.ContextWithSpanContext(context.Background(), faultSC), "*inline.Latency", "egress")
 
 	req := httptest.NewRequest("GET", "/metrics", nil)
 	req.Header.Set("Accept", "application/openmetrics-text; version=1.0.0")
@@ -416,6 +437,21 @@ func TestMetricsHandler_OpenMetricsExposesExemplars(t *testing.T) {
 	}
 	if exemplar == "" || !strings.Contains(body, "# EOF") {
 		t.Fatalf("OpenMetrics body lacks exemplars/EOF:\n%s", body)
+	}
+	for series, trace := range map[string]string{
+		"atropos_cachebox_hits_total{":    hitTrace,
+		"atropos_fault_injections_total{": faultSC.TraceID().String(),
+	} {
+		found := false
+		for _, line := range strings.Split(body, "\n") {
+			if strings.HasPrefix(line, series) && strings.Contains(line, `service="om-svc"`) &&
+				strings.Contains(line, " # {") && strings.Contains(line, `trace_id="`+trace+`"`) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no %s...service=\"om-svc\"} sample with an exemplar naming trace %s in the OpenMetrics body:\n%s", series, trace, body)
+		}
 	}
 }
 

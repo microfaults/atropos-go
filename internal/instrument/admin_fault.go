@@ -221,6 +221,13 @@ func handleFaultPost(w http.ResponseWriter, r *http.Request, eval *demoEvaluator
 		jsonError(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// A fault that decodes but fails its own Validate (a latency with
+	// neither delay nor jitter, a ramp longer than the fault) could never
+	// start: every matching request's check would fail. Refuse it here.
+	if err := f.Validate(); err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	mode := evaluator.Inline
 	if req.EffectiveCategory() != "inline" {

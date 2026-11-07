@@ -166,6 +166,29 @@ func TestFaultAdmin_MissingDelay(t *testing.T) {
 	}
 }
 
+// A fault that decodes but could never start (a latency with neither delay
+// nor jitter, a hang shorter than its ramp) is refused with 400 and arms no
+// slot, instead of failing every matching request's check.
+func TestFaultAdmin_PostInvalidFaultIs400(t *testing.T) {
+	for name, body := range map[string]string{
+		"zero latency":      `{"category":"inline","fault_type":"latency","params":{"delay":"0s"}}`,
+		"ramp exceeds hang": `{"category":"inline","fault_type":"hang","ramp_up_ms":3000,"params":{"duration":"2s"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			eval := &demoEvaluator{}
+			handler := faultAdminHandler(eval, nil, nil)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/fault", strings.NewReader(body)))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+			}
+			if ids := eval.ActiveIDs(); len(ids) != 0 {
+				t.Fatalf("an invalid fault armed slots %v", ids)
+			}
+		})
+	}
+}
+
 func TestFaultAdmin_InvalidJSON(t *testing.T) {
 	eval := &demoEvaluator{}
 	handler := faultAdminHandler(eval, nil, nil)

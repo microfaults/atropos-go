@@ -79,12 +79,12 @@ func initTelemetry(ctx context.Context, cfg telemetryConfig) (*Telemetry, error)
 
 	// A declarative configuration file wins over every OTEL_* exporter
 	// variable and owns the resource (see declarativeConfig).
-	sdk, ok, err := declarativeConfig(ctx)
+	sdk, meterSection, err := declarativeConfig(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if ok {
-		return declarativeTelemetry(sdk, cfg.logger), nil
+	if sdk != nil {
+		return declarativeTelemetry(sdk, meterSection, cfg.logger), nil
 	}
 
 	res, err := newResource(cfg)

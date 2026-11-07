@@ -269,8 +269,8 @@ func (e *recordedLogs) find(body string) (sdklog.Record, bool) {
 }
 
 // The whole chain behind request-scoped logging, end to end: a request through
-// Serve's middleware gets a server span; the armed fault is invalid, so the
-// interceptor's ingress check fails and logs through the host's logger, under
+// Serve's middleware gets a server span; the matching rule's fault is
+// invalid, so the interceptor's ingress check fails and logs through the host's logger, under
 // the request's context. With the SDK's default logger on a BYO logger provider
 // the bridge stamps the exported record with that server span's trace and span.
 func TestServe_CheckErrorLogCarriesTheRequestTrace(t *testing.T) {
@@ -289,10 +289,16 @@ func TestServe_CheckErrorLogCarriesTheRequestTrace(t *testing.T) {
 	biz.HandleFunc("GET /work", func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "done") })
 	ts, spans := serveOffline(t, Config{Service: "log-trace-test", Handler: biz, LoggerProvider: lp})
 
-	// A latency with neither delay nor jitter decodes, but fails Validate when
-	// the interceptor starts it.
-	if code, body := postJSON(t, ts.URL+"/admin/fault", `{"category":"inline","fault_type":"latency","params":{"delay":"0s"}}`); code != http.StatusCreated {
-		t.Fatalf("arm fault: code=%d body=%s", code, body)
+	// A rule whose latency has neither delay nor jitter decodes (rule decode
+	// does not validate the fault; /admin/fault refuses it with 400), but
+	// fails Validate when the interceptor starts it for a matching request.
+	if code, body := postJSON(t, ts.URL+"/admin/rules", `[{
+		"name": "never-starts",
+		"injection_point": "ingress",
+		"mode": "inline",
+		"fault": {"category": "inline", "fault_type": "latency", "params": {"delay": "0s"}}
+	}]`); code != http.StatusNoContent {
+		t.Fatalf("push rule: code=%d body=%s", code, body)
 	}
 	spans.Reset()
 	if code, body := mustGet(t, ts.URL+"/work"); code != 200 || body != "done" {

@@ -636,9 +636,14 @@ func TestInitTelemetry_BYOTracerProviderReadsNoExporterEnv(t *testing.T) {
 	}
 	_ = tel.Shutdown(context.Background())
 
-	// The control: the SDK path does build one, and fails on that value.
+	// The control: the SDK path does build one, and fails on that value,
+	// after shutting down the span exporter it had already built.
+	spans := useTestSpanExporter(t)
 	if _, err := initTelemetry(context.Background(), telemetryConfig{serviceName: "svc"}); err == nil || !strings.Contains(err.Error(), "log exporter") {
 		t.Fatalf("SDK path err = %v, want the log exporter's error", err)
+	}
+	if n := spans.Shutdowns(); n != 1 {
+		t.Fatalf("span exporter shut down %d times after the log exporter failed, want 1", n)
 	}
 }
 

@@ -76,15 +76,19 @@ type Config struct {
 	// COLLECTOR_SERVICE_ADDR or a schemeless endpoint mean a gRPC collector).
 	TracerProvider oteltrace.TracerProvider
 
-	// LoggerProvider, if set, receives the SDK's log records (and the decision
-	// events) instead of the OTLP log exporter autoexport would build. Ignored
-	// unless TracerProvider is also set: a host that owns one signal owns both.
+	// LoggerProvider, if set, is registered as the global logger provider and
+	// receives the SDK's log records (and the decision events). Ignored unless
+	// TracerProvider is also set: a host that owns one signal owns both, and
+	// with TracerProvider set the SDK builds no log exporter either way.
 	LoggerProvider otellog.LoggerProvider
 
 	// Logger receives SDK logs. Default: a JSON handler on stdout teed into
 	// the OTel logs bridge, so every *Context call carries trace_id and
-	// span_id. The atropos.decision events do not go through it: they are
-	// emitted on the global OTel logger provider (see LoggerProvider).
+	// span_id. The bridge feeds the SDK's logger provider; with a BYO
+	// TracerProvider it feeds LoggerProvider, or, when that is nil, whatever
+	// global logger provider is registered (records are dropped while none
+	// is). The atropos.decision events do not go through it: they
+	// are emitted on the global OTel logger provider (see LoggerProvider).
 	Logger *slog.Logger
 }
 
@@ -128,6 +132,12 @@ type ShutdownFunc func(context.Context) error
 // plane. Everything else flows through the middleware into cfg.Handler.
 //
 // Serve is init-time API: call it once per process, before traffic flows.
+//
+// When Serve fails after OTel init (manteion configured but unreachable), it
+// shuts the tracer and logger providers it built down, but they stay
+// registered as the global providers: an embedder that keeps running after
+// the error, offline or on a fallback path, registers its own or its spans and
+// log records are silently dropped.
 func Serve(ctx context.Context, cfg Config) (http.Handler, ShutdownFunc, error) {
 	if cfg.Service == "" {
 		return nil, nil, errors.New("atropos: Config.Service is required")
