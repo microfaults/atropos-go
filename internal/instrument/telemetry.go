@@ -77,6 +77,16 @@ func initTelemetry(ctx context.Context, cfg telemetryConfig) (*Telemetry, error)
 		return newTelemetry(cfg.logger, lp, func(context.Context) error { return nil }), nil
 	}
 
+	// A declarative configuration file wins over every OTEL_* exporter
+	// variable and owns the resource (see declarativeConfig).
+	sdk, ok, err := declarativeConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return declarativeTelemetry(sdk, cfg.logger), nil
+	}
+
 	res, err := newResource(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("atropos: build resource: %w", err)
@@ -293,6 +303,9 @@ func newLogExporter(ctx context.Context) (sdklog.Exporter, error) {
 // empty). OTEL_RESOURCE_ATTRIBUTES adds further attributes, and supplies the
 // version and environment left empty here. Host, the sampler and the resource
 // apply only when no TracerProvider is given: a BYO provider keeps its own.
+// Without one, OTEL_CONFIG_FILE replaces all of this with the declarative
+// configuration file it names (see declarativeConfig): the file owns the
+// exporters, the sampler and the whole resource, and the propagators stay.
 type TelemetryConfig struct {
 	ServiceName string
 	// ServiceVersion is service.version; empty leaves it to

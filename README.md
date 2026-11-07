@@ -180,7 +180,7 @@ Telemetry follows the standard OTel environment:
   default is parent-based always-on (`parentbased_always_on`), so an incoming
   `traceparent` whose sampled flag is off suppresses the request's spans; a
   deployment that wants every request traced whatever its caller decided sets
-  `OTEL_TRACES_SAMPLER=always_on` (the beds do).
+  `OTEL_TRACES_SAMPLER=always_on` (the lab beds are expected to set it).
 - **Resource** on every span and log record: `service.name` (`Config.Service`),
   `service.instance.id` (the registration identity, see `InstanceID` below, so
   spans and logs join manteion's instance rows), `service.version` and
@@ -203,11 +203,20 @@ Telemetry follows the standard OTel environment:
   included), into the OTel slog bridge, so the SDK's `*Context` log calls carry
   the request's `trace_id` and `span_id` in the log backend.
   `OTEL_LOGS_EXPORTER=none` turns the export off; stdout stays.
+- **Declarative file**: `OTEL_CONFIG_FILE=/etc/atropos/otel.yaml` switches to
+  the OpenTelemetry declarative configuration file (format `1.0-rc.2`); the
+  file then owns exporters, sampler and resource, and the `OTEL_*` exporter
+  variables are ignored (`OTEL_EXPERIMENTAL_CONFIG_FILE` is rejected). The SDK
+  adds nothing to the file's resource, so `service.name`,
+  `service.instance.id`, `service.version`, `k8s.pod.name` and `atropos.host`
+  are there only if the file sets them; its `propagator` section is ignored
+  (logged at WARN) and the propagators above stay.
 
-The span flush at shutdown flushes the logs too. A BYO `TracerProvider` turns
-all of the above off except the propagators: the SDK builds no exporter, for
-traces or logs, applies no sampler or resource, and the host owns the
-providers' shutdown.
+A BYO `TracerProvider` makes the shutdown a no-op: it turns all of the above
+off except the propagators (the SDK builds no exporter, for traces or logs,
+applies no sampler or resource, and reads no `OTEL_CONFIG_FILE`), and the host
+owns the providers' shutdown. Otherwise the shutdown flushes the spans and
+then the logs.
 
 Offline is first-class: with `MANTEION_URL` unset everything works — tracing,
 `/admin/*` fault control, the cache-box endpoints — there is just no control
@@ -600,7 +609,7 @@ correlates all three. Environment read by `Serve`: `MANTEION_URL`,
 `MANTEION_INIT_TIMEOUT`, and for telemetry `OTEL_TRACES_EXPORTER`,
 `OTEL_LOGS_EXPORTER`, `OTEL_EXPORTER_OTLP_*`, `COLLECTOR_SERVICE_ADDR`,
 `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG`, `OTEL_RESOURCE_ATTRIBUTES`,
-`ATROPOS_POD_NAME` and `HOSTNAME` (see "Embed the instrument" above).
+`OTEL_CONFIG_FILE`, `ATROPOS_POD_NAME` and `HOSTNAME` (see "Embed the instrument" above).
 
 ---
 
