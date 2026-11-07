@@ -90,7 +90,9 @@ carried). Supports `Range: bytes=a-b` (206) and `HEAD` (`Content-Length`, `ETag:
 `sha256:<hex>` of the file bytes; `sha256` in `replay_set` is the W5 digest over entries (unchanged
 algorithm), `count` the entry count. The instance fetches in ≤4 MiB ranges, stages entries through the
 existing preload staging path, and commits when count and W5 digest match; any failure → `failed` in the
-status report with the reason in `errors`.
+status report with the reason in `errors`. The endpoint answers 5xx for transient errors, and also 500 for a
+missing artifact file although that condition is permanent: the instance reports `failed` once its chunk
+retries are spent, and the convergence barrier fast-fails on it.
 
 ### `GET /api/v1/sdk/events?service=S` (SSE)
 Unchanged shape; the materializer emits `rules_changed {"generation":G}` on every generation change
@@ -106,7 +108,7 @@ Body gains `epoch` (int64, the instance's start time in unix nanoseconds). Dedup
 `capabilities` (`JSONB`). The response body is the materialized `RuleSync` (same shape as a 200 poll)
 plus `status`. Registering with capabilities different from the stored ones bumps the service generation.
 If manteion cannot materialize the document (a broken rule or spec), register still answers 201 with a
-**no-document** body — `version: 0`, `etag: ""`, `rules: null`, `active_faults: null`, no `freeze_cfg`, no
+**no-document** body — `version: 0`, `etag` absent or empty, `rules: null`, `active_faults: null`, no `freeze_cfg`, no
 `replay_set` — and logs the cause; the instance applies nothing for such a body (it keeps its rules, slots,
 delay source and replay set) and keeps polling. Outside this case `rules` and `active_faults` are never null.
 
@@ -125,11 +127,14 @@ delay source and replay set) and keeps polling. Outside this case `rules` and `a
 - Phase entry: write the inputs (rules attached, artifact assigned, freeze config), bump the generation of
   every service in the phase once, then **wait for convergence**: every live instance of those services
   has `observed_generation >= target` and, for frozen services, `replay_set_state = committed` for the
-  assigned artifact, within `MANTEION_CONVERGE_TIMEOUT` (default 30 s). Timeout fails the phase with the
-  list of lagging instances. Replaces `pushPhaseRules`, `freezeServices` and `preloadCacheEntries`.
+  assigned artifact, within `MANTEION_CONVERGE_TIMEOUT` (default 30 s). The barrier waits on alive
+  instances only: a stale instance (no recent poll or report) is named as suspect, not waited on. Timeout
+  fails the phase with the list of lagging instances. Replaces `pushPhaseRules`, `freezeServices` and `preloadCacheEntries`.
 - Phase exit / drain / teardown: same bump-and-wait with a non-fatal timeout (logged).
-- Kill switch: writes the killed flag (desired state = no rules, no faults), bumps, and additionally keeps
-  the existing immediate push as a best-effort nudge.
+- Kill switch: writes the killed flag and cancels the fault configs (desired state = no user rules and no
+  fault configs; a running phase's synthesized cache-box rule, `freeze_cfg` and `replay_set` stay in the
+  document), and bumps the generation once. The only nudge is the SSE `rules_changed` event; there is no
+  immediate push.
 - `atrocontrol.PushRules`, `FreezeService`, `ClearService`, `PreloadService` and the intent tracker are
   removed once the orchestrator no longer calls them; `InjectFault*`/`ClearFault*` (no callers) go with
   them. Fidelity pull and drain stay.
