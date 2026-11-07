@@ -22,12 +22,14 @@ type Decision struct {
 	RecentTraceIDs []string // newest first; omitted from the record when empty
 }
 
-// decisionLogger is the decision events' logger on the LoggerProvider
-// registered now. It is looked up on every call rather than once at init: a
+// DecisionLogger is the decision events' logger on the LoggerProvider
+// registered now. It is looked up per decision rather than once at init: a
 // logger the global API hands out before any provider is registered forwards
 // to the first provider registered and never to a later one, and a process
-// can register more than one (each Serve's InitTelemetry, tests).
-func decisionLogger() otellog.Logger {
+// can register more than one (each Serve's InitTelemetry, tests). A caller
+// that checks DecisionEnabledOn before EmitDecisionTo resolves it once and
+// passes it to both.
+func DecisionLogger() otellog.Logger {
 	return global.GetLoggerProvider().Logger(DecisionLoggerName)
 }
 
@@ -35,7 +37,13 @@ func decisionLogger() otellog.Logger {
 // a decision event emitted under ctx, so a caller can skip assembling one
 // (the recent trace ids are the costly part) when nothing would take it.
 func DecisionEnabled(ctx context.Context) bool {
-	return decisionLogger().Enabled(ctx, otellog.EnabledParameters{Severity: otellog.SeverityInfo, EventName: EventDecision})
+	return DecisionEnabledOn(ctx, DecisionLogger())
+}
+
+// DecisionEnabledOn is DecisionEnabled asked of logger (a DecisionLogger
+// result) instead of a fresh lookup.
+func DecisionEnabledOn(ctx context.Context, logger otellog.Logger) bool {
+	return logger.Enabled(ctx, otellog.EnabledParameters{Severity: otellog.SeverityInfo, EventName: EventDecision})
 }
 
 // EmitDecision emits d as one atropos.decision event through the OTel Logs
@@ -47,6 +55,12 @@ func DecisionEnabled(ctx context.Context) bool {
 // once, keeping the first (newest) occurrence, and is left out when d has
 // none.
 func EmitDecision(ctx context.Context, d Decision) {
+	EmitDecisionTo(ctx, DecisionLogger(), d)
+}
+
+// EmitDecisionTo is EmitDecision through logger (a DecisionLogger result)
+// instead of a fresh lookup.
+func EmitDecisionTo(ctx context.Context, logger otellog.Logger, d Decision) {
 	var rec otellog.Record
 	rec.SetTimestamp(time.Now())
 	rec.SetEventName(EventDecision)
@@ -65,7 +79,7 @@ func EmitDecision(ctx context.Context, d Decision) {
 	if ids := distinct(d.RecentTraceIDs); len(ids) > 0 {
 		rec.AddAttributes(attribute.StringSlice(AttrRecentTraceIDs, ids))
 	}
-	decisionLogger().Emit(ctx, rec)
+	logger.Emit(ctx, rec)
 }
 
 // distinct returns ids in order without repeats, keeping each id's first

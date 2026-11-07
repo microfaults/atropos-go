@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1469,5 +1470,73 @@ func TestStartTransient_DecisionRecordCarriesTheEndedServerSpan(t *testing.T) {
 	}
 	if !server.IsValid() || r.TraceID() != server.TraceID() || r.SpanID() != server.SpanID() || !r.TraceFlags().IsSampled() {
 		t.Fatalf("record trace %s span %s flags %s, want the ended server span's %s/%s, sampled", r.TraceID(), r.SpanID(), r.TraceFlags(), server.TraceID(), server.SpanID())
+	}
+}
+
+// A decision record names at most ringLinks traces, each once: the ring
+// dedupes and caps before hex-encoding, so 40 evaluations of 20 traces give
+// 16 distinct ids, newest first.
+func TestStartFault_DecisionRecentTraceIDsAreCapped(t *testing.T) {
+	rec := installDecisionRecorder(t)
+	i := New(&mockEvaluator{decision: &evaluator.Decision{Name: "lat", Fault: &inline.Latency{Delay: time.Millisecond}, Mode: evaluator.Inline, Reason: "test"}}, trace.Noop())
+	for k := 0; k < 40; k++ {
+		i.Evaluate(spanIn(byte(k%20+1), byte(k+1)), evaluator.Request{Point: evaluator.Egress})
+	}
+	cr, err := i.Check(spanIn(20, 99), evaluator.Request{Point: evaluator.Ingress})
+	if err != nil || cr.Handle == nil {
+		t.Fatalf("cr=%+v err=%v", cr, err)
+	}
+	<-cr.Handle.Done()
+
+	recs := decisionRecords(rec)
+	if len(recs) != 1 {
+		t.Fatalf("records = %d, want 1", len(recs))
+	}
+	got, _ := recentTraceIDs(recs[0].Attributes)
+	if len(got) != ringLinks {
+		t.Fatalf("recent trace ids = %d (%v), want %d", len(got), got, ringLinks)
+	}
+	seen := map[string]bool{}
+	for _, id := range got {
+		if seen[id] {
+			t.Fatalf("recent trace ids repeat %s: %v", id, got)
+		}
+		seen[id] = true
+	}
+	if want := oteltrace.SpanContextFromContext(spanIn(20, 99)).TraceID().String(); got[0] != want {
+		t.Fatalf("newest id = %s, want the deciding request's %s", got[0], want)
+	}
+}
+
+// countingLoggerProvider counts the loggers handed out.
+type countingLoggerProvider struct {
+	*logtest.Recorder
+	n atomic.Int32
+}
+
+func (p *countingLoggerProvider) Logger(name string, opts ...otellog.LoggerOption) otellog.Logger {
+	p.n.Add(1)
+	return p.Recorder.Logger(name, opts...)
+}
+
+// One decision resolves the decision logger once: the enabled check and the
+// emission share it.
+func TestStartFault_DecisionResolvesTheLoggerOnce(t *testing.T) {
+	p := &countingLoggerProvider{Recorder: logtest.NewRecorder()}
+	prev := global.GetLoggerProvider()
+	global.SetLoggerProvider(p)
+	t.Cleanup(func() { global.SetLoggerProvider(prev) })
+	i := New(&mockEvaluator{decision: &evaluator.Decision{Name: "lat", Fault: &inline.Latency{Delay: time.Millisecond}, Mode: evaluator.Inline, Reason: "test"}}, trace.Noop())
+	before := p.n.Load()
+	cr, err := i.Check(spanIn(1, 1), evaluator.Request{Point: evaluator.Ingress})
+	if err != nil || cr.Handle == nil {
+		t.Fatalf("cr=%+v err=%v", cr, err)
+	}
+	<-cr.Handle.Done()
+	if n := p.n.Load() - before; n != 1 {
+		t.Fatalf("Logger called %d times for one decision, want 1", n)
+	}
+	if len(decisionRecords(p.Recorder)) != 1 {
+		t.Fatal("the decision was not emitted")
 	}
 }

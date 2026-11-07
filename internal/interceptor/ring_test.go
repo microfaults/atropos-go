@@ -204,3 +204,27 @@ func TestNew_EachInterceptorHasItsOwnRing(t *testing.T) {
 		t.Fatalf("b holds a's request: %v", got)
 	}
 }
+
+// RecentTraceIDs names each trace once, newest first, and stops at limit:
+// 40 evaluations of 20 traces (each trace twice) yield the 16 newest traces.
+func TestRequestRing_RecentTraceIDsDedupesAndCaps(t *testing.T) {
+	r := newRequestRing(ringSize)
+	for k := 0; k < 40; k++ {
+		r.Record(sampledSC(byte(k%20+1)), nil)
+	}
+	got := r.RecentTraceIDs(ringLinks)
+	if len(got) != ringLinks {
+		t.Fatalf("ids = %d (%v), want %d", len(got), got, ringLinks)
+	}
+	for k, id := range got {
+		if want := sampledSC(byte(20 - k)).TraceID().String(); id != want {
+			t.Fatalf("id %d = %s, want trace %d's %s", k, id, 20-k, want)
+		}
+	}
+	if n := len(r.TraceIDs()); n != 40 {
+		t.Fatalf("TraceIDs = %d entries, want every one of the 40", n)
+	}
+	if got := r.RecentTraceIDs(0); got != nil {
+		t.Fatalf("limit 0 = %v, want nil", got)
+	}
+}

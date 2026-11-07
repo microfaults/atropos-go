@@ -251,14 +251,17 @@ func faultSpanAttrs(req evaluator.Request, decision *evaluator.Decision, faultTy
 // so the event carries that request's trace and span -- not those of the
 // fault or cache-box span the interceptor starts for it (Core.Arm's context
 // carries none). faultID is the fault run's id ("" for a cache-box action).
-// The recent trace ids are the ring's, newest first. Nothing is assembled
-// when the registered logger provider would drop the event.
+// The recent trace ids are the ring's newest ringLinks distinct traces,
+// newest first. The decision logger is resolved once per decision, and
+// nothing is assembled when the registered logger provider would drop the
+// event.
 func (i *Interceptor) emitDecision(ctx context.Context, req evaluator.Request, decision *evaluator.Decision, action, faultID string) {
-	if !trace.DecisionEnabled(ctx) {
+	logger := trace.DecisionLogger()
+	if !trace.DecisionEnabledOn(ctx, logger) {
 		return
 	}
 	experimentID, phaseID := decisionExperiment(decision)
-	trace.EmitDecision(ctx, trace.Decision{
+	trace.EmitDecisionTo(ctx, logger, trace.Decision{
 		RuleName:       decision.Name,
 		Reason:         decision.Reason,
 		FaultID:        faultID,
@@ -266,7 +269,7 @@ func (i *Interceptor) emitDecision(ctx context.Context, req evaluator.Request, d
 		ExperimentID:   experimentID,
 		PhaseID:        phaseID,
 		Action:         action,
-		RecentTraceIDs: i.recent.TraceIDs(),
+		RecentTraceIDs: i.recent.RecentTraceIDs(ringLinks),
 	})
 }
 

@@ -14,9 +14,9 @@ const (
 	AttrFaultID = "atropos.fault.id"
 	// AttrFaultJoined counts the requests that joined a running background
 	// fault instead of starting another (on the run's fault span). Every
-	// call the interceptor is not told is an arm counts, with or without a
-	// span context; an eager re-arm (Core.Arm marks its calls with
-	// interceptor.ArmedContext) that meets the running fault does not.
+	// call not marked as an arm (interceptor.ArmedContext) counts, with or
+	// without a span context; an eager re-arm (Core.Arm marks its calls that
+	// way) that meets the running fault does not.
 	AttrFaultJoined = "atropos.fault.joined"
 
 	// Span link attributes. AttrLinkKind says what a link points at; its

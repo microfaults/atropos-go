@@ -2,6 +2,7 @@ package interceptor
 
 import (
 	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -31,7 +32,8 @@ type recentRequest struct {
 // fault span can link the requests that led up to it. It holds sampled
 // requests only: an unsampled request's trace is never stored, and a link to
 // it would point at nothing. Record runs on the request path, so it takes one
-// mutex and allocates nothing beyond the label copy; Links and TraceIDs copy
+// mutex and allocates nothing beyond the label copy; Links, TraceIDs and
+// RecentTraceIDs copy
 // the ids out under the mutex and build their results after releasing it.
 type requestRing struct {
 	mu      sync.Mutex
@@ -100,6 +102,30 @@ func (r *requestRing) TraceIDs() []string {
 	r.mu.Lock()
 	for k := 1; k <= r.n; k++ {
 		traces = append(traces, r.at(k).Trace)
+	}
+	r.mu.Unlock()
+
+	ids := make([]string, len(traces))
+	for k, t := range traces {
+		ids[k] = t.String()
+	}
+	return ids
+}
+
+// RecentTraceIDs returns the trace ids of up to limit distinct recorded
+// traces, newest first, in hex. A trace recorded more than once is named at
+// its newest entry. The walk dedupes and caps on the raw ids under the mutex,
+// so only the ids returned are hex-encoded; nil when limit <= 0.
+func (r *requestRing) RecentTraceIDs(limit int) []string {
+	if limit <= 0 {
+		return nil
+	}
+	traces := make([]oteltrace.TraceID, 0, min(limit, len(r.buf)))
+	r.mu.Lock()
+	for k := 1; k <= r.n && len(traces) < limit; k++ {
+		if t := r.at(k).Trace; !slices.Contains(traces, t) {
+			traces = append(traces, t)
+		}
 	}
 	r.mu.Unlock()
 
