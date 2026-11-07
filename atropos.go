@@ -49,7 +49,7 @@ func init() {
 	defaultRegistry = interceptor.NewFaultRegistry()
 	defaultInterceptor.Store(interceptor.New(nil, trace.NewOTelTracer(),
 		interceptor.WithRegistry(defaultRegistry),
-		interceptor.WithInjectionHook(metrics.RecordFaultInjection)))
+		interceptor.WithInjectionHook(metrics.FaultInjectionHook(""))))
 }
 
 // currentInterceptor returns the live package interceptor.
@@ -73,7 +73,7 @@ func DefaultInterceptor() *Interceptor {
 // (A1).
 func configure(eval evaluator.Evaluator, cb *cachebox.CacheBox) {
 	opts := []interceptor.Option{
-		interceptor.WithInjectionHook(metrics.RecordFaultInjection),
+		interceptor.WithInjectionHook(metrics.FaultInjectionHook("")),
 		interceptor.WithRegistry(defaultRegistry),
 	}
 	if cb != nil {

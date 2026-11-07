@@ -103,6 +103,7 @@ func connectManteion(ctx context.Context, cfg manteionConfig) (*ManteionClient, 
 			},
 			CacheBox: cfg.targets.CacheBox,
 			Logger:   cfg.logger,
+			Service:  cfg.serviceName,
 			OnChange: func() { c.sendStatus(context.Background()) },
 		})
 		c.targets.ReplaySet = c.puller

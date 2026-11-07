@@ -29,6 +29,7 @@ type decodeConfig struct {
 	resourceHost ResourceHost
 	capabilities map[string]bool // nil = everything
 	logger       *slog.Logger    // where decodeRuleSet reports the rules it skips; nil = slog.Default()
+	service      string          // the service label of atropos_rules_unsupported_total
 }
 
 // ResourceHost builds the fault that executes a resource-category fault on
@@ -90,6 +91,17 @@ func withLogger(l *slog.Logger) decodeOption {
 	return func(c *decodeConfig) { c.logger = l }
 }
 
+// withService labels the rules a decode skips with the host's service in
+// atropos_rules_unsupported_total. NewCore adds it to the core's options.
+func withService(service string) decodeOption {
+	return func(c *decodeConfig) { c.service = service }
+}
+
+// countUnsupported counts one rule or slot skipped under category.
+func countUnsupported(opts []decodeOption, category string) {
+	metrics.RulesUnsupportedTotal.WithLabelValues(category, buildDecodeConfig(opts).service).Inc()
+}
+
 func buildDecodeConfig(opts []decodeOption) *decodeConfig {
 	cfg := &decodeConfig{}
 	for _, o := range opts {
@@ -140,7 +152,7 @@ func decodeRuleSet(compiled []wire.CompiledRule, opts ...decodeOption) ruleSetDe
 		if err != nil {
 			var unsup *UnsupportedFaultError
 			if errors.As(err, &unsup) {
-				metrics.RulesUnsupportedTotal.WithLabelValues(unsup.Category).Inc()
+				countUnsupported(opts, unsup.Category)
 				logger.Warn("rule skipped: not executable by this host",
 					"rule", cr.Name, "category", unsup.Category, "fault_type", unsup.FaultType)
 				out.Unsupported = append(out.Unsupported, wire.UnsupportedRule{Rule: cr.Name, Category: unsup.Category})

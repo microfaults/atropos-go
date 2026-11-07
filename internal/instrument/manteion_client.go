@@ -569,7 +569,7 @@ func (c *ManteionClient) adoptGeneration(h http.Header, sent uint64) {
 	}
 	if gen, err := strconv.ParseUint(h.Get("X-Atropos-Generation"), 10, 64); err == nil {
 		c.ruleVersion.Store(gen)
-		metrics.SyncGeneration.Set(float64(gen))
+		metrics.SyncGeneration.WithLabelValues(c.cfg.serviceName).Set(float64(gen))
 	}
 	if etag := strings.Trim(h.Get("ETag"), `"`); etag != "" {
 		c.etag = etag
@@ -588,7 +588,7 @@ func (c *ManteionClient) forgetDocument() {
 	c.applySeq++
 	c.ruleVersion.Store(0)
 	c.etag = ""
-	metrics.SyncGeneration.Set(0)
+	metrics.SyncGeneration.WithLabelValues(c.cfg.serviceName).Set(0)
 }
 
 // applyDesired applies one desired-state document -- a 200 poll body or the
@@ -669,7 +669,7 @@ func (c *ManteionClient) applyAndRecord(doc wire.RuleSync, etag, source string) 
 	c.ruleVersion.Store(doc.Version)
 	c.etag = etag
 	c.lastReport = report
-	metrics.SyncGeneration.Set(float64(doc.Version))
+	metrics.SyncGeneration.WithLabelValues(c.cfg.serviceName).Set(float64(doc.Version))
 	c.syncMu.Unlock()
 	c.logger.Info("rules updated",
 		"source", source,

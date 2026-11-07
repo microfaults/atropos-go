@@ -66,6 +66,8 @@ type replaySetPullerConfig struct {
 	// CacheBox leaves nothing to install into: newReplaySetPuller returns nil.
 	CacheBox *cachebox.CacheBox
 	Logger   *slog.Logger // nil means slog.Default()
+	// Service labels the atropos_replay_set_state gauge.
+	Service string
 	// OnChange, if set, is called after every transition the puller makes on
 	// its own -- to committed or failed when a fetch ends, and to fetching
 	// when a retry starts one -- from the goroutine that made it, once Status
@@ -96,6 +98,7 @@ type replaySetPuller struct {
 	newRequest func(ctx context.Context, method, url string) (*http.Request, error)
 	cb         *cachebox.CacheBox
 	logger     *slog.Logger
+	service    string // the atropos_replay_set_state service label
 	onChange   func()
 
 	// The retry of a failed pull waits retryDelay -- retryBase, doubling up to
@@ -169,6 +172,7 @@ func newReplaySetPuller(cfg replaySetPullerConfig) *replaySetPuller {
 		newRequest: cfg.NewRequest,
 		cb:         cfg.CacheBox,
 		logger:     cfg.Logger,
+		service:    cfg.Service,
 		onChange:   cfg.OnChange,
 		retryBase:  replaySetRetryBase,
 		retryMax:   replaySetRetryMax,
@@ -306,7 +310,7 @@ func (p *replaySetPuller) dropRetryLocked() {
 // atropos_replay_set_state gauge. p.mu must be held.
 func (p *replaySetPuller) setStateLocked(id, state, errMsg string) {
 	p.id, p.state, p.errMsg = id, state, errMsg
-	metrics.SetReplaySetState(state)
+	metrics.SetReplaySetState(p.service, state)
 }
 
 // run executes one fetch and records its outcome. A fetch that committed is

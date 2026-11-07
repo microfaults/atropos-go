@@ -16,17 +16,44 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
 	"git.ucsc.edu/microfaults/atropos-go/internal/metrics"
 	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
-
-	dto "github.com/prometheus/client_model/go"
 )
 
+// unsupportedCount sums atropos_rules_unsupported_total{category} over every
+// service: the targets most tests build by hand carry no service.
 func unsupportedCount(t *testing.T, category string) float64 {
 	t.Helper()
-	m := &dto.Metric{}
-	if err := metrics.RulesUnsupportedTotal.WithLabelValues(category).Write(m); err != nil {
+	return unsupportedCountFor(t, category, "")
+}
+
+// unsupportedCountFor reads atropos_rules_unsupported_total{category,
+// service}; an empty service sums over every service.
+func unsupportedCountFor(t *testing.T, category, service string) float64 {
+	t.Helper()
+	families, err := metrics.Registry.Gather()
+	if err != nil {
 		t.Fatal(err)
 	}
-	return m.GetCounter().GetValue()
+	var sum float64
+	for _, f := range families {
+		if f.GetName() != "atropos_rules_unsupported_total" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			var cat, svc string
+			for _, l := range m.GetLabel() {
+				switch l.GetName() {
+				case "category":
+					cat = l.GetValue()
+				case "service":
+					svc = l.GetValue()
+				}
+			}
+			if cat == category && (service == "" || svc == service) {
+				sum += m.GetCounter().GetValue()
+			}
+		}
+	}
+	return sum
 }
 
 func threeRules() []wire.CompiledRule {
@@ -92,6 +119,24 @@ func TestApply_UnsupportedActiveFaultDoesNotWedgeSync(t *testing.T) {
 	want := []wire.UnsupportedRule{{Rule: "cpu", Category: "resource"}, {Rule: "slot-cpu", Category: "resource"}}
 	if !reflect.DeepEqual(report.Unsupported, want) || len(report.Errors) != 0 {
 		t.Fatalf("report = %+v, want unsupported %+v and no errors", report, want)
+	}
+}
+
+// The core labels the rules and slots it skips with its service: the
+// manteion sync and the /admin/rules push both apply through core.targets.
+func TestApply_UnsupportedCountsCarryTheCoreService(t *testing.T) {
+	core := NewCore(CoreConfig{Service: "unsup-svc", Instance: "pod-1", Logger: slog.New(slog.DiscardHandler),
+		Capabilities: []string{CapInline, CapCacheBox}})
+	t.Cleanup(core.Stop)
+	before := unsupportedCountFor(t, "resource", "unsup-svc")
+	_, err := apply(wire.RuleSync{Rules: threeRules(), ActiveFaults: []wire.FaultRequest{
+		{ID: "slot-cpu", Category: "resource", FaultType: "cpu", DurationMs: 1000, Params: json.RawMessage(`{"target_load":0.1}`)},
+	}}, core.targets(nil), scopeAll)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := unsupportedCountFor(t, "resource", "unsup-svc") - before; got != 2 {
+		t.Fatalf("atropos_rules_unsupported_total{resource,service=unsup-svc} += %v, want 2 (the rule and the slot)", got)
 	}
 }
 

@@ -289,6 +289,18 @@ sync series: `atropos_sync_generation` (the generation held),
 `atropos_replay_set_state{state}` (the replay-set pull state; all three read 0
 when no set is desired) and `atropos_rules_unsupported_total{category}`.
 
+The atropos series carry a `service` label (the host's service name): the
+three cache-box counters `{service}`, `atropos_fault_injections_total{fault_type,
+injection_point, service}`, and the three sync series alongside their own
+labels (`http_server_*` already carried it; `http_client_*` are labelled by
+`target`). The request-duration histograms and the fault and cache-box
+counters carry `trace_id`/`span_id` exemplars of the sampled span they were
+recorded under (the request's server or client span; none for an unsampled
+one). `/metrics` negotiates OpenMetrics: a scrape that sends
+`Accept: application/openmetrics-text` (Prometheus with exemplar storage
+enabled does) gets the exemplars; other scrapes get the classic text format
+without them.
+
 ### 7. atroposd: the out-of-process host
 
 `atroposd` hosts the same instrument core as `Serve`, one sidecar per pod,

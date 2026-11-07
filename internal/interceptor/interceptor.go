@@ -31,15 +31,26 @@ func WithRegistry(r *FaultRegistry) Option {
 }
 
 // InjectionHook is called once each time the interceptor starts a fault,
-// with the fault's Go type and the injection point ("ingress", "egress",
-// "transient" or "custom"). The parent atropos package wires this to a
-// Prometheus counter; keep it cheap and non-blocking.
-type InjectionHook func(faultType, injectionPoint string)
+// with the context the fault was started under (the request's, so it carries
+// the request span; an eager arm's carries none), the fault's Go type and the
+// injection point ("ingress", "egress", "transient" or "custom"). Every host
+// wires it to metrics.FaultInjectionHook; keep it cheap and non-blocking.
+type InjectionHook func(ctx context.Context, faultType, injectionPoint string)
 
 // WithInjectionHook sets the per-injection callback. A nil hook is ignored.
 func WithInjectionHook(h InjectionHook) Option {
 	return func(i *Interceptor) { i.onInject = h }
 }
+
+// WithService names the service the interceptor dispatches for. The egress
+// transport labels its cache-box counters with it; empty (the default) means
+// the service is not known, as on the in-process baseline before Serve.
+func WithService(name string) Option {
+	return func(i *Interceptor) { i.service = name }
+}
+
+// Service is the service name WithService set; "" when none was.
+func (i *Interceptor) Service() string { return i.service }
 
 // WithLogger sets the logger the interceptor reports its own errors to: a
 // failed fault check, a recovered panic. A log call that has a request passes
@@ -64,6 +75,7 @@ type Interceptor struct {
 	registry *FaultRegistry
 	onInject InjectionHook
 	logger   *slog.Logger
+	service  string
 	// recent holds the last requests this interceptor evaluated; background
 	// fault spans link to them.
 	recent *requestRing
@@ -315,7 +327,7 @@ func (i *Interceptor) startDirect(ctx context.Context, req evaluator.Request, de
 	}
 	i.emitDecision(ctx, req, decision, trace.ActionFaultStart, runID)
 	if i.onInject != nil {
-		i.onInject(faultType, req.Point.String())
+		i.onInject(ctx, faultType, req.Point.String())
 	}
 	handle.SetOnResult(func(r fault.Result) {
 		span.RecordResult(r)
@@ -406,7 +418,7 @@ func (i *Interceptor) startRegistered(ctx, spanParent context.Context, req evalu
 	}
 	i.emitDecision(ctx, req, decision, trace.ActionFaultStart, run.ID)
 	if i.onInject != nil {
-		i.onInject(faultType, req.Point.String())
+		i.onInject(ctx, faultType, req.Point.String())
 	}
 	return CheckResult{Handle: run.Handle, Decision: &d, RunID: run.ID}, nil
 }

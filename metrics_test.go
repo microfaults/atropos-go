@@ -193,7 +193,7 @@ func TestEgressMetrics_CacheBoxClassification(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			before := map[string]float64{}
 			for _, c := range all {
-				before[c] = gatherCounter(c, nil)
+				before[c] = gatherCounter(c, map[string]string{"service": ""})
 			}
 
 			base := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
@@ -211,7 +211,7 @@ func TestEgressMetrics_CacheBoxClassification(t *testing.T) {
 				if c == tc.counter {
 					want = 1
 				}
-				if delta := gatherCounter(c, nil) - before[c]; delta != want {
+				if delta := gatherCounter(c, map[string]string{"service": ""}) - before[c]; delta != want {
 					t.Errorf("%s delta = %v, want %v", c, delta, want)
 				}
 			}

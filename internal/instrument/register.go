@@ -16,7 +16,6 @@ import (
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
 	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
-	"git.ucsc.edu/microfaults/atropos-go/internal/metrics"
 	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
 )
 
@@ -384,7 +383,7 @@ func applyActiveFault(req wire.FaultRequest, targets applyTargets) error {
 	if err != nil {
 		var unsup *UnsupportedFaultError
 		if errors.As(err, &unsup) {
-			metrics.RulesUnsupportedTotal.WithLabelValues(unsup.Category).Inc()
+			countUnsupported(targets.decodeOpts(), unsup.Category)
 			orDefault(targets.Logger).Warn("active fault skipped: not executable by this host",
 				"slot", id, "category", unsup.Category, "fault_type", unsup.FaultType)
 		}

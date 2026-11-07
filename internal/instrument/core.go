@@ -28,7 +28,7 @@ type CoreConfig struct {
 	// nil builds a fresh one. The in-process host passes its package-level
 	// registry so reconfiguration never orphans running faults (A1).
 	Registry *interceptor.FaultRegistry
-	// InjectionHook defaults to metrics.RecordFaultInjection.
+	// InjectionHook defaults to metrics.FaultInjectionHook(Service).
 	InjectionHook interceptor.InjectionHook
 	Logger        *slog.Logger
 	// DecodeOptions are host-supplied rule-decode hooks, e.g. the sidecar's
@@ -91,7 +91,7 @@ func NewCore(cfg CoreConfig) *Core {
 	}
 	hook := cfg.InjectionHook
 	if hook == nil {
-		hook = metrics.RecordFaultInjection
+		hook = metrics.FaultInjectionHook(cfg.Service)
 	}
 	reg := cfg.Registry
 	if reg == nil {
@@ -120,6 +120,7 @@ func NewCore(cfg CoreConfig) *Core {
 	demo := &demoEvaluator{}
 	ic := interceptor.New(evaluator.NewMultiEvaluator(host, demo), trace.NewOTelTracer(),
 		interceptor.WithInjectionHook(hook),
+		interceptor.WithService(cfg.Service),
 		interceptor.WithRegistry(reg),
 		interceptor.WithCacheBox(cb),
 		interceptor.WithLogger(logger),
@@ -129,7 +130,7 @@ func NewCore(cfg CoreConfig) *Core {
 		service: cfg.Service, instance: cfg.Instance,
 		fidelity: fidelity, cacheBox: cb, push: push,
 		host: host, demo: demo, registry: reg, ic: ic, logger: logger,
-		decodeOpts:   append([]decodeOption(nil), cfg.DecodeOptions...),
+		decodeOpts:   append([]decodeOption{withService(cfg.Service)}, cfg.DecodeOptions...),
 		eagerArm:     cfg.EagerArm,
 		hostName:     cfg.Host,
 		capabilities: append([]string(nil), cfg.Capabilities...),

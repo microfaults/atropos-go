@@ -34,7 +34,7 @@ func TestStartTransient_ForcesBackgroundThroughRegistry(t *testing.T) {
 	reg := NewFaultRegistry()
 	t.Cleanup(reg.Close)
 	var points []string
-	i := New(nil, trace.Noop(), WithRegistry(reg), WithInjectionHook(func(_, point string) { points = append(points, point) }))
+	i := New(nil, trace.Noop(), WithRegistry(reg), WithInjectionHook(func(_ context.Context, _, point string) { points = append(points, point) }))
 	req := evaluator.Request{Point: evaluator.Transient}
 
 	// The delay far outlasts the test: the fault can only end early if the
@@ -157,7 +157,9 @@ type hookCalls chan string
 
 func newHookCalls() hookCalls { return make(hookCalls, 16) }
 
-func (h hookCalls) hook() InjectionHook { return func(_, point string) { h <- point } }
+func (h hookCalls) hook() InjectionHook {
+	return func(_ context.Context, _, point string) { h <- point }
+}
 
 // next returns the point of the next hook call, waiting up to d for it.
 func (h hookCalls) next(d time.Duration) (string, bool) {

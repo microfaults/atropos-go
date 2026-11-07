@@ -690,11 +690,12 @@ func respond200(doc wire.RuleSync) func(http.ResponseWriter, *http.Request) {
 	}
 }
 
-// syncGeneration reads the atropos_sync_generation gauge.
+// syncGeneration reads the atropos_sync_generation gauge of the fake
+// client's service ("svc").
 func syncGeneration(t *testing.T) float64 {
 	t.Helper()
 	m := &dto.Metric{}
-	if err := metrics.SyncGeneration.Write(m); err != nil {
+	if err := metrics.SyncGeneration.WithLabelValues("svc").Write(m); err != nil {
 		t.Fatal(err)
 	}
 	return m.GetGauge().GetValue()
@@ -734,7 +735,7 @@ func TestFetchRules_200AppliesAndReportsStatus(t *testing.T) {
 }
 
 func TestFetchRules_304AdoptsGenerationWithoutApplying(t *testing.T) {
-	metrics.SyncGeneration.Set(0) // the gauge is process-wide: start from a known value
+	metrics.SyncGeneration.WithLabelValues("svc").Set(0) // the gauge is process-wide: start from a known value
 	f := newFakeManteion(t)
 	f.setRules(respond304("43", "43-def"))
 	eval := evaluator.NewStaticEvaluator(wire.StaticRule{Name: "keep", Point: evaluator.Ingress})

@@ -144,7 +144,7 @@ func refFor(f *fakeArtifact, entries []*cachebox.Entry) wire.ReplaySetRef {
 
 func newTestPuller(t *testing.T, f *fakeArtifact, cb *cachebox.CacheBox, onChange func()) *replaySetPuller {
 	t.Helper()
-	p := newReplaySetPuller(replaySetPullerConfig{BaseURL: f.srv.URL, CacheBox: cb, Logger: slog.New(slog.DiscardHandler), OnChange: onChange})
+	p := newReplaySetPuller(replaySetPullerConfig{BaseURL: f.srv.URL, Service: pullerService, CacheBox: cb, Logger: slog.New(slog.DiscardHandler), OnChange: onChange})
 	t.Cleanup(p.Close)
 	return p
 }
@@ -205,10 +205,14 @@ func waitChanges(t *testing.T, changes *atomic.Int32, want int32) {
 	}
 }
 
+// pullerService is the service newTestPuller's puller labels the
+// atropos_replay_set_state gauge with.
+const pullerService = "puller-svc"
+
 func replaySetGauge(t *testing.T, state string) float64 {
 	t.Helper()
 	m := &dto.Metric{}
-	if err := metrics.ReplaySetState.WithLabelValues(state).Write(m); err != nil {
+	if err := metrics.ReplaySetState.WithLabelValues(state, pullerService).Write(m); err != nil {
 		t.Fatal(err)
 	}
 	return m.GetGauge().GetValue()
