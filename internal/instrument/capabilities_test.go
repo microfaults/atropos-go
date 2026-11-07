@@ -13,6 +13,7 @@ import (
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault/inline"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault/network"
 	"git.ucsc.edu/microfaults/atropos-go/internal/interceptor"
 	"git.ucsc.edu/microfaults/atropos-go/internal/metrics"
 	"git.ucsc.edu/microfaults/atropos-go/internal/wire"
@@ -213,5 +214,89 @@ func TestDecode_QuotaMechanismNeedsAResourceHost(t *testing.T) {
 	out = decodeRuleSet(rule, WithResourceHost(host))
 	if len(out.Errors) != 0 || len(out.Unsupported) != 0 || len(out.Rules) != 1 || gotName != "cpu-quota" || gotMech != "quota" {
 		t.Fatalf("rules=%d errors=%v unsupported=%v name=%q mech=%q", len(out.Rules), out.Errors, out.Unsupported, gotName, gotMech)
+	}
+}
+
+func netemRule(name, faultType, params string) wire.CompiledRule {
+	return wire.CompiledRule{Name: name, InjectionPoint: "egress", Mode: "background",
+		Fault: &wire.CompiledFault{Category: "network", FaultType: faultType, DurationMs: 5000,
+			Network: &wire.NetworkEnvelope{Host: "inline", Target: "productcatalogservice:3550", Direction: "upstream"},
+			Params:  json.RawMessage(params)}}
+}
+
+func TestDecode_NetemRoutesToTheNetworkHost(t *testing.T) {
+	var got []string
+	stub := &inline.Latency{FaultConfig: fault.FaultConfig{Duration: time.Second}, Delay: time.Millisecond}
+	host := func(name string, req *wire.FaultRequest, base fault.FaultConfig) (fault.Fault, error) {
+		got = append(got, name+"/"+req.FaultType+"/"+req.Network.Target)
+		if base.Duration != 5*time.Second {
+			t.Errorf("base duration = %v", base.Duration)
+		}
+		return stub, nil
+	}
+	lat := netemRule("lat-toxic", "latency", `{"delay":"100ms"}`)
+	lat.Fault.Network.Host = "proxy" // the in-process toxic path, through the resolver
+	out := decodeRuleSet([]wire.CompiledRule{
+		netemRule("lat-netem", "latency", `{"delay":"100ms","mechanism":"netem"}`),
+		netemRule("loss", "packet_loss", `{"loss":10}`),
+		lat,
+	}, WithNetworkHost(host), withNetworkResolver(stubResolver(":19090", "localhost:3550")))
+	if len(out.Errors) != 0 || len(out.Unsupported) != 0 || len(out.Rules) != 3 {
+		t.Fatalf("rules=%d errors=%v unsupported=%v", len(out.Rules), out.Errors, out.Unsupported)
+	}
+	if strings.Join(got, ",") != "lat-netem/latency/productcatalogservice:3550,loss/packet_loss/productcatalogservice:3550" {
+		t.Fatalf("hook calls = %v", got)
+	}
+	if out.Rules[0].Decision.Fault != stub || out.Rules[1].Decision.Fault != stub {
+		t.Fatal("the hook's fault must be what the netem rules carry")
+	}
+	if _, ok := out.Rules[2].Decision.Fault.(*network.Proxy); !ok {
+		t.Fatalf("latency without mechanism must stay a toxic proxy fault, got %T", out.Rules[2].Decision.Fault)
+	}
+}
+
+func TestDecode_NetemWithoutANetworkHostIsSkippedAndCounted(t *testing.T) {
+	var logs strings.Builder
+	before := unsupportedCount(t, "network")
+	out := decodeRuleSet([]wire.CompiledRule{netemRule("loss", "packet_loss", `{"loss":10}`)},
+		withNetworkResolver(stubResolver(":19090", "localhost:3550")),
+		withLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+	counted := unsupportedCount(t, "network") - before
+	if len(out.Errors) != 0 || len(out.Rules) != 0 || counted != 1 {
+		t.Fatalf("rules=%d errors=%v counted=%v (netem needs the node agent; never a sync failure)", len(out.Rules), out.Errors, counted)
+	}
+	if len(out.Unsupported) != 1 || out.Unsupported[0] != (wire.UnsupportedRule{Rule: "loss", Category: "network"}) {
+		t.Fatalf("unsupported = %+v, want the netem rule reported under network", out.Unsupported)
+	}
+	if !strings.Contains(logs.String(), "fault_type=packet_loss/netem") {
+		t.Fatalf("skip log must name the netem fault type, got %q", logs.String())
+	}
+}
+
+func TestDecode_NetemNeedsTheNetemCapability(t *testing.T) {
+	host := func(name string, req *wire.FaultRequest, base fault.FaultConfig) (fault.Fault, error) {
+		return &inline.Latency{FaultConfig: base, Delay: time.Millisecond}, nil
+	}
+	rule := []wire.CompiledRule{netemRule("loss", "packet_loss", `{"loss":10}`)}
+	var logs strings.Builder
+	before := unsupportedCount(t, "network")
+	out := decodeRuleSet(rule, WithNetworkHost(host), WithCapabilities(CapInline, CapNetwork, CapCacheBox),
+		withLogger(slog.New(slog.NewTextHandler(&logs, nil))))
+	counted := unsupportedCount(t, "network") - before
+	if len(out.Errors) != 0 || len(out.Rules) != 0 || counted != 1 ||
+		len(out.Unsupported) != 1 || out.Unsupported[0] != (wire.UnsupportedRule{Rule: "loss", Category: "network"}) {
+		t.Fatalf("without CapNetem: rules=%d errors=%v unsupported=%v counted=%v", len(out.Rules), out.Errors, out.Unsupported, counted)
+	}
+	if !strings.Contains(logs.String(), "fault_type=packet_loss/netem") {
+		t.Fatalf("skip log must name the netem fault type, got %q", logs.String())
+	}
+	out = decodeRuleSet(rule, WithNetworkHost(host), WithCapabilities(CapInline, CapNetwork, CapCacheBox, CapNetem))
+	if len(out.Errors) != 0 || len(out.Unsupported) != 0 || len(out.Rules) != 1 {
+		t.Fatalf("with CapNetem: rules=%d errors=%v unsupported=%v", len(out.Rules), out.Errors, out.Unsupported)
+	}
+	for _, c := range AllCapabilities() {
+		if c == CapNetem {
+			t.Fatal("the in-process host must never advertise netem")
+		}
 	}
 }

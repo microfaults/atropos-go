@@ -27,6 +27,7 @@ type decodeConfig struct {
 	resolve      wire.NetworkResolver
 	inlineToxic  InlineToxicHost
 	resourceHost ResourceHost
+	networkHost  NetworkHost
 	capabilities map[string]bool // nil = everything
 	logger       *slog.Logger    // where decodeRuleSet reports the rules it skips; nil = slog.Default()
 	service      string          // the service label of atropos_rules_unsupported_total
@@ -42,6 +43,21 @@ type ResourceHost func(name string, req *wire.FaultRequest, base fault.FaultConf
 // decodes through it.
 func WithResourceHost(h ResourceHost) DecodeOption {
 	return func(c *decodeConfig) { c.resourceHost = h }
+}
+
+// NetworkHost builds the fault that executes a network fault whose mechanism
+// is netem (faultparams.NetworkMechanism; packet_loss always is): the atroposd
+// sidecar delegates it to the node agent, which applies tc netem in the
+// target pod's network namespace. name is the rule or slot the fault belongs
+// to; req carries the category, type, envelope and params. Every other network
+// fault keeps the proxy / inline toxic path.
+type NetworkHost func(name string, req *wire.FaultRequest, base fault.FaultConfig) (fault.Fault, error)
+
+// WithNetworkHost installs the netem network host. Without one -- or when the
+// capability set lacks CapNetem -- a netem network fault decodes to an
+// UnsupportedFaultError ("<type>/netem"), skipped per rule.
+func WithNetworkHost(h NetworkHost) DecodeOption {
+	return func(c *decodeConfig) { c.networkHost = h }
 }
 
 // resourceMechanism reads the optional mechanism param shared by the
@@ -270,6 +286,14 @@ func decodeFault(name string, f *wire.CompiledFault, cfg *decodeConfig) (fault.F
 	case "network":
 		if f.Network == nil {
 			return nil, fmt.Errorf("network fault %q requires a network envelope", f.FaultType)
+		}
+		if faultparams.NetworkMechanism(f.FaultType, params) == faultparams.MechanismNetem {
+			// tc netem needs the node agent, reached only through the
+			// sidecar's network host and advertised as CapNetem.
+			if cfg.networkHost == nil || (cfg.capabilities != nil && !cfg.capabilities[CapNetem]) {
+				return nil, &UnsupportedFaultError{Category: "network", FaultType: f.FaultType + "/netem"}
+			}
+			return cfg.networkHost(name, f, baseCfg)
 		}
 		return decodeNetworkFault(name, f.FaultType, f.Network, params, baseCfg, cfg)
 	case "resource":

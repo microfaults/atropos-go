@@ -17,6 +17,15 @@ const (
 	// until a composition evaluator exists -- the skip does not consult the
 	// capability set.
 	CapComposition = "composition"
+
+	// CapNetem is a mechanism capability, not a category: it is advertised
+	// alongside the category capabilities, and only by the sidecar whose node
+	// agent can apply tc netem. A network fault whose mechanism is netem
+	// (packet_loss always is) decodes to an UnsupportedFaultError
+	// ("<type>/netem") on a host whose capability set lacks it.
+	// AllCapabilities never lists it: the in-process host never executes
+	// netem.
+	CapNetem = "netem"
 )
 
 // Host names.
@@ -36,7 +45,8 @@ func AllCapabilities() []string {
 // the fault needs within a category it supports -- cgroup authority for a
 // resource quota (FaultType "<type>/quota"), an inline toxic host for a
 // network host=inline fault ("<type>/inline"), a NetworkResolver for a
-// network host=proxy fault ("<type>/proxy") -- or the rule is a composition
+// network host=proxy fault ("<type>/proxy"), a NetworkHost and CapNetem for
+// a netem network fault ("<type>/netem") -- or the rule is a composition
 // (Category is then CapComposition and FaultType the composition's name).
 // Rule decoding skips such rules per rule (counted, logged, reported)
 // instead of failing the whole sync (design §5.3, D7); a single admin slot
