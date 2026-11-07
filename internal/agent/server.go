@@ -343,8 +343,10 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(res)
 }
 
-// stopHandler serves DELETE /v1/faults/{id}: it stops a running fault, or,
-// for an id that is not running, restores a netem journal entry kept by a
+// stopHandler serves DELETE /v1/faults/{id}: it stops a running fault (for
+// a netem fault whose release failed, now or earlier, it then retries the
+// kept entry as below), or, for an id that is not running, restores a netem
+// journal entry kept by a
 // failed Apply rollback or a failed restore, through Netem.Restore (locked
 // and single-flight). 200 when the entry is restored, dropped (namespace
 // gone, or superseded by a newer fault, which is left alone) or already
@@ -356,9 +358,15 @@ func (s *Server) stopHandler(w http.ResponseWriter, r *http.Request) {
 	rf := s.running[id]
 	s.mu.Unlock()
 	if rf != nil {
+		// stop is synchronous for a timed fault: when it returns, the
+		// release has run (now, or earlier). A netem release that failed
+		// kept its journal entry: fall through and retry it, instead of
+		// answering 200 over a qdisc that may still be applied.
 		rf.stop()
-		w.WriteHeader(http.StatusOK)
-		return
+		if rf.st.Mechanism != faultparams.MechanismNetem {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 	}
 	if nt := s.Netem; nt != nil {
 		es, err := nt.Journal.Load()
@@ -381,6 +389,10 @@ func (s *Server) stopHandler(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
+	}
+	if rf != nil { // stopped, and its release left no entry behind
+		w.WriteHeader(http.StatusOK)
+		return
 	}
 	http.Error(w, "no such fault", http.StatusNotFound)
 }

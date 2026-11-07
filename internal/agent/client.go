@@ -140,19 +140,6 @@ func ResourceFactory(sock, podUID, container string) instrument.ResourceHost {
 	}
 }
 
-// Reachable reports whether an agent answers on sock (GET /v1/faults).
-func Reachable(sock string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://atropos-agent/v1/faults", nil)
-	resp, err := socketClient(sock).Do(req)
-	if err != nil {
-		return false
-	}
-	resp.Body.Close()
-	return resp.StatusCode == http.StatusOK
-}
-
 // NetworkFactory is the instrument.NetworkHost a sidecar installs when the
 // agent offers netem: every netem network rule becomes an AgentFault for this
 // pod's app container. It validates the request with NetemSpecFromRequest

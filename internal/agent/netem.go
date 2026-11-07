@@ -36,7 +36,9 @@ type NetemSpec struct {
 // turns it into a NetemSpec. It is the one validation the sidecar runs at
 // decode time and the agent at start time. Checks, in order: the category is
 // network; the envelope is present; the direction is "" or "upstream"
-// (egress only); the scope is in (0,1] (0 means 1); then the params of packet_loss or
+// (egress only); no ramp (ramp_up_ms and ramp_down_ms are 0: netem applies
+// its parameters at once); the target passes checkNetemTarget; the scope
+// is in (0,1] (0 means 1); then the params of packet_loss or
 // latency (latency needs mechanism netem and scope 1); any other fault type
 // is rejected.
 func NetemSpecFromRequest(req wire.FaultRequest) (NetemSpec, error) {
@@ -50,6 +52,12 @@ func NetemSpecFromRequest(req wire.FaultRequest) (NetemSpec, error) {
 	case "", "upstream":
 	default:
 		return NetemSpec{}, fmt.Errorf("netem: direction %q unsupported: netem shapes egress only (ingress would need an ifb device)", req.Network.Direction)
+	}
+	if req.RampUpMs != 0 || req.RampDownMs != 0 {
+		return NetemSpec{}, errors.New("netem: ramps are not supported")
+	}
+	if err := checkNetemTarget(req.Network.Target); err != nil {
+		return NetemSpec{}, err
 	}
 	scope := req.Network.Scope
 	if scope == 0 {
@@ -99,9 +107,30 @@ func NetemSpecFromRequest(req wire.FaultRequest) (NetemSpec, error) {
 	return spec, nil
 }
 
+// checkNetemTarget runs the syntactic checks on a host[:port] target that
+// need no resolver: a port, when present, parses and lies in 1..65535, and
+// the host is not an IPv6 literal (netem filters match IPv4 only). Name
+// resolution happens at start, in the agent.
+func checkNetemTarget(target string) error {
+	if target == "" {
+		return nil
+	}
+	host := target
+	if h, p, err := net.SplitHostPort(target); err == nil {
+		host = h
+		if port, err := strconv.Atoi(p); err != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("netem: target %q: malformed port %q (1..65535)", target, p)
+		}
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		return fmt.Errorf("netem: target %q is an IPv6 literal: netem targets are IPv4 only", target)
+	}
+	return nil
+}
+
 // netemArgs is the netem qdisc's arguments for spec: "loss <loss>% [<corr>%]"
 // or "delay <delay>ms [<jitter>ms]". The optional value is omitted when 0;
-// numbers use the shortest exact decimal and durations are rendered in
+// percentages are rounded to 6 significant digits and durations are rendered in
 // milliseconds (1500µs is "1.5ms").
 func netemArgs(spec NetemSpec) []string {
 	if spec.FaultType == "latency" {
@@ -118,7 +147,12 @@ func netemArgs(spec NetemSpec) []string {
 	return args
 }
 
-func netemPct(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) + "%" }
+// netemPct renders a percentage rounded to 6 significant digits, so a
+// scaled loss prints as 0.3%, not 0.30000000000000004%.
+func netemPct(v float64) string {
+	r, _ := strconv.ParseFloat(strconv.FormatFloat(v, 'g', 6, 64), 64)
+	return strconv.FormatFloat(r, 'f', -1, 64) + "%"
+}
 
 func netemMs(d time.Duration) string {
 	return strconv.FormatFloat(float64(d)/1e6, 'f', -1, 64) + "ms"

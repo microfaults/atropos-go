@@ -69,7 +69,10 @@ func (j Journal) Load() ([]Quota, error) {
 
 func journalPath(dir, id string) string { return filepath.Join(dir, id+".json") }
 
-// writeJournalFile writes v as <dir>/<id>.json atomically, creating dir.
+// writeJournalFile writes v as <dir>/<id>.json atomically and durably,
+// creating dir: the tmp file is fsynced before the rename and dir after it,
+// so an entry saved before a tc line or a cgroup write survives a node
+// power loss.
 func writeJournalFile(dir, id string, v any) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -79,10 +82,37 @@ func writeJournalFile(dir, id string, v any) error {
 		return err
 	}
 	tmp := journalPath(dir, id) + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, journalPath(dir, id))
+	_, err = f.Write(b)
+	if err == nil {
+		err = f.Sync() // the bytes reach the disk before the rename publishes them
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, journalPath(dir, id)); err != nil {
+		return err
+	}
+	return syncDir(dir) // the rename itself survives a power loss
+}
+
+// syncDir fsyncs the directory dir, making a rename in it durable.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	if cerr := d.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 // removeJournalFile deletes <dir>/<id>.json; a missing entry is not an error.

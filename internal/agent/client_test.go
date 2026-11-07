@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -9,13 +10,11 @@ import (
 	"time"
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/fault"
+	"git.ucsc.edu/microfaults/atropos-go/internal/instrument"
 )
 
 func TestAgentFault_StartStopThroughTheSocket(t *testing.T) {
 	a := startTestAgent(t, "pod-a")
-	if !Reachable(a.sock) {
-		t.Fatal("agent must be reachable")
-	}
 	f := &AgentFault{FaultConfig: fault.FaultConfig{Duration: 10 * time.Second}, Sock: a.sock, PodUID: "pod-a", Container: "server", Name: "cpu-quota",
 		Req: quotaReq("pod-a", 0.5, 10000).Fault}
 	h, err := f.Start(context.Background())
@@ -49,9 +48,6 @@ func TestAgentFault_RejectedStartIsAnError(t *testing.T) {
 	f := &AgentFault{FaultConfig: fault.FaultConfig{Duration: time.Second}, Sock: a.sock, PodUID: "pod-b", Container: "server", Req: quotaReq("pod-b", 0.5, 1000).Fault}
 	if _, err := f.Start(context.Background()); err == nil {
 		t.Fatal("a refused start must be an error, not a silent no-op")
-	}
-	if Reachable(shortSocket(t)) {
-		t.Fatal("a missing socket must not be reachable")
 	}
 }
 
@@ -97,5 +93,7 @@ func TestNetworkFactory_ValidatesAtDecodeAndBuildsAnAgentFault(t *testing.T) {
 	bad := netReq("latency", "", "", 0, `{"delay":"1ms"}`)
 	if _, err := h("toxic", &bad, fault.FaultConfig{Duration: time.Second}); err == nil || !strings.Contains(err.Error(), "toxic") {
 		t.Fatalf("a non-netem latency must fail decode through the factory, got %v", err)
+	} else if ue := (*instrument.UnsupportedFaultError)(nil); errors.As(err, &ue) {
+		t.Fatalf("a malformed netem rule is a decode error, not an UnsupportedFaultError: %v", err)
 	}
 }

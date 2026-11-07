@@ -113,6 +113,8 @@ func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
 				decodeOpts = append(decodeOpts, instrument.WithNetworkHost(agent.NetworkFactory(cfg.AgentSocket, cfg.PodUID, cfg.AppContainer)))
 			}
 			logger.Info("atroposd: node agent reachable; resource faults delegated", "socket", cfg.AgentSocket, "container", cfg.AppContainer, "pod_uid", cfg.PodUID, "mechanisms", ac.Mechanisms)
+		} else {
+			logger.Warn("atroposd: node agent not reachable; resource and netem faults not advertised", "socket", cfg.AgentSocket, "error", err)
 		}
 	}
 	core := instrument.NewCore(instrument.CoreConfig{

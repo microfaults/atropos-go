@@ -632,6 +632,48 @@ func TestRun_AdvertisesNetemOnlyWhenTheAgentOffersIt(t *testing.T) {
 	}
 }
 
+// TestRun_LegacyAgentAdvertisesResourceButNotNetem: an agent predating GET
+// /v1/capabilities answers it 404, read as burn and quota: the sidecar
+// advertises resource, never netem.
+func TestRun_LegacyAgentAdvertisesResourceButNotNetem(t *testing.T) {
+	var sb [4]byte
+	rand.Read(sb[:])
+	sock := filepath.Join(os.TempDir(), "atropos-agent-"+hex.EncodeToString(sb[:])+".sock")
+	t.Cleanup(func() { os.Remove(sock) })
+	ln, err := agent.Listen(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux() // the legacy API: no /v1/capabilities
+	mux.HandleFunc("GET /v1/faults", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("[]")) })
+	legacy := &http.Server{Handler: mux}
+	go legacy.Serve(ln)
+	t.Cleanup(func() { legacy.Close() })
+
+	m := newDesiredStateManteion(t, wire.RuleSync{Version: 1, Rules: []wire.CompiledRule{}, ActiveFaults: []wire.FaultRequest{}}, nil)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	t.Cleanup(up.Close)
+	runDaemon(t, Config{
+		Service: "recommendationservice", ManteionURL: m.srv.URL,
+		Egress:      []EgressRoute{{Listen: "127.0.0.1:0", Upstream: strings.TrimPrefix(up.URL, "http://")}},
+		AgentSocket: sock, PodUID: "pod-x", AppContainer: "server",
+	})
+	var registers []wire.RegisterRequest
+	deadline := time.Now().Add(10 * time.Second)
+	for len(registers) == 0 && time.Now().Before(deadline) {
+		_, _, registers, _ = m.snapshot()
+		if len(registers) == 0 {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	if len(registers) == 0 {
+		t.Fatal("no registration")
+	}
+	if got := strings.Join(registers[0].Capabilities, ","); got != "inline,network,cachebox,resource" {
+		t.Fatalf("register capabilities = %s, want inline,network,cachebox,resource", got)
+	}
+}
+
 // TestRun_NoLiveAgentAdvertisesNeitherResourceNorNetem: a configured socket
 // nobody answers on delegates nothing.
 func TestRun_NoLiveAgentAdvertisesNeitherResourceNorNetem(t *testing.T) {

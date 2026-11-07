@@ -38,11 +38,38 @@ func TestNetemSpecFromRequest(t *testing.T) {
 		{"bad params", netReq("packet_loss", "x", "", 0, `{"loss":0}`), "loss"},
 		{"no envelope", wire.FaultRequest{Category: "network", FaultType: "packet_loss", Params: json.RawMessage(`{"loss":1}`)}, "envelope"},
 		{"not network", wire.FaultRequest{Category: "inline", FaultType: "latency", Params: json.RawMessage(`{"delay":"1ms"}`)}, "network"},
+		{"ramp up", withRamps(netReq("packet_loss", "", "", 0, `{"loss":10}`), 1000, 0), "netem: ramps are not supported"},
+		{"ramp down", withRamps(netReq("latency", "", "", 0, `{"delay":"1ms","mechanism":"netem"}`), 0, 500), "netem: ramps are not supported"},
+		{"malformed port", netReq("packet_loss", "catalog:abc", "", 0, `{"loss":10}`), "port"},
+		{"empty port", netReq("packet_loss", "catalog:", "", 0, `{"loss":10}`), "port"},
+		{"port out of range", netReq("packet_loss", "catalog:70000", "", 0, `{"loss":10}`), "port"},
+		{"bracketed IPv6 literal", netReq("packet_loss", "[fe80::1]:80", "", 0, `{"loss":10}`), "IPv6"},
+		{"bare IPv6 literal", netReq("packet_loss", "fe80::1", "", 0, `{"loss":10}`), "IPv6"},
 	}
 	for _, c := range bad {
 		if _, err := NetemSpecFromRequest(c.req); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: err = %v, want one mentioning %q", c.name, err, c.want)
 		}
+	}
+}
+
+func withRamps(r wire.FaultRequest, up, down int64) wire.FaultRequest {
+	r.RampUpMs, r.RampDownMs = up, down
+	return r
+}
+
+// Minor 5: scope × loss is rounded to 6 significant digits before it is
+// formatted (0.1 × 3 is 0.30000000000000004 in float64).
+func TestNetemArgs_RoundsTheScaledLoss(t *testing.T) {
+	spec, err := NetemSpecFromRequest(netReq("packet_loss", "", "", 0.1, `{"loss":3,"correlation":25}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := netemArgs(spec); !reflect.DeepEqual(got, []string{"loss", "0.3%", "25%"}) {
+		t.Fatalf("netemArgs = %v, want [loss 0.3%% 25%%]", got)
+	}
+	if got := netemArgs(NetemSpec{FaultType: "packet_loss", Loss: 1.0 / 3}); !reflect.DeepEqual(got, []string{"loss", "0.333333%"}) {
+		t.Fatalf("netemArgs = %v, want 6 significant digits", got)
 	}
 }
 

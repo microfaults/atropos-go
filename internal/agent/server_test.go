@@ -431,11 +431,14 @@ func TestServer_NetemKeptEntryAfterFailedRollbackIsRestoredThroughTheJournal(t *
 		t.Fatalf("netem while the entry is kept: status=%d body=%q, want 409", resp.StatusCode, body)
 	}
 
-	// The del keeps failing: DELETE answers 500 and the entry stays.
+	// The del keeps failing: DELETE answers 500 with tc's text and the entry stays.
 	dr, _ := http.NewRequest(http.MethodDelete, "http://agent/v1/faults/"+id, nil)
 	dresp, err := a.client.Do(dr)
 	if err != nil || dresp.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("delete with a failing del: %v %v", err, dresp)
+	}
+	if b, _ := io.ReadAll(dresp.Body); !strings.Contains(string(b), "exit status 3") {
+		t.Fatalf("failed delete body = %q, want tc's failure", b)
 	}
 	dresp.Body.Close()
 	if es, _ := a.srv.Netem.Journal.Load(); len(es) != 1 {
@@ -586,5 +589,60 @@ func TestServer_NetemRefusesAHostNetworkPodWith400(t *testing.T) {
 	resp, body := a.post(t, context.Background(), netemReq("pod-a", "packet_loss", "", "", `{"loss":10}`, 1000))
 	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(body, "host network namespace") {
 		t.Fatalf("status=%d body=%q, want 400 naming the host network namespace", resp.StatusCode, body)
+	}
+}
+
+// Minor 1: a DELETE of a running netem fault whose timed release failed
+// (its entry kept) must not answer a bare 200: it retries the kept entry
+// through the journal. Here the first del is held until the DELETE is on
+// its way, then fails; the DELETE's retry runs a second del, which succeeds.
+func TestServer_NetemDeleteAfterAFailedTimedReleaseRetriesTheEntry(t *testing.T) {
+	a := startTestAgent(t, "pod-a")
+	a.seedPID(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	var dels atomic.Int32
+	a.runner.mu.Lock()
+	a.runner.seen = func(line string) {
+		if strings.Contains(line, "tc qdisc del") && dels.Add(1) == 1 {
+			close(entered)
+			<-release
+			a.runner.mu.Lock()
+			a.runner.fail["tc qdisc del"] = errors.New("exit status 3")
+			a.runner.mu.Unlock()
+		} else if strings.Contains(line, "tc qdisc del") {
+			a.runner.mu.Lock()
+			delete(a.runner.fail, "tc qdisc del")
+			a.runner.mu.Unlock()
+		}
+	}
+	a.runner.mu.Unlock()
+	resp, id := a.post(t, context.Background(), netemReq("pod-a", "packet_loss", "", "", `{"loss":10}`, 100))
+	defer resp.Body.Close()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the timed release never reached its del")
+	}
+	code := make(chan int, 1)
+	go func() {
+		dr, _ := http.NewRequest(http.MethodDelete, "http://agent/v1/faults/"+id, nil)
+		dresp, err := a.client.Do(dr)
+		if err != nil {
+			code <- 0
+			return
+		}
+		dresp.Body.Close()
+		code <- dresp.StatusCode
+	}()
+	time.Sleep(100 * time.Millisecond) // the DELETE finds the fault still running, its release in flight
+	close(release)
+	if c := <-code; c != http.StatusOK {
+		t.Fatalf("delete: status %d, want 200 after the retry", c)
+	}
+	if n := dels.Load(); n != 2 {
+		t.Fatalf("tc qdisc del ran %d times, want 2 (the failed release, then the DELETE's retry)", n)
+	}
+	if es, _ := a.srv.Netem.Journal.Load(); len(es) != 0 {
+		t.Fatalf("journal = %+v, want the kept entry restored by the DELETE", es)
 	}
 }
