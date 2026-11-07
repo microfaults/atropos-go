@@ -327,9 +327,11 @@ func (s *Server) start(w http.ResponseWriter, r *http.Request) {
 
 // stopHandler serves DELETE /v1/faults/{id}: it stops a running fault, or,
 // for an id that is not running, restores a netem journal entry kept by a
-// failed Apply rollback or a failed restore (200 once restored, 500 with
-// the error when tc fails again; the entry stays for a later retry). An id
-// in neither is 404.
+// failed Apply rollback or a failed restore, through Netem.Restore (locked
+// and single-flight). 200 when the entry is restored, dropped (namespace
+// gone, or superseded by a newer fault, which is left alone) or already
+// being restored by a concurrent call; 500 with the error when tc fails
+// again (the entry stays for a later retry). An id in neither is 404.
 func (s *Server) stopHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	s.mu.Lock()

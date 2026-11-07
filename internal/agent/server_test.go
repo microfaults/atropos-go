@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -467,5 +468,76 @@ func TestServer_NetemKeptEntryAfterFailedRollbackIsRestoredThroughTheJournal(t *
 		t.Fatalf("delete of an unknown id: %v %v", err, dresp)
 	} else {
 		dresp.Body.Close()
+	}
+}
+
+// Critical 2: two DELETEs of one kept id race. The first restore is held
+// inside its tc del; the second finds the restore in flight and answers 200
+// at once without running tc. Exactly one del runs in all.
+func TestServer_NetemConcurrentDeletesOfAKeptEntryRunOneDel(t *testing.T) {
+	a := startTestAgent(t, "pod-a")
+	a.seedPID(t)
+	a.runner.mu.Lock()
+	a.runner.fail["tc filter add"] = errors.New("exit status 2")
+	a.runner.fail["tc qdisc del"] = errors.New("exit status 3")
+	a.runner.mu.Unlock()
+	if resp, body := a.post(t, context.Background(), netemReq("pod-a", "packet_loss", "productcatalogservice:3550", "upstream", `{"loss":10}`, 10000)); resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("start: status=%d body=%q, want 500", resp.StatusCode, body)
+	}
+	es, _ := a.srv.Netem.Journal.Load()
+	if len(es) != 1 {
+		t.Fatalf("journal = %+v, want the kept entry", es)
+	}
+	id := es[0].ID
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	var held atomic.Bool // only the first del is held; any later one passes
+	a.runner.mu.Lock()
+	delete(a.runner.fail, "tc filter add")
+	delete(a.runner.fail, "tc qdisc del")
+	a.runner.seen = func(line string) {
+		if strings.Contains(line, "tc qdisc del") && held.CompareAndSwap(false, true) {
+			close(entered)
+			<-release
+		}
+	}
+	a.runner.mu.Unlock()
+	before := len(a.runner.lines())
+
+	del := func() int {
+		dr, _ := http.NewRequest(http.MethodDelete, "http://agent/v1/faults/"+id, nil)
+		dresp, err := a.client.Do(dr)
+		if err != nil {
+			t.Errorf("delete: %v", err)
+			return 0
+		}
+		dresp.Body.Close()
+		return dresp.StatusCode
+	}
+	first := make(chan int, 1)
+	go func() { first <- del() }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first restore never reached its tc del")
+	}
+	if code := del(); code != http.StatusOK {
+		t.Fatalf("second delete while the first is in flight: status %d, want 200", code)
+	}
+	close(release)
+	if code := <-first; code != http.StatusOK {
+		t.Fatalf("first delete: status %d, want 200", code)
+	}
+	dels := 0
+	for _, l := range a.runner.lines()[before:] {
+		if strings.Contains(l, "tc qdisc del") {
+			dels++
+		}
+	}
+	if dels != 1 {
+		t.Fatalf("tc qdisc del ran %d times, want exactly 1: %q", dels, a.runner.lines()[before:])
+	}
+	if es, _ := a.srv.Netem.Journal.Load(); len(es) != 0 {
+		t.Fatalf("journal = %+v, want empty", es)
 	}
 }

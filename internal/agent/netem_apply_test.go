@@ -409,3 +409,78 @@ func TestNetem_RestoreDropsAnEntryWhoseNamespaceNobodyHolds(t *testing.T) {
 		t.Fatal("the stale entry must be dropped")
 	}
 }
+
+// Critical 2: a stale entry (kept by an earlier agent run) whose namespace a
+// newer fault now holds is dropped without tc: the old root qdisc cannot
+// coexist with the newer fault's, so deleting the root would remove the
+// newer fault.
+func TestNetem_RestoreDropsAnEntrySupersededByANewerFault(t *testing.T) {
+	n, r, netns, tg := newTestNetem(t)
+	old := NetemEntry{ID: "old", PodUID: "pod-a", Netns: netns, NetnsID: podNetnsID, Dev: "eth0",
+		Applied: []string{"tc qdisc add dev eth0 root handle 1: netem loss 5%"}}
+	if err := n.Journal.Save(old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n.Apply(context.Background(), "new", tg, lossSpec); err != nil {
+		t.Fatal(err)
+	}
+	before := len(r.lines())
+	if err := n.Restore(context.Background(), old); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.lines()) != before {
+		t.Fatalf("a superseded entry must run no tc, ran %q", r.lines()[before:])
+	}
+	es, _ := n.Journal.Load()
+	if len(es) != 1 || es[0].ID != "new" {
+		t.Fatalf("journal = %+v, want only the newer fault", es)
+	}
+	if _, err := n.Apply(context.Background(), "third", tg, lossSpec); !errors.Is(err, ErrNetemBusy) {
+		t.Fatalf("the newer fault must still hold the namespace, got %v", err)
+	}
+}
+
+// An entry whose journal file is already gone (another restore finished it)
+// is not restored again.
+func TestNetem_RestoreOfAnAlreadyRemovedEntryRunsNoTC(t *testing.T) {
+	n, r, _, tg := newTestNetem(t)
+	e, err := n.Apply(context.Background(), "f1", tg, lossSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Restore(context.Background(), *e); err != nil {
+		t.Fatal(err)
+	}
+	before := len(r.lines())
+	if err := n.Restore(context.Background(), *e); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.lines()) != before {
+		t.Fatalf("a second restore of the same entry must run no tc, ran %q", r.lines()[before:])
+	}
+}
+
+// Minor 8: a boot restore that fails keeps the entry AND reserves its
+// namespace, so a later Apply there answers ErrNetemBusy (409), not tc's
+// "File exists".
+func TestNetem_RestoreAllReservesTheNamespaceOfAKeptEntry(t *testing.T) {
+	n, r, _, tg := newTestNetem(t)
+	if _, err := n.Apply(context.Background(), "crashed", tg, lossSpec); err != nil {
+		t.Fatal(err)
+	}
+	r.fail["tc qdisc del"] = errors.New("exit status 2")
+	boot := &Netem{Runner: r, Journal: n.Journal, ProcRoot: n.ProcRoot, LookupIP: n.LookupIP}
+	if got := boot.RestoreAll(context.Background(), slog.New(slog.DiscardHandler)); got != 0 {
+		t.Fatalf("RestoreAll = %d, want 0 (the del failed)", got)
+	}
+	if es, _ := n.Journal.Load(); len(es) != 1 {
+		t.Fatalf("journal = %+v, want the entry kept", es)
+	}
+	before := len(r.lines())
+	if _, err := boot.Apply(context.Background(), "f2", tg, lossSpec); !errors.Is(err, ErrNetemBusy) {
+		t.Fatalf("Apply over a kept entry: err = %v, want ErrNetemBusy", err)
+	}
+	if len(r.lines()) != before {
+		t.Fatal("a refused apply must run no command")
+	}
+}
