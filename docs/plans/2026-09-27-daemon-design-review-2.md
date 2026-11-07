@@ -293,7 +293,7 @@ maintenance problem.
 | Gap | Disposition |
 |---|---|
 | Transient injection point | Define it as "after the response is flushed": the ingress middleware wraps the writer, runs the fault after `WriteHeader`+body completion with a detached context, span linked to the request. Small; fits both hosts. |
-| Packet drops, true latency at L3 | The node agent (M4) already has hostPID and privileges: add a `netem` mechanism that enters the pod's network namespace and applies `tc qdisc netem loss/delay/corrupt` on the pod's veth, journaled and restored like quotas. This is the first honest "packet drop" the platform can offer; the L4/L7 toxics stay for shaping without privileges. |
+| Packet drops, true latency at L3 | Done (`2026-10-30-agent-netem.md`); egress only, ifb for ingress deferred; `loss` and `delay` only (no `corrupt`), applied inside the pod's namespace on its egress interface rather than on the host-side veth. The node agent (M4) already has hostPID and privileges: add a `netem` mechanism that enters the pod's network namespace and applies `tc qdisc netem loss/delay/corrupt` on the pod's veth, journaled and restored like quotas. This is the first honest "packet drop" the platform can offer; the L4/L7 toxics stay for shaping without privileges. |
 | GPU | Out of scope unless a bed has GPUs; NVML-based burn would be a node-agent mechanism. |
 | Compositions rejected by the SDK, failing the whole sync | Skip per rule with a counted reason (same path as unsupported categories) until compositions are expanded by manteion into phases. |
 | Version not bumped on fault-only phases; lossy SSE | Subsumed by ADR-2 (generation from the materializer). |

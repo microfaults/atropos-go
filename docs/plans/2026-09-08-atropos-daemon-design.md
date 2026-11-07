@@ -619,6 +619,11 @@ restores the quota; the journal covers an agent crash; a burn child carries a pa
 `quota` covers cpu and memory, not io/disk. M3 (manteion-go) is not started: until it lands, every
 instance receives every rule and relies on the per-rule capability skip. VM1 preconditions remain
 unverified from this session (listed in `deploy/sidecar/README.md` and `deploy/agent/README.md`).
+netem done (plan `2026-10-30-agent-netem.md`): the agent applies `tc netem` in the pod's network
+namespace on egress, `prio`+`u32` scoping by ClusterIP, journal restored on stop/disconnect/boot;
+`GET /v1/capabilities` lets the sidecar advertise `netem` precisely. One netem fault per pod network
+namespace; IPv6 targets and ingress shaping (ifb) are not done; the k3s verification in
+`deploy/agent/README.md` is written but not yet run.
 
 ---
 

@@ -48,7 +48,7 @@ A snapshot of what's shipped on `main`. For the research vision (cache-box primi
 | Cache-box on ingress + gRPC | Not yet implemented |
 | OPA-backed evaluator | Not yet implemented |
 | Out-of-process host — `atroposd` sidecar: explicit capture (per-dependency egress ports) and transparent capture (iptables REDIRECT + `SO_ORIGINAL_DST`, raw-TCP relay for non-HTTP dependencies), inline network toxics, eager arming, `host`/`capabilities` at registration, `ATROPOS_HOST=sidecar` passive guard, deploy assets under `deploy/sidecar/` | Shipped (M1, M2) |
-| Node agent for resource faults — `atropos-agent` DaemonSet: `burn` placed in the target container's cgroup, `quota` on its `cpu.max`/`memory.high` with a restore journal, own-pod peer check, deploy assets under `deploy/agent/` | Shipped (M4) |
+| Node agent for resource faults — `atropos-agent` DaemonSet: `burn` placed in the target container's cgroup, `quota` on its `cpu.max`/`memory.high` with a restore journal, own-pod peer check, `netem` on the pod's egress (`packet_loss`, kernel-level `latency`) scoped to a dependency by ClusterIP, journaled and restored like quotas, deploy assets under `deploy/agent/` | Shipped (M4; netem 2026-11) |
 | manteion capability filter (M3), gRPC cache-box, thin-client hook API | Not yet implemented (M3 lives in manteion-go; the rest is deferred; see `docs/plans/2026-09-08-atropos-daemon-design.md`) |
 | Polyglot bindings (DeathStarBench target) | Superseded by `atroposd` (the 2026-04 sidecar plan is critiqued in the design doc above) |
 
@@ -506,9 +506,34 @@ authority; a single `/admin/fault` slot gets a 400). A fault lives as long
 as the sidecar's streaming request to the agent; its result lands on the
 sidecar's fault span as usual.
 
+**Netem network faults** go through the same agent. The sidecar asks it
+`GET /v1/capabilities` at start; when the answer lists `netem` (the agent
+lists it only when `tc` and `nsenter` are on its PATH; an older agent that
+answers 404 means `burn` and `quota` only), the sidecar advertises the
+`netem` capability and routes `network/packet_loss` (always netem) and
+`network/latency` with `mechanism: netem` to the agent. The agent applies
+`tc netem` inside the pod's network namespace on its egress interface: with
+a `network.target` it installs a `prio` root with the netem qdisc on band 4
+and one `u32` filter per IPv4 address the target resolves to (the
+ClusterIP, plus the port when the target names one), so other traffic is
+untouched; with no target the netem qdisc is the root and shapes all of the
+pod's egress, the sidecar's own control-plane and OTel traffic included.
+`network.scope` multiplies `loss` and must lie in (0,1] (0 means 1); netem
+latency needs scope 1. Netem shapes egress only (`direction` empty or
+`upstream`). A pod network namespace carries one netem fault at a time (a
+second one gets `409` from the agent and fails to start). The agent
+journals each fault before its first `tc` command and removes it on stop,
+when the sidecar disconnects, and at agent boot. The in-process host, and a
+sidecar whose agent does not list `netem`, skip such rules per rule
+(logged, counted in `atropos_rules_unsupported_total{category="network"}`,
+reported under `unsupported`); on a netem-capable sidecar a netem rule
+whose spec is invalid is a decode error (`422` on `/admin/rules`, a `400`
+as an `/admin/fault` slot). `deploy/agent/README.md` has the k3s
+verification recipe.
+
 Not in this release: the manteion-side capability filter (M3), gRPC and
 the thin-client hook API (deferred), IPv6 original destinations, `quota`
-for `io`/`disk`. Design and milestones:
+for `io`/`disk`, IPv6 netem targets, netem ingress shaping (ifb). Design and milestones:
 `docs/plans/2026-09-08-atropos-daemon-design.md`.
 
 ---
@@ -542,7 +567,8 @@ it:
 - **Skipped per rule.** One bad rule never fails the sync; the rest apply. A rule
   this host cannot execute (a category outside its capabilities, `quota`
   in-process, network `host: inline` outside the sidecar or `host: proxy` without
-  a resolver, a composition) is skipped, logged, counted in
+  a resolver, a netem network rule without a netem-capable sidecar, a
+  composition) is skipped, logged, counted in
   `atropos_rules_unsupported_total{category}` (compositions under
   `category="composition"`) and reported under `unsupported`. A rule it cannot
   decode is skipped, logged and reported under `errors`; it is not counted.

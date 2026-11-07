@@ -275,4 +275,13 @@ desired-state sync as `Serve` (long-poll, status report, replay-set pull),
 because both connect the same core through `ConnectManteion`. Sidecar-only
 behaviours: `network.host: inline` faults become armed proxy policies
 (`internal/proxy.PolicyTable`), and background faults arm when their rule
-applies (except Transient rules; `CoreConfig.EagerArm`).
+applies (except Transient rules; `CoreConfig.EagerArm`). When the node agent
+reports `netem` (`GET /v1/capabilities`, probed once at sidecar start; a 404
+from an older agent means `burn` and `quota` only), the sidecar advertises the
+`netem` capability and routes `network/packet_loss` and netem `latency` to the
+agent (`internal/agent.NetworkFactory` via `instrument.WithNetworkHost`), which
+applies `tc netem` on the pod's egress, one netem fault per pod network
+namespace at a time (`409` from the agent for a second). Without that (and
+always in-process) netem rules are skipped per rule and counted under
+`atropos_rules_unsupported_total{category="network"}`; on a netem-capable
+sidecar an invalid netem spec is a decode error (`422` on `/admin/rules`).

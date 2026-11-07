@@ -4,6 +4,13 @@ All notable changes to atropos-go are documented in this file.
 
 ## Unreleased
 
+### Added — Node-agent netem (packet loss, kernel latency)
+
+- **`packet_loss` network fault** (`params: {"loss", "correlation"}`, percent) and **`mechanism: "netem"` on network `latency`**: both run as `tc netem` in the pod's network namespace, through the node agent, from the atroposd sidecar only. `packet_loss` is always netem; latency without the mechanism stays the proxy toxic.
+- **Agent.** The netem qdisc goes on the pod's egress interface: under a `prio` root with one `u32` filter per IPv4 address of `network.target` (and its port, when named), or as the root itself when no target is given (then the sidecar's own traffic is shaped too). `network.scope` multiplies `loss` and must lie in (0,1] (0 means 1); latency needs scope 1; egress only (`direction` empty or `upstream`). One netem fault per pod network namespace (`409` for a second, `400` for an invalid spec). Each fault is journaled (`-netem-journal`, default `/var/lib/atropos-agent/netem`) before its first `tc` command and removed on stop, on sidecar disconnect and at agent boot; a failed removal keeps the entry and the namespace reserved so a later stop or the next boot retries it. Known residual: a crash between the root `qdisc add` and the journal re-save leaves the qdisc for manual removal (`deploy/agent/README.md`).
+- **`GET /v1/capabilities`** on the agent lists its mechanisms (`burn`, `quota`, and `netem` when `tc` and `nsenter` are on its PATH). The sidecar probes it at start and advertises the `netem` capability only when listed (an agent answering 404 is read as `burn` and `quota`). The in-process host, and a sidecar without a netem-capable agent, skip netem rules per rule (`atropos_rules_unsupported_total{category="network"}`); on a netem-capable sidecar an invalid netem spec is a decode error (`422` on `/admin/rules`).
+- **Images.** The agent image installs `iproute2` and `util-linux`; the Go build stages of the agent and sidecar Dockerfiles run on the build platform and cross-compile (`FROM --platform=$BUILDPLATFORM`), since emulating the Go compiler under amd64 on an arm64 Mac segfaults it. The DaemonSet passes `-netem-journal`.
+
 ### Changed — Telemetry (ADR-3)
 
 Both hosts (`Serve` and atroposd) bootstrap OTel through one `InitTelemetry`, configured by the standard OTel environment.
