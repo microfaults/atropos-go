@@ -157,13 +157,57 @@ func main() {
 }
 ```
 
-`Serve` bootstraps OTel (OTLP gRPC exporter, W3C TraceContext + Baggage
-propagators; endpoint from `OTEL_EXPORTER_OTLP_ENDPOINT` >
-`COLLECTOR_SERVICE_ADDR` > `localhost:4317`), builds the record/replay
-cache-box and its manteion push client around one shared fidelity registry,
-composes the host rule evaluator with the admin fault slot (host rules always
-win), connects to manteion, and returns a handler that serves the control
-surface beside the middleware-wrapped business handler.
+`Serve` bootstraps OTel for two signals, traces and logs, and builds the
+record/replay cache-box and its manteion push client around one shared
+fidelity registry, composes the host rule evaluator with the admin fault slot
+(host rules always win), connects to manteion, and returns a handler that
+serves the control surface beside the middleware-wrapped business handler.
+
+Telemetry follows the standard OTel environment:
+
+- **Exporters** come from contrib `autoexport`: `OTEL_TRACES_EXPORTER` and
+  `OTEL_LOGS_EXPORTER` (`otlp` by default, `console`, `none`) and, for `otlp`,
+  `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_PROTOCOL` (`grpc` or
+  `http/protobuf`) and the other `OTEL_EXPORTER_OTLP_*` variables.
+  `COLLECTOR_SERVICE_ADDR`, and a schemeless `OTEL_EXPORTER_OTLP_ENDPOINT` such
+  as `otel-collector:4317`, still work and mean a gRPC collector (unless
+  `OTEL_EXPORTER_OTLP_PROTOCOL` names another protocol); an endpoint that is
+  already a URL is used as it is. With no endpoint configured at all the OTel
+  default applies: **http/protobuf to `localhost:4318`** (it was gRPC to
+  `localhost:4317`), so a bare local run against a gRPC-only collector sets
+  `OTEL_EXPORTER_OTLP_PROTOCOL=grpc`. A malformed `OTEL_*` value fails startup.
+- **Sampler** from `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG`; the
+  default is parent-based always-on (`parentbased_always_on`), so an incoming
+  `traceparent` whose sampled flag is off suppresses the request's spans; a
+  deployment that wants every request traced whatever its caller decided sets
+  `OTEL_TRACES_SAMPLER=always_on` (the beds do).
+- **Resource** on every span and log record: `service.name` (`Config.Service`),
+  `service.instance.id` (the registration identity, see `InstanceID` below, so
+  spans and logs join manteion's instance rows), `service.version` and
+  `deployment.environment.name` only when set (otherwise
+  `OTEL_RESOURCE_ATTRIBUTES` may supply them), `k8s.pod.name` from
+  `ATROPOS_POD_NAME`, else `HOSTNAME` (omitted when neither is set), and
+  `atropos.host` (`in-process`, or `sidecar` in atroposd), merged over
+  `OTEL_RESOURCE_ATTRIBUTES`.
+- **Propagators**: W3C TraceContext plus the standard W3C Baggage propagator.
+  The SDK never drops a baggage member: every member a request arrived with is
+  forwarded on its outbound calls (see "Decision events and correlation" for
+  the two members the SDK adds).
+- **Server span**: the ingress server span (`Serve`, and the atroposd ingress
+  listener) takes the semconv name otelhttp gives it, `METHOD /route`
+  (`GET /product/{id}`) when a `ServeMux` set the request's route pattern, else
+  the method alone (`GET`). It used to carry the service name; select it by
+  `service.name` and `span.kind = server` instead.
+- **Logs** are a signal: the default `Config.Logger` writes JSON lines to
+  stdout at Info and above and tees every record, at every level (Debug
+  included), into the OTel slog bridge, so the SDK's `*Context` log calls carry
+  the request's `trace_id` and `span_id` in the log backend.
+  `OTEL_LOGS_EXPORTER=none` turns the export off; stdout stays.
+
+The span flush at shutdown flushes the logs too. A BYO `TracerProvider` turns
+all of the above off except the propagators: the SDK builds no exporter, for
+traces or logs, applies no sampler or resource, and the host owns the
+providers' shutdown.
 
 Offline is first-class: with `MANTEION_URL` unset everything works — tracing,
 `/admin/*` fault control, the cache-box endpoints — there is just no control
@@ -176,19 +220,20 @@ control-surface-only embed, e.g. a gRPC service's admin port):
 
 | Field | Default | Purpose |
 |---|---|---|
-| `Service` | — (required) | OTel `service.name`, manteion identity, metrics label |
-| `Version` | `MANTEION_SERVICE_VERSION` | OTel `service.version` + experiment attribution |
-| `Environment` | `"development"` | OTel `deployment.environment` |
+| `Service` | — (required) | OTel `service.name`, manteion identity, `service` metrics label |
+| `Version` | `MANTEION_SERVICE_VERSION` | OTel `service.version` (omitted when empty) + experiment attribution |
+| `Environment` | none (`OTEL_RESOURCE_ATTRIBUTES` may supply it) | OTel `deployment.environment.name` (omitted when empty) |
 | `Routes` | none | route inventory published at registration |
 | `Handler` | nil | the service's own routes (nil = control surface only) |
 | `ManteionURL` | `MANTEION_URL` | control-plane base URL; empty = offline |
-| `InstanceID` | `MANTEION_INSTANCE_ID` > hostname > `Service` | the ONE instance identity (register, cache-push, fidelity) |
+| `InstanceID` | `MANTEION_INSTANCE_ID` > hostname > `Service` | the ONE instance identity (register, cache-push, fidelity) and the OTel `service.instance.id` |
 | `NetworkResolver` | nil | target → (listen, upstream) for network faults |
-| `TracerProvider` | OTLP exporter | BYO provider (tests, custom OTel setups) |
-| `Logger` | `slog.Default()` | SDK logging |
+| `TracerProvider` | exporters from the `OTEL_*` environment | BYO provider (tests, custom OTel setups); also disables the SDK's log exporter, sampler and resource |
+| `LoggerProvider` | `nil` | BYO logs: the global logger provider, fed by the default logger and the decision events; honoured only with `TracerProvider` |
+| `Logger` | stdout JSON (Info+) teed into the OTel bridge | SDK logging; `*Context` calls carry `trace_id`/`span_id`. A BYO logger is used as is and bypasses the bridge |
 
 The returned `ShutdownFunc` tears down in dependency order: manteion close →
-recorder drain → final cache-push flush → OTel span flush. Idempotent.
+recorder drain → final cache-push flush → OTel span and log flush. Idempotent.
 
 ### 2. Outbound calls
 
@@ -279,7 +324,46 @@ Response headers on replay: `X-Atropos-Cache-Key`, `X-Atropos-Cache-Mode`, `X-At
 
 Cache-box covers **egress HTTP only**. Ingress and gRPC are tracked in Ongoing Development.
 
-### 6. Prometheus Metrics
+### 6. Decision events and correlation
+
+Every decision the interceptor applies is one `atropos.decision` log event
+(INFO), emitted through the OTel Logs API on the global logger provider (scope
+`git.ucsc.edu/microfaults/atropos-go/decision`; not through `Config.Logger`)
+with the context of the request it was applied to, so the record carries that
+request's `trace_id` and `span_id`. `atropos.action` says what was decided:
+`fault.start`, `fault.join` (a request joined a running background fault) or
+`cachebox.<action>` (`passthrough`, `replay`, `replay_with_delay`). The other
+attributes are `atropos.rule.name`, `atropos.reason`, `atropos.fault.id` (the
+run id; empty for a cache-box action), `atropos.injection_point`,
+`atropos.experiment.id` and `atropos.phase.id` (from the matched rule's
+cache-box context, else from the request's experiment baggage, else empty),
+and `atropos.recent.trace_ids`: up to 16 distinct trace ids among the last 256
+sampled requests the interceptor evaluated, newest first, left out when there
+are none. A sidecar's eager re-arm of a running fault emits nothing, a fault
+that fails to start emits nothing, and `MustFault`'s direct fallback (it
+bypasses the evaluator) starts an untracked fault with no event and no run id.
+
+Spans tie a fault to the requests around it. Every fault run started through
+the interceptor has an id, `atropos.fault.id`, on its fault span and on the
+span of each request that started or joined it. A background fault span links
+the request that triggered it (`atropos.link.kind=trigger`) and up to 16 of the
+last sampled requests the interceptor saw before it (`recent`, newest first);
+an eagerly armed fault has only `recent` links. A request that joins a running
+background fault carries the run id, links the fault span (`fault`) when that
+span is sampled, and is counted on it as `atropos.fault.joined`; an eager
+re-arm is not a request and is never counted. TraceQL
+`{ span.atropos.fault.id = "<id>" }` answers "which requests met this fault".
+
+Experiment baggage: once a cache-box decision whose context names an
+experiment applies to an outbound HTTP call, the SDK adds the W3C Baggage
+members `atropos.experiment_id` and `atropos.phase_id` to that call (the phase
+member is removed when the context names none), and from there they travel on
+every further hop through the downstream services' inbound baggage. They ride
+on the call whatever its destination, third-party APIs included: they are
+opaque ids, so strip them at an egress gateway if that matters. Every other
+baggage member is forwarded unchanged.
+
+### 7. Prometheus Metrics
 
 `GET /metrics` (mounted by `Serve`, outside the middleware) exposes
 `http_server_requests_total`, `http_server_request_duration_seconds`,
@@ -299,9 +383,11 @@ recorded under (the request's server or client span; none for an unsampled
 one). `/metrics` negotiates OpenMetrics: a scrape that sends
 `Accept: application/openmetrics-text` (Prometheus with exemplar storage
 enabled does) gets the exemplars; other scrapes get the classic text format
-without them.
+without them. Before `Serve` runs, the in-process baseline interceptor (what
+`EgressTransport` and `DefaultInterceptor()` resolve to until then) labels its
+counters `service=""`.
 
-### 7. atroposd: the out-of-process host
+### 8. atroposd: the out-of-process host
 
 `atroposd` hosts the same instrument core as `Serve`, one sidecar per pod,
 for services that cannot embed the Go SDK (or a Go service you want to
@@ -511,7 +597,10 @@ hostname > service name) and used verbatim in the register call, the
 cache-push envelopes and drain reports, and the fidelity endpoint — manteion
 correlates all three. Environment read by `Serve`: `MANTEION_URL`,
 `MANTEION_INSTANCE_ID`, `MANTEION_ADVERTISE_ADDR`, `MANTEION_SERVICE_VERSION`,
-`MANTEION_INIT_TIMEOUT`, plus the OTel endpoint vars above.
+`MANTEION_INIT_TIMEOUT`, and for telemetry `OTEL_TRACES_EXPORTER`,
+`OTEL_LOGS_EXPORTER`, `OTEL_EXPORTER_OTLP_*`, `COLLECTOR_SERVICE_ADDR`,
+`OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG`, `OTEL_RESOURCE_ATTRIBUTES`,
+`ATROPOS_POD_NAME` and `HOSTNAME` (see "Embed the instrument" above).
 
 ---
 
