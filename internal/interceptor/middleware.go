@@ -12,7 +12,9 @@ import (
 	inlinefault "git.ucsc.edu/microfaults/atropos-go/internal/fault/inline"
 	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/baggage"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 // HeaderFault marks a response the interceptor synthesized for an inline
@@ -20,11 +22,6 @@ import (
 // never called), so callers and tests can tell an injected error from a
 // real one.
 const HeaderFault = "X-Atropos-Fault"
-
-// workflowBaggageKey is the W3C baggage entry name used to carry per-request
-// workflow identity across service boundaries. Cache-box rules can match on
-// this to scope freezing to specific workflows (e.g. "browse" vs "checkout").
-const workflowBaggageKey = "atropos.workflow"
 
 // IngressMiddleware checks for faults on inbound HTTP requests, then -- once
 // the response is complete, whichever path produced it -- evaluates the
@@ -97,7 +94,8 @@ func (i *Interceptor) transient(r *http.Request, labels map[string]string, statu
 // EgressTransport checks for faults and cache-box operations on outbound
 // HTTP requests. When a cache-box decision matches AND the interceptor has
 // a CacheBox coordinator configured, the request is dispatched through
-// handleCacheBox (see cachebox.go). Otherwise the fault path runs and
+// handleCacheBox (see cachebox.go), carrying the decision's experiment as
+// baggage (withExperimentBaggage). Otherwise the fault path runs and
 // base.RoundTrip is called to forward the request normally.
 func (i *Interceptor) EgressTransport(base http.RoundTripper) http.RoundTripper {
 	if base == nil {
@@ -115,7 +113,7 @@ func (i *Interceptor) EgressTransport(base http.RoundTripper) http.RoundTripper 
 		// attached cache-box coordinator. If either is missing the request
 		// falls through to the fault path.
 		if decision != nil && decision.CacheBox != evaluator.CacheBoxNone && i.cacheBox != nil {
-			return i.handleCacheBox(r, base, req, decision)
+			return i.handleCacheBox(withExperimentBaggage(r, decision), base, req, decision)
 		}
 
 		// Fault path (unchanged from previous behavior, but using the split
@@ -137,6 +135,31 @@ func (i *Interceptor) EgressTransport(base http.RoundTripper) http.RoundTripper 
 
 		return base.RoundTrip(r)
 	})
+}
+
+// withExperimentBaggage returns r carrying the experiment of the cache-box
+// decision applied to it: when the decision's CacheBoxContext names an
+// experiment, a clone of r (a RoundTripper never mutates the caller's
+// request) whose context has the trace.BaggageExperimentID and
+// trace.BaggagePhaseID members set, and whose headers are re-injected from
+// that context through the global propagator. The otelhttp transport one
+// layer up already injected traceparent and baggage from the pre-decision
+// context; re-injecting rewrites baggage with the two members added (every
+// other member kept: the SDK never drops foreign baggage) and traceparent
+// with the same client span. Otherwise r itself.
+//
+// The members ride on the call whatever its destination, a third party's
+// API included: they are opaque ids, and an egress gateway is the place to
+// strip them where that matters.
+func withExperimentBaggage(r *http.Request, decision *evaluator.Decision) *http.Request {
+	c := decision.CacheBoxContext
+	if c == nil || c.ExperimentID == "" {
+		return r
+	}
+	ctx := trace.WithExperimentBaggage(r.Context(), c.ExperimentID, c.PhaseID)
+	r = r.Clone(ctx)
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(r.Header))
+	return r
 }
 
 // syntheticErrorResponse builds the response an inline error fault stands in
@@ -181,10 +204,13 @@ func extractHTTPLabels(r *http.Request) map[string]string {
 	if ua := r.UserAgent(); ua != "" {
 		labels[trace.AttrHTTPUserAgent] = ua
 	}
-	// Workflow label from W3C Baggage. The baggage key is "atropos.workflow";
-	// production deployments propagate it via meta-trace-id wiring upstream.
+	// Workflow label from W3C Baggage (trace.BaggageWorkflow), which carries
+	// per-request workflow identity across service boundaries: cache-box
+	// rules match on it to scope freezing to specific workflows (e.g.
+	// "browse" vs "checkout"). Production deployments propagate it via
+	// meta-trace-id wiring upstream.
 	if b := baggage.FromContext(r.Context()); b.Len() > 0 {
-		if m := b.Member(workflowBaggageKey); m.Key() != "" {
+		if m := b.Member(trace.BaggageWorkflow); m.Key() != "" {
 			labels[trace.AttrCacheBoxWorkflow] = m.Value()
 		}
 	}

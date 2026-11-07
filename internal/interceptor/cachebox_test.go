@@ -17,9 +17,12 @@ import (
 
 	"git.ucsc.edu/microfaults/atropos-go/internal/cachebox"
 	"git.ucsc.edu/microfaults/atropos-go/internal/evaluator"
+	"git.ucsc.edu/microfaults/atropos-go/internal/fault/inline"
 	"git.ucsc.edu/microfaults/atropos-go/internal/trace"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/baggage"
+	"go.opentelemetry.io/otel/propagation"
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
@@ -844,5 +847,141 @@ func TestHandleCacheBox_DecisionEventWithoutContextCarriesTheRequestSpan(t *test
 	check := findSpan(t, exp.GetSpans(), trace.SpanCacheBoxCheck)
 	if got.SpanID() != call.SpanContext().SpanID() || got.SpanID() == check.SpanContext.SpanID() {
 		t.Fatalf("record span = %s, want the egress call's %s (the cache-box span is %s)", got.SpanID(), call.SpanContext().SpanID(), check.SpanContext.SpanID())
+	}
+}
+
+// installStandardPropagator registers the propagator initTelemetry
+// registers: W3C trace context and W3C baggage, nothing filtered.
+func installStandardPropagator(t *testing.T) {
+	t.Helper()
+	prev := otel.GetTextMapPropagator()
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+	t.Cleanup(func() { otel.SetTextMapPropagator(prev) })
+}
+
+// headerRecorder is a base transport that records the headers it was sent.
+func headerRecorder(seen *http.Header) roundTripperFunc {
+	return func(r *http.Request) (*http.Response, error) {
+		*seen = r.Header.Clone()
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("ok"))}, nil
+	}
+}
+
+// parseBaggage parses a baggage header, failing the test on a malformed one.
+func parseBaggage(t *testing.T, h string) baggage.Baggage {
+	t.Helper()
+	b, err := baggage.Parse(h)
+	if err != nil {
+		t.Fatalf("baggage header %q: %v", h, err)
+	}
+	return b
+}
+
+// Once a cache-box decision with an experiment applies, the upstream call
+// carries atropos.experiment_id and atropos.phase_id, and traceparent names
+// the same span the request's context does. The caller's request is never
+// mutated (RoundTripper contract).
+func TestEgressTransport_InjectsExperimentBaggage(t *testing.T) {
+	installStandardPropagator(t)
+	i, _ := newTestInterceptor(t, cacheBoxRuleWithPhase("dep", evaluator.CacheBoxPassthrough, "exp-1", "ph-1"))
+	var seen http.Header
+	ctx := spanIn(3, 4)
+	req := httptest.NewRequest("GET", "http://dep/x", nil).WithContext(ctx)
+	resp, err := i.EgressTransport(headerRecorder(&seen)).RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	b := parseBaggage(t, seen.Get("baggage"))
+	if b.Member(trace.BaggageExperimentID).Value() != "exp-1" || b.Member(trace.BaggagePhaseID).Value() != "ph-1" {
+		t.Fatalf("upstream baggage = %q", seen.Get("baggage"))
+	}
+	sc := oteltrace.SpanContextFromContext(ctx)
+	if want := "00-" + sc.TraceID().String() + "-" + sc.SpanID().String() + "-01"; seen.Get("traceparent") != want {
+		t.Fatalf("upstream traceparent = %q, want %q", seen.Get("traceparent"), want)
+	}
+	if len(req.Header) != 0 {
+		t.Fatalf("the caller's request was mutated: %v", req.Header)
+	}
+}
+
+// Ruling 6 / Review Focus 3, at the transport: a foreign member already in
+// the request's baggage reaches the upstream unchanged, properties included,
+// alongside the two atropos members.
+func TestEgressTransport_ForeignBaggagePreserved(t *testing.T) {
+	installStandardPropagator(t)
+	i, _ := newTestInterceptor(t, cacheBoxRuleWithPhase("dep", evaluator.CacheBoxPassthrough, "exp-1", "ph-1"))
+	var seen http.Header
+	in := parseBaggage(t, "tenant=acme;region=eu")
+	req := httptest.NewRequest("GET", "http://dep/x", nil).WithContext(baggage.ContextWithBaggage(context.Background(), in))
+	resp, err := i.EgressTransport(headerRecorder(&seen)).RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	b := parseBaggage(t, seen.Get("baggage"))
+	if b.Member("tenant").String() != "tenant=acme;region=eu" || b.Member(trace.BaggageExperimentID).Value() != "exp-1" || b.Member(trace.BaggagePhaseID).Value() != "ph-1" || b.Len() != 3 {
+		t.Fatalf("upstream baggage = %q", seen.Get("baggage"))
+	}
+}
+
+// Nothing is injected when no cache-box decision with an experiment applies:
+// a cache-box rule without a context, and an egress call no rule matches,
+// leave the request's headers as the caller built them.
+func TestEgressTransport_NoExperimentNoInjection(t *testing.T) {
+	installStandardPropagator(t)
+	for name, rule := range map[string]evaluator.StaticRule{
+		"no context":  cacheBoxRule("dep", evaluator.CacheBoxPassthrough),
+		"no decision": cacheBoxRuleWithPhase("other", evaluator.CacheBoxPassthrough, "exp-1", "ph-1"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			i, _ := newTestInterceptor(t, rule)
+			var seen http.Header
+			resp, err := i.EgressTransport(headerRecorder(&seen)).RoundTrip(httptest.NewRequest("GET", "http://dep/x", nil).WithContext(spanIn(3, 4)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if seen.Get("baggage") != "" || seen.Get("traceparent") != "" {
+				t.Fatalf("upstream headers = %v, want nothing injected", seen)
+			}
+		})
+	}
+}
+
+// A decision without a CacheBoxContext attributes its event to the
+// experiment the request's baggage names (set by the service upstream).
+func TestEgressTransport_FaultDecisionEventFallsBackToBaggage(t *testing.T) {
+	rec := installDecisionRecorder(t)
+	i := New(&mockEvaluator{decision: &evaluator.Decision{Name: "lat", Fault: &inline.Latency{Delay: time.Millisecond}, Mode: evaluator.Inline, Reason: "compiled"}}, trace.Noop())
+	base := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: http.NoBody}, nil
+	})
+	req := httptest.NewRequest("GET", "http://dep/x", nil).WithContext(trace.WithExperimentBaggage(context.Background(), "exp-7", "ph-3"))
+	if _, err := i.EgressTransport(base).RoundTrip(req); err != nil {
+		t.Fatal(err)
+	}
+	recs := decisionRecords(rec)
+	if len(recs) != 1 || attrString(recs[0].Attributes, trace.AttrExperimentID) != "exp-7" || attrString(recs[0].Attributes, trace.AttrPhaseID) != "ph-3" {
+		t.Fatalf("records = %+v", recs)
+	}
+}
+
+// The decision's own CacheBoxContext wins over the request's baggage.
+func TestHandleCacheBox_DecisionContextWinsOverBaggage(t *testing.T) {
+	rec := installDecisionRecorder(t)
+	i, _ := newTestInterceptor(t, cacheBoxRuleWithPhase("dep", evaluator.CacheBoxPassthrough, "exp-1", "ph-1"))
+	base := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("ok"))}, nil
+	})
+	req := httptest.NewRequest("GET", "http://dep/x", nil).WithContext(trace.WithExperimentBaggage(context.Background(), "exp-up", "ph-up"))
+	resp, err := i.EgressTransport(base).RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	recs := decisionRecords(rec)
+	if len(recs) != 1 || attrString(recs[0].Attributes, trace.AttrExperimentID) != "exp-1" || attrString(recs[0].Attributes, trace.AttrPhaseID) != "ph-1" {
+		t.Fatalf("records = %+v", recs)
 	}
 }

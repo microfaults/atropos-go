@@ -260,7 +260,7 @@ func (i *Interceptor) emitDecision(ctx context.Context, req evaluator.Request, d
 	if !trace.DecisionEnabledOn(ctx, logger) {
 		return
 	}
-	experimentID, phaseID := decisionExperiment(decision)
+	experimentID, phaseID := decisionExperiment(ctx, decision)
 	trace.EmitDecisionTo(ctx, logger, trace.Decision{
 		RuleName:       decision.Name,
 		Reason:         decision.Reason,
@@ -275,12 +275,15 @@ func (i *Interceptor) emitDecision(ctx context.Context, req evaluator.Request, d
 
 // decisionExperiment names the experiment and phase a decision event is
 // attributed to -- the one place the event resolves them: the matched
-// rule's CacheBoxContext, when the decision carries one; none otherwise.
-func decisionExperiment(decision *evaluator.Decision) (experimentID, phaseID string) {
+// rule's CacheBoxContext, when the decision carries one; otherwise the
+// trace.BaggageExperimentID and trace.BaggagePhaseID members of the
+// request's baggage (set by an upstream service's cache-box decision), or
+// none.
+func decisionExperiment(ctx context.Context, decision *evaluator.Decision) (experimentID, phaseID string) {
 	if c := decision.CacheBoxContext; c != nil {
 		return c.ExperimentID, c.PhaseID
 	}
-	return "", ""
+	return trace.ExperimentFromContext(ctx)
 }
 
 // startDirect is the inline-fault path. It mints the run's id, creates a
