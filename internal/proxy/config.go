@@ -31,7 +31,8 @@ type IngressListener struct {
 
 // Config configures a Proxy.
 type Config struct {
-	// Service labels metrics and names the otelhttp server span.
+	// Service labels metrics and is the otelhttp handler's operation; the
+	// server span itself takes the semconv "METHOD" name.
 	Service string
 	// Resolve returns the interceptor every request is dispatched through.
 	// Called per egress round-trip and once for the ingress listener.

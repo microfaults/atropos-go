@@ -26,50 +26,54 @@ func (e *testEvaluator) Evaluate(_ context.Context, _ evaluator.Request) *evalua
 	return e.decision
 }
 
+// The server span takes otelhttp's semconv name: the method alone, or
+// "METHOD /route" when a ServeMux in front of the middleware set the
+// request's route pattern. It is no longer named after the service.
 func TestIngressMiddleware_CreatesSpans(t *testing.T) {
-	exporter := tracetest.NewInMemoryExporter()
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithSyncer(exporter),
-		sdktrace.WithSampler(sdktrace.AlwaysSample()),
-	)
-	otel.SetTracerProvider(tp)
-	defer tp.Shutdown(context.Background())
-
-	// No faults, just span creation.
-	i := interceptor.New(nil, trace.NewOTelTracer())
-
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-
-	handler := ingressMiddleware(inner, "test-service", i)
-
-	req := httptest.NewRequest("GET", "/api/health", nil)
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", rec.Code)
+	cases := []struct {
+		name    string
+		handler func(http.Handler) http.Handler
+		want    string
+	}{
+		{"no route pattern", func(h http.Handler) http.Handler { return h }, "GET"},
+		{"route pattern", func(h http.Handler) http.Handler {
+			mux := http.NewServeMux()
+			mux.Handle("GET /api/{name}", h)
+			return mux
+		}, "GET /api/{name}"},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			exporter := tracetest.NewInMemoryExporter()
+			tp := sdktrace.NewTracerProvider(
+				sdktrace.WithSyncer(exporter),
+				sdktrace.WithSampler(sdktrace.AlwaysSample()),
+			)
+			otel.SetTracerProvider(tp)
+			defer tp.Shutdown(context.Background())
 
-	spans := exporter.GetSpans()
-	if len(spans) == 0 {
-		t.Fatal("expected at least one span from otelhttp")
-	}
+			// No faults, just span creation.
+			i := interceptor.New(nil, trace.NewOTelTracer())
+			handler := tc.handler(ingressMiddleware(inner, "test-service", i))
 
-	// Should have an otelhttp span named "test-service".
-	found := false
-	for _, s := range spans {
-		if s.Name == "test-service" {
-			found = true
-		}
-	}
-	if !found {
-		names := make([]string, len(spans))
-		for i, s := range spans {
-			names[i] = s.Name
-		}
-		t.Fatalf("expected otelhttp span named 'test-service', got spans: %v", names)
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest("GET", "/api/health", nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d", rec.Code)
+			}
+
+			spans := exporter.GetSpans()
+			names := make([]string, len(spans))
+			for k, s := range spans {
+				names[k] = s.Name
+			}
+			if len(spans) != 1 || spans[0].Name != tc.want {
+				t.Fatalf("server spans = %v, want one named %q", names, tc.want)
+			}
+		})
 	}
 }
 
