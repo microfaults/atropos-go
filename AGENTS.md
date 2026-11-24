@@ -35,7 +35,8 @@ go test -count=1 ./...          # also: make test
 go test -race -count=1 ./...    # CI runs this on main/develop only
 ```
 
-- OpenAPI: `GOTOOLCHAIN=go1.25.5 make openapi` regenerates `docs/swagger.{yaml,json}`; `make openapi-check` regenerates and fails on a diff. It needs `swag` v2.0.0-rc5 (`go install github.com/swaggo/swag/v2/cmd/swag@v2.0.0-rc5`) and python3 with PyYAML. The `GOTOOLCHAIN` pin matters because swag rc5 cannot parse the Go 1.27 standard library and this Mac has Go 1.27.
+- The module targets Go 1.27 (`go 1.27.3` in `go.mod`); CI and the Dockerfiles use `golang:1.27` images. A consumer that re-pins this tree needs Go 1.27.3 or newer.
+- OpenAPI: `make openapi` regenerates `docs/swagger.{yaml,json}`; `make openapi-check` regenerates and fails on a diff against the index. It needs `swag` v2.0.0-rc6 built with Go 1.27 (`go install github.com/swaggo/swag/v2/cmd/swag@v2.0.0-rc6`) and python3 with PyYAML. A swag binary built with an older Go cannot parse the Go 1.27 standard library.
 - The CI job `go-integration` clones manteion-go `develop` and builds it against this tree. That is the old push-era manteion, not `feat/atropos-daemon`, so a green job says nothing about the branch that consumes this protocol.
 
 ## Where the code misleads

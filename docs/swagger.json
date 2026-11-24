@@ -2,7 +2,6 @@
     "components": {
         "schemas": {
             "atropos.CacheBoxContext": {
-                "description": "CacheBoxContext, when present, is authoritative end-to-end (design\ndoc Q3): its KeyStrategy/KeyHeaders/MissStatus take precedence over\nCacheBoxKeyStrategy and the CacheBox's construction-time default.\nPopulated at rule-match time from the matched rule's compiled\ncache-box context (or the freeze command's, for the freeze path).",
                 "properties": {
                     "experiment_id": {
                         "type": "string"
@@ -512,7 +511,6 @@
                 "type": "object"
             },
             "atropos.ReplaySetRef": {
-                "description": "ReplaySet is the replay set desired on this instance: absent means no replay\nset is desired, so the instance clears one it holds. Present, it names the\nset to pull: ExperimentID and PhaseID are the (experiment, phase) pair it\nis installed under (the cache-box serves it only to the rule whose context\nmatches that pair), ID is `sha256:<hex>` of the artifact bytes fetched from\nURL, and SHA256 is the W5 digest over its entries.",
                 "properties": {
                     "count": {
                         "type": "integer"
@@ -572,7 +570,8 @@
                         "$ref": "#/components/schemas/atropos.DelayRequest"
                     },
                     "replay_set": {
-                        "$ref": "#/components/schemas/atropos.ReplaySetRef"
+                        "$ref": "#/components/schemas/atropos.ReplaySetRef",
+                        "description": "ReplaySet is the replay set desired on this instance: absent means no replay\nset is desired, so the instance clears one it holds. Present, it names the\nset to pull: ExperimentID and PhaseID are the (experiment, phase) pair it\nis installed under (the cache-box serves it only to the rule whose context\nmatches that pair), ID is `sha256:<hex>` of the artifact bytes fetched from\nURL, and SHA256 is the W5 digest over its entries."
                     },
                     "rules": {
                         "items": {
@@ -591,7 +590,8 @@
             "atropos.StaticRule": {
                 "properties": {
                     "decision": {
-                        "$ref": "#/components/schemas/evaluator.Decision"
+                        "$ref": "#/components/schemas/evaluator.Decision",
+                        "description": "returned on match (copied, not aliased)"
                     },
                     "labels": {
                         "additionalProperties": {
@@ -655,7 +655,6 @@
                 "type": "object"
             },
             "cachebox.CacheBoxContext": {
-                "description": "CacheBoxContext, when present, is authoritative end-to-end (design\ndoc Q3): its KeyStrategy/KeyHeaders/MissStatus take precedence over\nCacheBoxKeyStrategy and the CacheBox's construction-time default.\nPopulated at rule-match time from the matched rule's compiled\ncache-box context (or the freeze command's, for the freeze path).",
                 "properties": {
                     "experiment_id": {
                         "type": "string"
@@ -828,13 +827,13 @@
                 ]
             },
             "evaluator.Decision": {
-                "description": "returned on match (copied, not aliased)",
                 "properties": {
                     "cacheBox": {
                         "$ref": "#/components/schemas/evaluator.CacheBoxAction"
                     },
                     "cacheBoxContext": {
-                        "$ref": "#/components/schemas/cachebox.CacheBoxContext"
+                        "$ref": "#/components/schemas/cachebox.CacheBoxContext",
+                        "description": "CacheBoxContext, when present, is authoritative end-to-end (design\ndoc Q3): its KeyStrategy/KeyHeaders/MissStatus take precedence over\nCacheBoxKeyStrategy and the CacheBox's construction-time default.\nPopulated at rule-match time from the matched rule's compiled\ncache-box context (or the freeze command's, for the freeze path)."
                     },
                     "cacheBoxKeyStrategy": {
                         "description": "legacy, construction-time-only hint; empty = default. Superseded by CacheBoxContext when present.",
@@ -976,16 +975,9 @@
                     "content": {
                         "application/json": {
                             "schema": {
-                                "oneOf": [
-                                    {
-                                        "type": "object"
-                                    },
-                                    {
-                                        "$ref": "#/components/schemas/atropos.DelayRequest",
-                                        "summary": "delay",
-                                        "description": "delay distribution"
-                                    }
-                                ]
+                                "$ref": "#/components/schemas/atropos.DelayRequest",
+                                "summary": "delay",
+                                "description": "delay distribution"
                             }
                         }
                     },
@@ -1086,16 +1078,9 @@
                     "content": {
                         "application/json": {
                             "schema": {
-                                "oneOf": [
-                                    {
-                                        "type": "object"
-                                    },
-                                    {
-                                        "$ref": "#/components/schemas/atropos.FaultRequest",
-                                        "summary": "fault",
-                                        "description": "fault request"
-                                    }
-                                ]
+                                "$ref": "#/components/schemas/atropos.FaultRequest",
+                                "summary": "fault",
+                                "description": "fault request"
                             }
                         }
                     },
@@ -1178,18 +1163,11 @@
                     "content": {
                         "application/json": {
                             "schema": {
-                                "oneOf": [
-                                    {
-                                        "type": "object"
-                                    },
-                                    {
-                                        "items": {
-                                            "$ref": "#/components/schemas/atropos.CompiledRule"
-                                        },
-                                        "title": "rules",
-                                        "type": "array"
-                                    }
-                                ]
+                                "items": {
+                                    "$ref": "#/components/schemas/atropos.CompiledRule"
+                                },
+                                "title": "rules",
+                                "type": "array"
                             }
                         }
                     },
@@ -1350,16 +1328,9 @@
                     "content": {
                         "application/json": {
                             "schema": {
-                                "oneOf": [
-                                    {
-                                        "type": "object"
-                                    },
-                                    {
-                                        "$ref": "#/components/schemas/atropos.StatusReport",
-                                        "summary": "status",
-                                        "description": "what the instance holds"
-                                    }
-                                ]
+                                "$ref": "#/components/schemas/atropos.StatusReport",
+                                "summary": "status",
+                                "description": "what the instance holds"
                             }
                         }
                     },
@@ -1444,16 +1415,9 @@
                     "content": {
                         "application/json": {
                             "schema": {
-                                "oneOf": [
-                                    {
-                                        "type": "object"
-                                    },
-                                    {
-                                        "$ref": "#/components/schemas/atropos.PreloadAbortRequest",
-                                        "summary": "abort",
-                                        "description": "preload abort"
-                                    }
-                                ]
+                                "$ref": "#/components/schemas/atropos.PreloadAbortRequest",
+                                "summary": "abort",
+                                "description": "preload abort"
                             }
                         }
                     },
@@ -1488,16 +1452,9 @@
                     "content": {
                         "application/json": {
                             "schema": {
-                                "oneOf": [
-                                    {
-                                        "type": "object"
-                                    },
-                                    {
-                                        "$ref": "#/components/schemas/atropos.PreloadBeginRequest",
-                                        "summary": "begin",
-                                        "description": "preload begin"
-                                    }
-                                ]
+                                "$ref": "#/components/schemas/atropos.PreloadBeginRequest",
+                                "summary": "begin",
+                                "description": "preload begin"
                             }
                         }
                     },
@@ -1559,16 +1516,9 @@
                     "content": {
                         "application/json": {
                             "schema": {
-                                "oneOf": [
-                                    {
-                                        "type": "object"
-                                    },
-                                    {
-                                        "$ref": "#/components/schemas/atropos.PreloadChunkRequest",
-                                        "summary": "chunk",
-                                        "description": "preload chunk"
-                                    }
-                                ]
+                                "$ref": "#/components/schemas/atropos.PreloadChunkRequest",
+                                "summary": "chunk",
+                                "description": "preload chunk"
                             }
                         }
                     },
@@ -1630,16 +1580,9 @@
                     "content": {
                         "application/json": {
                             "schema": {
-                                "oneOf": [
-                                    {
-                                        "type": "object"
-                                    },
-                                    {
-                                        "$ref": "#/components/schemas/atropos.PreloadCommitRequest",
-                                        "summary": "commit",
-                                        "description": "preload commit"
-                                    }
-                                ]
+                                "$ref": "#/components/schemas/atropos.PreloadCommitRequest",
+                                "summary": "commit",
+                                "description": "preload commit"
                             }
                         }
                     },

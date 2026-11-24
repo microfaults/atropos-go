@@ -6,7 +6,7 @@
 #
 # Requirements:
 #   - swag v2 binary on PATH; install with:
-#       go install github.com/swaggo/swag/v2/cmd/swag@v2.0.0-rc5
+#       go install github.com/swaggo/swag/v2/cmd/swag@v2.0.0-rc6
 #   - python3 with pyyaml for scripts/strip-empty-externaldocs.py
 
 .PHONY: openapi openapi-check test build

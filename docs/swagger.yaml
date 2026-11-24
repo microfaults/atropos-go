@@ -1,15 +1,6 @@
 components:
   schemas:
     atropos.CacheBoxContext:
-      description: 'CacheBoxContext, when present, is authoritative end-to-end (design
-
-        doc Q3): its KeyStrategy/KeyHeaders/MissStatus take precedence over
-
-        CacheBoxKeyStrategy and the CacheBox''s construction-time default.
-
-        Populated at rule-match time from the matched rule''s compiled
-
-        cache-box context (or the freeze command''s, for the freeze path).'
       properties:
         experiment_id:
           type: string
@@ -377,18 +368,6 @@ components:
           type: boolean
       type: object
     atropos.ReplaySetRef:
-      description: 'ReplaySet is the replay set desired on this instance: absent means
-        no replay
-
-        set is desired, so the instance clears one it holds. Present, it names the
-
-        set to pull: ExperimentID and PhaseID are the (experiment, phase) pair it
-
-        is installed under (the cache-box serves it only to the rule whose context
-
-        matches that pair), ID is `sha256:<hex>` of the artifact bytes fetched from
-
-        URL, and SHA256 is the W5 digest over its entries.'
       properties:
         count:
           type: integer
@@ -440,6 +419,21 @@ components:
           $ref: '#/components/schemas/atropos.DelayRequest'
         replay_set:
           $ref: '#/components/schemas/atropos.ReplaySetRef'
+          description: 'ReplaySet is the replay set desired on this instance: absent
+            means no replay
+
+            set is desired, so the instance clears one it holds. Present, it names
+            the
+
+            set to pull: ExperimentID and PhaseID are the (experiment, phase) pair
+            it
+
+            is installed under (the cache-box serves it only to the rule whose context
+
+            matches that pair), ID is `sha256:<hex>` of the artifact bytes fetched
+            from
+
+            URL, and SHA256 is the W5 digest over its entries.'
         rules:
           items:
             $ref: '#/components/schemas/atropos.CompiledRule'
@@ -453,6 +447,7 @@ components:
       properties:
         decision:
           $ref: '#/components/schemas/evaluator.Decision'
+          description: returned on match (copied, not aliased)
         labels:
           additionalProperties:
             type: string
@@ -494,15 +489,6 @@ components:
           type: string
       type: object
     cachebox.CacheBoxContext:
-      description: 'CacheBoxContext, when present, is authoritative end-to-end (design
-
-        doc Q3): its KeyStrategy/KeyHeaders/MissStatus take precedence over
-
-        CacheBoxKeyStrategy and the CacheBox''s construction-time default.
-
-        Populated at rule-match time from the matched rule''s compiled
-
-        cache-box context (or the freeze command''s, for the freeze path).'
       properties:
         experiment_id:
           type: string
@@ -618,12 +604,21 @@ components:
       - CacheBoxReplay
       - CacheBoxReplayDelay
     evaluator.Decision:
-      description: returned on match (copied, not aliased)
       properties:
         cacheBox:
           $ref: '#/components/schemas/evaluator.CacheBoxAction'
         cacheBoxContext:
           $ref: '#/components/schemas/cachebox.CacheBoxContext'
+          description: 'CacheBoxContext, when present, is authoritative end-to-end
+            (design
+
+            doc Q3): its KeyStrategy/KeyHeaders/MissStatus take precedence over
+
+            CacheBoxKeyStrategy and the CacheBox''s construction-time default.
+
+            Populated at rule-match time from the matched rule''s compiled
+
+            cache-box context (or the freeze command''s, for the freeze path).'
         cacheBoxKeyStrategy:
           description: legacy, construction-time-only hint; empty = default. Superseded
             by CacheBoxContext when present.
@@ -743,11 +738,9 @@ paths:
         content:
           application/json:
             schema:
-              oneOf:
-              - type: object
-              - $ref: '#/components/schemas/atropos.DelayRequest'
-                description: delay distribution
-                summary: delay
+              $ref: '#/components/schemas/atropos.DelayRequest'
+              description: delay distribution
+              summary: delay
         description: delay distribution
         required: true
       responses:
@@ -811,11 +804,9 @@ paths:
         content:
           application/json:
             schema:
-              oneOf:
-              - type: object
-              - $ref: '#/components/schemas/atropos.FaultRequest'
-                description: fault request
-                summary: fault
+              $ref: '#/components/schemas/atropos.FaultRequest'
+              description: fault request
+              summary: fault
         description: fault request
         required: true
       responses:
@@ -879,12 +870,10 @@ paths:
         content:
           application/json:
             schema:
-              oneOf:
-              - type: object
-              - items:
-                  $ref: '#/components/schemas/atropos.CompiledRule'
-                title: rules
-                type: array
+              items:
+                $ref: '#/components/schemas/atropos.CompiledRule'
+              title: rules
+              type: array
         description: replacement rules (null clears the set)
         required: true
       responses:
@@ -1005,11 +994,9 @@ paths:
         content:
           application/json:
             schema:
-              oneOf:
-              - type: object
-              - $ref: '#/components/schemas/atropos.StatusReport'
-                description: what the instance holds
-                summary: status
+              $ref: '#/components/schemas/atropos.StatusReport'
+              description: what the instance holds
+              summary: status
         description: what the instance holds
         required: true
       responses:
@@ -1063,11 +1050,9 @@ paths:
         content:
           application/json:
             schema:
-              oneOf:
-              - type: object
-              - $ref: '#/components/schemas/atropos.PreloadAbortRequest'
-                description: preload abort
-                summary: abort
+              $ref: '#/components/schemas/atropos.PreloadAbortRequest'
+              description: preload abort
+              summary: abort
         description: preload abort
         required: true
       responses:
@@ -1090,11 +1075,9 @@ paths:
         content:
           application/json:
             schema:
-              oneOf:
-              - type: object
-              - $ref: '#/components/schemas/atropos.PreloadBeginRequest'
-                description: preload begin
-                summary: begin
+              $ref: '#/components/schemas/atropos.PreloadBeginRequest'
+              description: preload begin
+              summary: begin
         description: preload begin
         required: true
       responses:
@@ -1133,11 +1116,9 @@ paths:
         content:
           application/json:
             schema:
-              oneOf:
-              - type: object
-              - $ref: '#/components/schemas/atropos.PreloadChunkRequest'
-                description: preload chunk
-                summary: chunk
+              $ref: '#/components/schemas/atropos.PreloadChunkRequest'
+              description: preload chunk
+              summary: chunk
         description: preload chunk
         required: true
       responses:
@@ -1177,11 +1158,9 @@ paths:
         content:
           application/json:
             schema:
-              oneOf:
-              - type: object
-              - $ref: '#/components/schemas/atropos.PreloadCommitRequest'
-                description: preload commit
-                summary: commit
+              $ref: '#/components/schemas/atropos.PreloadCommitRequest'
+              description: preload commit
+              summary: commit
         description: preload commit
         required: true
       responses:

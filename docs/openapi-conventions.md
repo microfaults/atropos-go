@@ -4,10 +4,10 @@ All admin handlers in this repo are annotated with [swaggo/swag](https://github.
 
 ## Toolchain
 
-- `swag` v2.0.0-rc5 is pinned. Install with `go install github.com/swaggo/swag/v2/cmd/swag@v2.0.0-rc5`.
+- `swag` v2.0.0-rc6 is pinned. Install with `go install github.com/swaggo/swag/v2/cmd/swag@v2.0.0-rc6`.
 - The generated spec is committed at `docs/swagger.{yaml,json}` and validated in CI with `make openapi-check`.
 - `scripts/strip-empty-externaldocs.py` removes empty `externalDocs` stubs emitted by current swag v2 builds.
-- swag v2 cannot parse the Go 1.27 standard library (`make openapi` fails in `math/rand/v2` there), so regenerate with the module's Go 1.25 toolchain: `GOTOOLCHAIN=go1.25.5 make openapi`.
+- Build swag with Go 1.27, the module's Go version: a swag binary built with an older Go cannot parse the Go 1.27 standard library (`make openapi` fails in `math/rand/v2`). Regenerate with `make openapi`.
 - swag emits only the schemas an annotated operation reaches, so a wire type no route carries is absent from the spec however it is annotated.
 
 ## Required annotations

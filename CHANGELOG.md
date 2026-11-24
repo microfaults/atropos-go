@@ -4,6 +4,12 @@ All notable changes to atropos-go are documented in this file.
 
 ## Unreleased
 
+### Changed — Go 1.27 and dependencies
+
+- **Go 1.27.** `go.mod` declares `go 1.27.3`; CI, the agent and sidecar Dockerfiles and the PoC Dockerfiles build on `golang:1.27` images. A consumer that pins this tree needs Go 1.27.3 or newer.
+- **Dependencies.** OpenTelemetry 1.47.0 (contrib 0.72.0, `otelconf` 0.27.0, `otelslog` 0.21.0; `otel/log` and `otel/sdk/log` at 1.47.0, the log exporters and `logtest` at 0.23.0), `client_golang` 1.25.0, `client_model` 0.6.3, `grpc` 1.85.0, `x/sys` 0.50.0.
+- **OpenAPI.** swag is pinned at v2.0.0-rc6. The regenerated spec gives request bodies as a plain `$ref` (or array schema) instead of a `oneOf` with an empty object, and attaches the doc comments of `ReplaySet`, `Decision` and `CacheBoxContext` fields to the referencing properties instead of the referenced schemas.
+
 ### Added — Node-agent netem (packet loss, kernel latency)
 
 - **`packet_loss` network fault** (`params: {"loss", "correlation"}`, percent) and **`mechanism: "netem"` on network `latency`**: both run as `tc netem` in the pod's network namespace, through the node agent, from the atroposd sidecar only. `packet_loss` is always netem; latency without the mechanism stays the proxy toxic.
@@ -79,7 +85,7 @@ The in-process host (`Serve`) and the atroposd sidecar converge on manteion's ma
 
 ### Docs
 
-- OpenAPI (`docs/swagger.{yaml,json}`) regenerated: `POST /admin/rules` documents its `204`/`400`/`422`/`500` answers, `GET /admin/cachebox` the delay state, and a `manteion-protocol` tag lists the desired-state poll (`GET /api/v1/sdk/rules`) and status report (`POST /api/v1/sdk/status`) the SDK calls (manteion serves them). Regenerate with `GOTOOLCHAIN=go1.25.5 make openapi`: swag v2 cannot parse the Go 1.27 standard library.
+- OpenAPI (`docs/swagger.{yaml,json}`) regenerated: `POST /admin/rules` documents its `204`/`400`/`422`/`500` answers, `GET /admin/cachebox` the delay state, and a `manteion-protocol` tag lists the desired-state poll (`GET /api/v1/sdk/rules`) and status report (`POST /api/v1/sdk/status`) the SDK calls (manteion serves them). Regenerate with `make openapi` and swag v2.0.0-rc6 built with Go 1.27.
 - `docs/plans/2026-05-17-concurrent-multi-fault-execution.md` — design note covering the current single-decision-per-`Evaluate` limitation and the three changes needed for true concurrent multi-fault execution (eager arming, per-slot lifecycle, slot-aware registry keys). Referenced from `DemoEvaluator.Evaluate` doc comment.
 
 ### Changed — fault wire format and rename

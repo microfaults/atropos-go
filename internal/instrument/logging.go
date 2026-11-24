@@ -36,8 +36,8 @@ func orDefault(l *slog.Logger) *slog.Logger {
 }
 
 // teeHandler sends each record to every handler behind it that is enabled at
-// the record's level. It stands in for slog.NewMultiHandler, which arrives in
-// Go 1.26, above this module's Go 1.25 floor.
+// the record's level. It behaves like slog.NewMultiHandler (Go 1.26), which
+// this module's Go version allows; switching to it is an open cleanup.
 type teeHandler struct{ handlers []slog.Handler }
 
 func newTeeHandler(handlers ...slog.Handler) slog.Handler {
