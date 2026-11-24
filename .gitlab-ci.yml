@@ -4,41 +4,19 @@
 # Stages:
 #   check   — Go build, vet, fmt, test, race detection
 #   release — Manual version tagging on main / alpha on develop
-#   review  — AI code review (schedule/manual/trigger only)
 #
 # Required CI/CD variables (Settings > CI/CD > Variables):
-#   ANTHROPIC_API_KEY    — Anthropic API key                    [if LLM_PROVIDER=claude]
-#   GOOGLE_API_KEY       — Google AI API key                    [if LLM_PROVIDER=gemini]
 #   RELEASE_PUSH_TOKEN   — Project access token, write_repository scope.
 #                          Used by release-tag and release-alpha to push the
 #                          newly-created tag back to origin. Mark as Protected
 #                          + Masked. Role must satisfy any Protected-Tags rule
 #                          on `v*` (typically Developer; Maintainer if the
 #                          protection is restricted to maintainers only).
-#
-# Optional:
-#   GITLAB_API_TOKEN  — Project access token (api scope); enables commit comments
-#   LLM_PROVIDER      — "claude" (default) or "gemini"
-#   LLM_MODEL         — Override model ID
-#   REVIEW_PROMPT     — Extra review instructions
-#   FROM_COMMIT / TO_COMMIT — Manual review range
-#   REVIEW_HOURS      — Hours to look back (default: 24)
-#   MAX_DIFF_CHARS    — Max diff chars (default: 120000)
 # ---------------------------------------------------------------------------
-
-variables:
-  LLM_PROVIDER: "claude"
-  LLM_MODEL: ""
-  REVIEW_PROMPT: ""
-  FROM_COMMIT: ""
-  TO_COMMIT: "HEAD"
-  REVIEW_HOURS: "24"
-  MAX_DIFF_CHARS: "120000"
 
 stages:
   - check
   - release
-  - review
 
 # ---------------------------------------------------------------------------
 # Go verification
@@ -178,30 +156,3 @@ release-alpha:
   artifacts:
     reports:
       dotenv: release.env
-
-# ---------------------------------------------------------------------------
-# AI code review (schedule/manual/trigger only)
-# ---------------------------------------------------------------------------
-
-ai-review:
-  stage: review
-  image: python:3.12-slim
-  allow_failure: true
-  retry:
-    max: 2
-    when: script_failure
-  timeout: 15m
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule"'
-    - if: '$CI_PIPELINE_SOURCE == "web"'
-    - if: '$CI_PIPELINE_SOURCE == "trigger"'
-  artifacts:
-    name: "ai-review-$CI_COMMIT_SHORT_SHA"
-    paths:
-      - review-output/
-    expire_in: 30 days
-    when: always
-  before_script:
-    - apt-get update -qq && apt-get install -y -qq git > /dev/null
-  script:
-    - python3 scripts/ai-review.py
