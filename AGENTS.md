@@ -52,7 +52,7 @@ go test -race -count=1 ./...    # CI runs this on main/develop only
 - The protocol contract `docs/plans/2026-10-30-desired-state-protocol.md` is wrong in two places: §4 says the kill switch writes a killed flag (manteion has none; it disables the service's rules and cancels its fault configs), and §5 says the bed vendors the SDK and upgrades together with it (not true today, see above).
 - The README's "Current State" table says "shipped on `main`"; it describes this unmerged `feat/atroposd` branch.
 - Metric names (`atropos_cachebox_hits_total`, `atropos_cachebox_misses_total`, `http_server_*`, ...) are what the Grafana dashboards in `service-beds/observability/` query. Renaming one breaks a dashboard silently.
-- Everything in `docs/plans/` except the protocol contract is an executed plan, kept as history. `.agent/rules/sdk-rules.md` is the original project-intention note, not current rules.
+- Everything in `docs/plans/` except the protocol contract is an executed plan, kept as history.
 
 ## Conventions
 
