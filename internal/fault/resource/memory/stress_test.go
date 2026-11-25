@@ -2,6 +2,9 @@ package memory
 
 import (
 	"context"
+	"runtime/metrics"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -219,6 +222,113 @@ func TestStress_AutoDetectMemory(t *testing.T) {
 		t.Fatalf("expected at least 1 chunk, got %d", d.ChunksAllocated)
 	}
 	t.Logf("chunks=%d, peak=%d bytes, target=%d bytes", d.ChunksAllocated, d.PeakAllocated, d.TargetBytes)
+}
+
+// Each ending path calls the release exactly once, on the fault's goroutine;
+// the result arrives only after the release finished; and ending the fault
+// (Stop, a cancelled parent) does not wait for the release.
+func TestStress_ReleasesMemoryOnEveryEnding(t *testing.T) {
+	stop := func(h *fault.Handle, _ context.CancelFunc) { h.Stop() }
+	cancelParent := func(_ *fault.Handle, c context.CancelFunc) { c() }
+	cases := []struct {
+		name                       string
+		duration, rampUp, rampDown time.Duration
+		end                        func(*fault.Handle, context.CancelFunc) // nil: let it run out
+	}{
+		{"runs to its end", 200 * time.Millisecond, 0, 0, nil},
+		{"Stop while holding", 5 * time.Second, 0, 0, stop},
+		{"parent context cancelled", 5 * time.Second, 0, 0, cancelParent},
+		{"Stop while ramping up", 5 * time.Second, 4 * time.Second, 0, stop},
+		{"ramp-down runs to its end", 400 * time.Millisecond, 0, 200 * time.Millisecond, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls atomic.Int32
+			finish := make(chan struct{})
+			var finishOnce sync.Once
+			finishRelease := func() { finishOnce.Do(func() { close(finish) }) }
+			orig := freeOSMemory
+			freeOSMemory = func() { calls.Add(1); <-finish }
+			t.Cleanup(func() { freeOSMemory = orig })
+			// Registered last, so it runs first: a failed case leaves no
+			// goroutine blocked in the release.
+			t.Cleanup(finishRelease)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			s := newStress(0.05, tc.duration, tc.rampUp, tc.rampDown, 64*1024, false, 0)
+			s.AvailableBytes, s.CurrentBytes = 256<<20, 0
+			h, err := s.Start(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.end != nil {
+				time.Sleep(100 * time.Millisecond)
+				ended := make(chan struct{})
+				go func() { tc.end(h, cancel); close(ended) }()
+				select {
+				case <-ended:
+				case <-time.After(time.Second):
+					t.Fatal("ending the fault waited for the release")
+				}
+			}
+			waitUntil(t, 5*time.Second, func() bool { return calls.Load() > 0 }) // the release started
+			select {
+			case <-h.Done():
+				t.Fatal("the result arrived before the release finished")
+			case <-time.After(50 * time.Millisecond):
+			}
+			finishRelease()
+			select {
+			case <-h.Done():
+			case <-time.After(5 * time.Second):
+				t.Fatal("the fault did not end")
+			}
+			if got := calls.Load(); got != 1 {
+				t.Fatalf("release called %d times, want 1", got)
+			}
+		})
+	}
+}
+
+// With the real runtime, the fault's memory is released to the OS by the
+// time its result arrives.
+func TestStress_ReturnsMemoryToTheOS(t *testing.T) {
+	const size = 64 << 20
+	s := newStress(0.125, 10*time.Second, 0, 0, 1<<20, false, 0)
+	s.AvailableBytes, s.CurrentBytes = 512<<20, 0
+	h, err := s.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 5*time.Second, func() bool { return readMetric("/memory/classes/heap/objects:bytes") >= size })
+	before := readMetric("/memory/classes/heap/released:bytes")
+	h.Stop()
+	<-h.Done()
+	// Released memory can also shrink (the allocator reuses released pages), so compare, never subtract unsigned.
+	if after := readMetric("/memory/classes/heap/released:bytes"); after < before+size*3/4 {
+		t.Fatalf("released %d MiB to the OS after the fault ended, want at least %d MiB",
+			(int64(after)-int64(before))>>20, (size*3/4)>>20)
+	}
+}
+
+// waitUntil polls cond every 5 ms and fails the test if it does not hold
+// within d.
+func waitUntil(t *testing.T, d time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("condition not met within %s", d)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// readMetric reads one runtime/metrics sample of kind KindUint64.
+func readMetric(name string) uint64 {
+	sample := []metrics.Sample{{Name: name}}
+	metrics.Read(sample)
+	return sample[0].Value.Uint64()
 }
 
 // Verify Stress implements fault.Fault at compile time.

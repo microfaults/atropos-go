@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -16,6 +17,12 @@ const pageSize = 4096
 // so every access crosses a page boundary, maximising TLB misses.
 const thrashStride = pageSize + 1
 
+// freeOSMemory is called when a fault ends, once its chunks are dropped.
+// Without it, a Go service that allocates slowly keeps the freed pages
+// resident for minutes, and the next memory fault reuses them, so its
+// allocation is invisible in RSS. It is a variable so tests can replace it.
+var freeOSMemory = debug.FreeOSMemory
+
 // Stress is a memory-pressure fault that consumes a configurable fraction
 // of available memory using chunk-based allocation.
 //
@@ -26,6 +33,12 @@ const thrashStride = pageSize + 1
 // Phase 2 (Hold + optional Thrash): holds allocations for the remaining
 // duration. If Thrashing is enabled, worker goroutines continuously walk
 // the allocated pages in a TLB-hostile stride pattern.
+//
+// Release: however the fault ends (its duration runs out, Handle.Stop, a
+// cancelled parent context, during ramp-up or ramp-down), it drops every
+// chunk and, as its last step before delivering the Result, forces a
+// garbage collection that returns the freed pages to the OS
+// (debug.FreeOSMemory), so the process's RSS falls when the fault ends.
 type Stress struct {
 	Config
 }
@@ -207,6 +220,11 @@ func (s *Stress) Start(ctx context.Context) (*fault.Handle, error) {
 		chunks = nil
 
 		elapsed := time.Since(start)
+
+		// Return the dropped chunks to the OS before reporting the end,
+		// so the target's RSS falls as the fault ends. This runs on the
+		// fault's goroutine: Stop and a cancelled parent never wait for it.
+		freeOSMemory()
 
 		result := fault.Result{
 			ActualDuration: elapsed,

@@ -4,6 +4,11 @@ All notable changes to atropos-go are documented in this file.
 
 ## Unreleased
 
+### Fixed — The memory fault returns its memory
+
+- **Released when it ends.** However the memory fault ends (its duration runs out, `Stop`, a cancelled parent context, during ramp-up or ramp-down), it drops its chunks and calls `debug.FreeOSMemory` before delivering its result, so the target's RSS falls as the fault ends. Before, a slowly allocating service kept the pages resident for minutes, and a later memory fault reused them, invisible in RSS.
+- **Cost.** One forced full GC in the process when each memory fault ends. It runs on the fault's own goroutine, so `Stop` does not wait for it.
+
 ### Changed — Go 1.27 and dependencies
 
 - **Go 1.27.** `go.mod` declares `go 1.27.3`; CI, the agent and sidecar Dockerfiles and the PoC Dockerfiles build on `golang:1.27` images. A consumer that pins this tree needs Go 1.27.3 or newer.
